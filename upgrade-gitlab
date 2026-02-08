@@ -882,7 +882,7 @@ if [ "$DETECTED_EDITION" != "$GITLAB_EDITION" ]; then
     echo ' done'
 
     echo -n "removing previous $CURRENT_VERSION image..."
-    docker image rm "$(docker images --format "{{.ID}}" "gitlab/gitlab-${DETECTED_EDITION}")" &> /dev/null
+    docker image rm "gitlab/gitlab-${DETECTED_EDITION}:$CURRENT_VERSION" &> /dev/null
     echo ' done'
 
     pull_with_retry "$GITLAB_IMAGE:$EDITION_SWITCH_TAG"
@@ -970,7 +970,7 @@ for ver in "${UPGRADE_POINTS_ARRAY[@]}"; do
     echo ' done'
 
     echo -n "removing previous $CNT_VERSION image..."
-    docker image rm "$(docker images --format "{{.ID}}" "$GITLAB_IMAGE")" &> /dev/null
+    docker image rm "$GITLAB_IMAGE:$CNT_VERSION" &> /dev/null
     echo ' done'
 
     # 사전 Pull 완료 대기
