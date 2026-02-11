@@ -621,10 +621,9 @@ draw_progress() {
     local filled=$(( progress * bar_length / 100 ))
     local empty=$(( bar_length - filled ))
 
-    local bar=""
-    local spaces=""
-    local bar=$(printf '%*s' "$filled" '' | tr ' ' '=')
-    local spaces=$(printf '%*s' "$empty" '')
+    local bar spaces
+    bar=$(printf '%*s' "$filled" '' | tr ' ' '=')
+    spaces=$(printf '%*s' "$empty" '')
 
     local elapsed=$(( SECONDS - start_time ))
 
