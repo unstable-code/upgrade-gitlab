@@ -761,31 +761,37 @@ if [ -n "$target_version_tag" ]; then
     UPDATABLE_TAGS=("${TEMP[@]}")
 fi
 
-# 2. 마이너 릴리즈별 첫/최신 버전 선택
-declare -A MINOR_FIRST
-declare -A MINOR_LATEST
-count=1
-for idx in "${!UPDATABLE_TAGS[@]}"; do
-    tag="${UPDATABLE_TAGS[$idx]}"
-    minor=$(echo "$tag" | cut -d. -f1,2)
-    draw_progress $count ${#UPDATABLE_TAGS[@]} "Creating Upgrade Path" 'Item'
-    if [[ -z "${MINOR_FIRST[$minor]}" ]]; then
-        MINOR_FIRST[$minor]="$tag"
-    fi
-    if [[ -z "${MINOR_LATEST[$minor]}" ]] || [[ "$(printf '%s\n%s\n' "${MINOR_LATEST[$minor]}" "$tag" | sort -V | tail -n1)" == "$tag" ]]; then
-        MINOR_LATEST[$minor]="$tag"
-    fi
-    count=$((count + 1))
-done
-
-mapfile -t UPGRADE_POINTS_ARRAY < <(
-    for minor in $(printf '%s\n' "${!MINOR_FIRST[@]}" | sort -V); do
-        echo "${MINOR_FIRST[$minor]}"
-        if [[ "${MINOR_FIRST[$minor]}" != "${MINOR_LATEST[$minor]}" ]]; then
-            echo "${MINOR_LATEST[$minor]}"
+# 2. 업그레이드 경로 구성
+if [ $use_all_tags -eq 1 ]; then
+    # --all-tags: Docker Hub 전체 태그에서 마이너 릴리즈별 첫/최신 버전 선택
+    declare -A MINOR_FIRST
+    declare -A MINOR_LATEST
+    count=1
+    for idx in "${!UPDATABLE_TAGS[@]}"; do
+        tag="${UPDATABLE_TAGS[$idx]}"
+        minor=$(echo "$tag" | cut -d. -f1,2)
+        draw_progress $count ${#UPDATABLE_TAGS[@]} "Creating Upgrade Path" 'Item'
+        if [[ -z "${MINOR_FIRST[$minor]}" ]]; then
+            MINOR_FIRST[$minor]="$tag"
         fi
+        if [[ -z "${MINOR_LATEST[$minor]}" ]] || [[ "$(printf '%s\n%s\n' "${MINOR_LATEST[$minor]}" "$tag" | sort -V | tail -n1)" == "$tag" ]]; then
+            MINOR_LATEST[$minor]="$tag"
+        fi
+        count=$((count + 1))
     done
-)
+
+    mapfile -t UPGRADE_POINTS_ARRAY < <(
+        for minor in $(printf '%s\n' "${!MINOR_FIRST[@]}" | sort -V); do
+            echo "${MINOR_FIRST[$minor]}"
+            if [[ "${MINOR_FIRST[$minor]}" != "${MINOR_LATEST[$minor]}" ]]; then
+                echo "${MINOR_LATEST[$minor]}"
+            fi
+        done
+    )
+else
+    # path.json: 이미 필수 경유 버전이므로 그대로 사용
+    UPGRADE_POINTS_ARRAY=("${UPDATABLE_TAGS[@]}")
+fi
 
 # CE → EE 전환 시 같은 버전의 EE 태그를 라우팅 포인트 맨 앞에 추가
 if [ "$DETECTED_EDITION" != "$GITLAB_EDITION" ]; then
