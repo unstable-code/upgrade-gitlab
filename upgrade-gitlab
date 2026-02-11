@@ -274,17 +274,29 @@ GITLAB_IMAGE="gitlab/gitlab-${GITLAB_EDITION}"
 TAG_SUFFIX="-${GITLAB_EDITION}.0"
 
 # --version 플래그의 에디션 suffix 적용 (GITLAB_EDITION 확정 후)
+_partial_version=0
 if [ -n "$target_version_tag" ]; then
-    if [ "$(echo "$target_version_tag" | grep -c "\-${GITLAB_EDITION}")" -ne 1 ]; then
-        target_version_tag="${target_version_tag}${TAG_SUFFIX}"
-    fi
-
-    if curl -sf "https://hub.docker.com/v2/repositories/${GITLAB_IMAGE}/tags/$target_version_tag" &> /dev/null; then
-        echo "Using $target_version_tag instead of latest"
-        extract_versions_only=0
+    # partial version 감지 (x 또는 x.y 형식)
+    if [[ "$target_version_tag" =~ ^[0-9]+$ ]] || [[ "$target_version_tag" =~ ^[0-9]+\.[0-9]+$ ]]; then
+        if [ $use_all_tags -eq 0 ]; then
+            echo "Error: Partial version (--version=$target_version_tag) requires --all-tags flag." >&2
+            echo "Hint: Use exact version (e.g. --version=16.9.1) or add --all-tags to resolve from Docker Hub." >&2
+            exit 1
+        fi
+        _partial_version=1
+        echo "Partial version provided: $target_version_tag (will resolve after fetching tags)"
     else
-        echo "Error: No such $target_version_tag tag in Docker Hub. Using alternative tag: latest" >&2
-        target_version_tag=
+        if [ "$(echo "$target_version_tag" | grep -c "\-${GITLAB_EDITION}")" -ne 1 ]; then
+            target_version_tag="${target_version_tag}${TAG_SUFFIX}"
+        fi
+
+        if curl -sf "https://hub.docker.com/v2/repositories/${GITLAB_IMAGE}/tags/$target_version_tag" &> /dev/null; then
+            echo "Using $target_version_tag instead of latest"
+            extract_versions_only=0
+        else
+            echo "Error: No such $target_version_tag tag in Docker Hub. Using alternative tag: latest" >&2
+            target_version_tag=
+        fi
     fi
 fi
 
@@ -756,6 +768,18 @@ else
             fi
         fi
     done
+fi
+
+# partial version resolve (--all-tags 모드에서만 도달)
+if [ "$_partial_version" -eq 1 ]; then
+    resolved=$(printf '%s\n' "${ALL_TAGS[@]}" | grep "^${target_version_tag}\." | sort -V | tail -1)
+    if [ -z "$resolved" ]; then
+        echo "Error: No tags matching '${target_version_tag}.*' found in Docker Hub." >&2
+        target_version_tag=
+    else
+        target_version_tag="$resolved"
+        echo "Resolved partial version to: $target_version_tag"
+    fi
 fi
 
 # 1. 현재 버전 이후만 필터링
