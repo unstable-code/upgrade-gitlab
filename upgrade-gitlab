@@ -13,6 +13,7 @@ target_version_tag=
 auto_restart_enabled=no
 _in_stacktrace=0
 edition_flag=
+auto_yes=0
 _interrupted=0
 _trap_active=0
 _pull_pid=
@@ -79,9 +80,10 @@ pull_with_retry() {
 }
 
 if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
-    echo "Usage: $0 [--edition=ce|ee] [--all-tags [--page-size=25]] [--target-url=http] [--extract | [--version=0.0.0] [FILE]]"
+    echo "Usage: $0 [-y] [--edition=ce|ee] [--all-tags [--page-size=25]] [--target-url=http] [--extract | [--version=0.0.0] [FILE]]"
 
     echo -e '\n\e[0;1mOPTIONS\e[m'
+    echo -e "-y\t\t\tAuto-confirm prompts for unattended/cron usage. Aborts on safety warnings and if upgrade path >= 3 steps."
     echo -e "--help\t\t\tShow this help."
     echo -e "--edition=ce|ee\t\tForce GitLab edition (ce or ee). Auto-detected if omitted."
     echo -e "--extract\t\tDownload GitLab released tags file. (aka. export)"
@@ -104,7 +106,9 @@ else
         if [[ "${params[$i]}" == "-"* ]]; then
             temp=$(echo "${params[$i]}" | awk -F '=' '{ print $2 }')
 
-            if [ "${params[$i]}" == "--all-tags" ]; then
+            if [ "${params[$i]}" == "-y" ] || [ "${params[$i]}" == "--yes" ]; then
+                auto_yes=1
+            elif [ "${params[$i]}" == "--all-tags" ]; then
                 use_all_tags=1
             elif [ "${params[$i]}" == "--extract" ] || [ "${params[$i]}" == "--export" ]; then
                 if [ "$use_local_versions" == '/dev/null' ] && [ -z "$target_version_tag" ]; then
@@ -254,7 +258,7 @@ if [ -n "$edition_flag" ]; then
     GITLAB_EDITION=$edition_flag
 else
     GITLAB_EDITION=$DETECTED_EDITION
-    if [ "$GITLAB_EDITION" == "ce" ]; then
+    if [ "$GITLAB_EDITION" == "ce" ] && [ $auto_yes -eq 0 ]; then
         echo -en "Detected edition: CE. Would you like to switch to EE? (y/N) > "
         read -r switch_ee
         if [ "$switch_ee" == "y" ] || [ "$switch_ee" == "Y" ]; then
@@ -419,6 +423,10 @@ check_disk_space() {
 
     if [ "$insufficient" -eq 1 ]; then
         send_discord_webhook "WARN" "Low disk space detected" "Review disk space before upgrading"
+        if [ $auto_yes -eq 1 ]; then
+            echo "Aborted due to insufficient disk space (-y mode)." >&2
+            exit 1
+        fi
         echo -n "Continue anyway? (y/N) > "
         read -r disk_confirm
         if [ "$disk_confirm" != "y" ] && [ "$disk_confirm" != "Y" ]; then
@@ -822,6 +830,10 @@ if [ "$DETECTED_EDITION" != "$GITLAB_EDITION" ]; then
 fi
 
 if [ -z "$TARGET_URL" ]; then
+    if [ $auto_yes -eq 1 ]; then
+        echo "Error: TARGET_URL is required for unattended mode (-y). Use --target-url or TARGET_URL env." >&2
+        exit 1
+    fi
     echo 'TARGET_URL is not configured yet. Please enter your GitLab server URL.'
     echo 'e.g.: https://gitlab.com'
     echo -n '> '
@@ -830,6 +842,13 @@ if [ -z "$TARGET_URL" ]; then
         echo 'User abort'
         exit 1
     fi
+fi
+
+if [ $auto_yes -eq 1 ] && [ ${#UPGRADE_POINTS_ARRAY[@]} -ge 3 ]; then
+    echo "Error: Upgrade path has ${#UPGRADE_POINTS_ARRAY[@]} steps (>= 3). Too many steps for unattended mode (-y)." >&2
+    echo "Please run manually without -y flag." >&2
+    send_discord_webhook "WARN" "Unattended upgrade aborted" "Upgrade path has ${#UPGRADE_POINTS_ARRAY[@]} steps (>= 3), manual intervention required."
+    exit 1
 fi
 
 if [ ${#UPGRADE_POINTS_ARRAY[@]} -eq 0 ]; then
@@ -877,11 +896,15 @@ else
     echo -e "\t- I checked PAGE_SIZE and TARGET_URL values: PAGE_SIZE: $PAGE_SIZE, TARGET_URL: $TARGET_URL"
 fi
 
-echo -en "\nI accept the above notice and continue this job (y/N) > "
-read -r n
-if [ "$n" != "y" ] && [ "$n" != "Y" ]; then
-    echo 'User abort' >&2
-    exit 1
+if [ $auto_yes -eq 1 ]; then
+    echo -e "\nAuto-confirmed (-y mode)."
+else
+    echo -en "\nI accept the above notice and continue this job (y/N) > "
+    read -r n
+    if [ "$n" != "y" ] && [ "$n" != "Y" ]; then
+        echo 'User abort' >&2
+        exit 1
+    fi
 fi
 
 send_discord_webhook "NOTE" "Updating GitLab now!" "GitLab will be upgraded from $CURRENT_VERSION to ${UPGRADE_POINTS_ARRAY[-1]}"
@@ -899,6 +922,10 @@ if ! [ -r /tmp/upgrade-gitlab.lock ]; then
 
     # Secrets 무결성 기준선 확인
     if ! check_secrets_integrity "pre-upgrade"; then
+        if [ $auto_yes -eq 1 ]; then
+            echo "Aborted due to secrets integrity check failure (-y mode)." >&2
+            exit 1
+        fi
         echo -n "Continue despite secrets integrity warning? (y/N) > "
         read -r secrets_confirm
         if [ "$secrets_confirm" != "y" ] && [ "$secrets_confirm" != "Y" ]; then
@@ -1076,23 +1103,25 @@ check_gitlab_server_healthy 1
 check_secrets_integrity "post-upgrade"
 
 if [ "$auto_restart_enabled" == "$(docker inspect --format='{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER_NAME")" ] && [ "$auto_restart_enabled" == 'no' ]; then
-    echo "Would you like to change RestartPolicy from $auto_restart_enabled to always?"
-    echo 'AVAILABLE OPTIONS'
-    echo -e 'no\t\t\t\tDo not automatically restart the container. (Default, Current)'
-    echo -e 'on-failure[:max-retries]\tRestart the container if it exits due to an error, which manifests as a non-zero exit code.'
-    echo -e 'always\t\t\t\tAlways restart the container if it stops. If it is manually stopped, it is restarted only when Docker daemon restarts or the container itself is manually restarted.'
-    echo -e 'unless-stopped\t\t\tSimilar to always, except that when the container is stopped (manually or otherwise), it is not restarted even after Docker daemon restarts.'
-    echo -n '> '
-    read -r n
-    case "$n" in
-        no|always|unless-stopped|on-failure|on-failure:[0-9]*)
-            docker update --restart="$n" "$CONTAINER_NAME"
-            ;;
-        *)
-            # shellcheck disable=SC2016
-            echo 'If you want to edit RestartPolicy value later, please run `docker update --restart=<rule> <container-name>` to apply.'
-            ;;
-    esac
+    if [ $auto_yes -eq 0 ]; then
+        echo "Would you like to change RestartPolicy from $auto_restart_enabled to always?"
+        echo 'AVAILABLE OPTIONS'
+        echo -e 'no\t\t\t\tDo not automatically restart the container. (Default, Current)'
+        echo -e 'on-failure[:max-retries]\tRestart the container if it exits due to an error, which manifests as a non-zero exit code.'
+        echo -e 'always\t\t\t\tAlways restart the container if it stops. If it is manually stopped, it is restarted only when Docker daemon restarts or the container itself is manually restarted.'
+        echo -e 'unless-stopped\t\t\tSimilar to always, except that when the container is stopped (manually or otherwise), it is not restarted even after Docker daemon restarts.'
+        echo -n '> '
+        read -r n
+        case "$n" in
+            no|always|unless-stopped|on-failure|on-failure:[0-9]*)
+                docker update --restart="$n" "$CONTAINER_NAME"
+                ;;
+            *)
+                # shellcheck disable=SC2016
+                echo 'If you want to edit RestartPolicy value later, please run `docker update --restart=<rule> <container-name>` to apply.'
+                ;;
+        esac
+    fi
 elif [ "$auto_restart_enabled" != "$(docker inspect --format='{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER_NAME")" ]; then
     echo "Updating gitlab RestartPolicy from $(docker inspect --format='{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER_NAME") to $auto_restart_enabled"
     docker update --restart="$auto_restart_enabled" "$CONTAINER_NAME" &> /dev/null
