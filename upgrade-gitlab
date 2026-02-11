@@ -158,6 +158,29 @@ else
     done
 fi
 
+# --------------------------
+# 필수 유틸리티 사전 검증
+# --------------------------
+for util in curl jq; do
+    if ! which "$util" &> /dev/null; then
+        echo "Error: Required utility '$util' is not installed. $(uname -a)" >&2
+        if [ -d /usr/syno ]; then
+            echo "Hint: On Synology DSM, install '$util' via Entware or opkg." >&2
+        fi
+        exit 1
+    fi
+done
+
+if ! echo -e "1.10.0\n1.2.0" | sort -V &> /dev/null; then
+    echo "Error: 'sort' does not support version sorting (-V). GNU coreutils is required." >&2
+    exit 1
+fi
+
+if [ "${BASH_VERSION%%.*}" -lt 4 ] 2>/dev/null; then
+    echo "Error: Bash 4.0+ is required (current: $BASH_VERSION)." >&2
+    exit 1
+fi
+
 if ! which docker &> /dev/null; then
     echo "Docker is not installed on this system. $(uname -a)" >&2
     if [ -d /usr/syno ]; then
@@ -580,12 +603,8 @@ draw_progress() {
 
     local bar=""
     local spaces=""
-    if [ $filled -gt 0 ]; then
-        bar=$(printf "%0.s=" $(seq 1 $filled))
-    fi
-    if [ $empty -gt 0 ]; then
-        spaces=$(printf "%0.s " $(seq 1 $empty))
-    fi
+    local bar=$(printf '%*s' "$filled" '' | tr ' ' '=')
+    local spaces=$(printf '%*s' "$empty" '')
 
     local elapsed=$(( SECONDS - start_time ))
 
@@ -648,7 +667,7 @@ if [ "$use_local_versions" == '/dev/null' ]; then
             if [ ${#TAGS[@]} -eq 0 ]; then
                 break
             else
-                CURRENT_PAGE=$(echo "$TAGS_URL" | grep -oP 'page=\K[0-9]+' || echo 1)
+                CURRENT_PAGE=$(echo "$TAGS_URL" | grep -oE 'page=[0-9]+' | grep -oE '[0-9]+' || echo 1)
                 draw_progress "$CURRENT_PAGE" "$TOTAL_PAGES" 'Querying GitLab Releases' 'Page'
             fi
             ALL_TAGS+=("${TAGS[@]}")
