@@ -179,6 +179,17 @@ fi
 # 🔍 gitlab/gitlab-ce 또는 gitlab/gitlab-ee 컨테이너 자동 감지
 # --------------------------
 CONTAINER_CANDIDATES=$(docker ps -a --format "{{.Image}}\t{{.Names}}" | grep "^gitlab/gitlab-\(ce\|ee\)" | awk '{print $2}')
+
+# 이름으로 못 찾으면 이미지 ID → RepoTags 역조회로 재시도
+if [ -z "$CONTAINER_CANDIDATES" ]; then
+    while IFS=$'\t' read -r img name; do
+        repo_tags=$(docker image inspect "$img" --format='{{range .RepoTags}}{{.}} {{end}}' 2>/dev/null)
+        if echo "$repo_tags" | grep -q "gitlab/gitlab-\(ce\|ee\)"; then
+            CONTAINER_CANDIDATES="${CONTAINER_CANDIDATES:+$CONTAINER_CANDIDATES$'\n'}$name"
+        fi
+    done < <(docker ps -a --format "{{.Image}}\t{{.Names}}")
+fi
+
 CONTAINER_COUNT=$(echo "$CONTAINER_CANDIDATES" | grep -c .)
 
 if [ "$CONTAINER_COUNT" -eq 0 ]; then
@@ -197,8 +208,17 @@ echo "Detected gitlab container: $CONTAINER_NAME"
 # --------------------------
 # 에디션 자동 감지 (CE/EE)
 # --------------------------
-DETECTED_EDITION=$(docker inspect "$CONTAINER_NAME" --format='{{.Config.Image}}' \
-    | sed 's|gitlab/gitlab-||;s|:.*||')
+CONFIG_IMAGE=$(docker inspect "$CONTAINER_NAME" --format='{{.Config.Image}}')
+if ! echo "$CONFIG_IMAGE" | grep -q "^gitlab/gitlab-"; then
+    CONFIG_IMAGE=$(docker image inspect "$CONFIG_IMAGE" --format='{{range .RepoTags}}{{.}} {{end}}' 2>/dev/null \
+        | grep -oE "gitlab/gitlab-(ce|ee)[^ ]*" | head -1)
+    if [ -z "$CONFIG_IMAGE" ]; then
+        echo "Error: Cannot determine GitLab edition from container image." >&2
+        echo "Hint: Try running 'docker tag <IMAGE_ID> gitlab/gitlab-ce:<VERSION>' to restore the image tag." >&2
+        exit 1
+    fi
+fi
+DETECTED_EDITION=$(echo "$CONFIG_IMAGE" | sed 's|gitlab/gitlab-||;s|:.*||')
 
 if [ -n "$edition_flag" ]; then
     if [ "$DETECTED_EDITION" == "ee" ] && [ "$edition_flag" == "ce" ]; then
