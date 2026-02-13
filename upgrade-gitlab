@@ -163,6 +163,14 @@ else
 fi
 
 # --------------------------
+# 대화형 모드 TTY 검증
+# --------------------------
+if [ $auto_yes -eq 0 ] && [ ! -t 0 ]; then
+    echo "Error: stdin is not a terminal. Use -y/--yes for non-interactive mode." >&2
+    exit 1
+fi
+
+# --------------------------
 # 필수 유틸리티 사전 검증
 # --------------------------
 for util in curl jq; do
@@ -260,7 +268,7 @@ else
     GITLAB_EDITION=$DETECTED_EDITION
     if [ "$GITLAB_EDITION" == "ce" ] && [ $auto_yes -eq 0 ]; then
         echo -en "Detected edition: CE. Would you like to switch to EE? (y/N) > "
-        read -r switch_ee
+        read -r switch_ee < /dev/tty
         if [ "$switch_ee" == "y" ] || [ "$switch_ee" == "Y" ]; then
             GITLAB_EDITION="ee"
             echo "Edition switch requested: ce -> ee"
@@ -440,7 +448,7 @@ check_disk_space() {
             exit 1
         fi
         echo -n "Continue anyway? (y/N) > "
-        read -r disk_confirm
+        read -r disk_confirm < /dev/tty
         if [ "$disk_confirm" != "y" ] && [ "$disk_confirm" != "Y" ]; then
             echo "Aborted due to insufficient disk space." >&2
             exit 1
@@ -860,7 +868,7 @@ if [ -z "$TARGET_URL" ]; then
     echo 'TARGET_URL is not configured yet. Please enter your GitLab server URL.'
     echo 'e.g.: https://gitlab.com'
     echo -n '> '
-    read -r TARGET_URL
+    read -r TARGET_URL < /dev/tty
     if [ -z "$TARGET_URL" ]; then
         echo 'User abort'
         exit 1
@@ -923,7 +931,7 @@ if [ $auto_yes -eq 1 ]; then
     echo -e "\nAuto-confirmed (-y mode)."
 else
     echo -en "\nI accept the above notice and continue this job (y/N) > "
-    read -r n
+    read -r n < /dev/tty
     if [ "$n" != "y" ] && [ "$n" != "Y" ]; then
         echo 'User abort' >&2
         exit 1
@@ -950,7 +958,7 @@ if ! [ -r /tmp/upgrade-gitlab.lock ]; then
             exit 1
         fi
         echo -n "Continue despite secrets integrity warning? (y/N) > "
-        read -r secrets_confirm
+        read -r secrets_confirm < /dev/tty
         if [ "$secrets_confirm" != "y" ] && [ "$secrets_confirm" != "Y" ]; then
             echo "Aborted due to secrets integrity check failure." >&2
             exit 1
@@ -1134,7 +1142,7 @@ if [ "$auto_restart_enabled" == "$(docker inspect --format='{{.HostConfig.Restar
         echo -e 'always\t\t\t\tAlways restart the container if it stops. If it is manually stopped, it is restarted only when Docker daemon restarts or the container itself is manually restarted.'
         echo -e 'unless-stopped\t\t\tSimilar to always, except that when the container is stopped (manually or otherwise), it is not restarted even after Docker daemon restarts.'
         echo -n '> '
-        read -r n
+        read -r n < /dev/tty
         case "$n" in
             no|always|unless-stopped|on-failure|on-failure:[0-9]*)
                 docker update --restart="$n" "$CONTAINER_NAME"
