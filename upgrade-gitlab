@@ -26,6 +26,9 @@ _handle_signal() {
         echo -e "\nSignal received. Will exit at next safe point..." >&2
         return
     fi
+    if [ -n "$PULL_PID" ]; then
+        kill "$PULL_PID" 2>/dev/null
+    fi
     exit 130
 }
 trap _handle_signal SIGINT SIGTERM SIGTSTP SIGHUP
@@ -558,12 +561,15 @@ check_migration_status() {
 check_gitlab_server_healthy() {
     local skip_reconfigure=${1:-0}
     if docker exec "$CONTAINER_NAME" gitlab-ctl status; then
+        enter_critical
         if [ "$skip_reconfigure" -eq 0 ]; then
             docker exec "$CONTAINER_NAME" gitlab-ctl reconfigure
+        else
+            docker exec "$CONTAINER_NAME" gitlab-ctl restart
         fi
         docker exec "$CONTAINER_NAME" gitlab-ctl pg-upgrade
         docker exec "$CONTAINER_NAME" gitlab-rake db:migrate
-        docker exec "$CONTAINER_NAME" gitlab-ctl restart
+        exit_critical
         docker exec "$CONTAINER_NAME" gitlab-ctl status || print_stacktrace_errors
     else
         print_stacktrace_errors
@@ -971,6 +977,7 @@ if [ "$DETECTED_EDITION" != "$GITLAB_EDITION" ]; then
     echo "Switching edition at current version: $CURRENT_VERSION -> $EDITION_SWITCH_TAG"
     send_discord_webhook "INFO" "Switching edition: $DETECTED_EDITION -> $GITLAB_EDITION" "Same version edition switch before version upgrades"
 
+    wait_for_background_migrations
     check_gitlab_server_healthy 0
 
     enter_critical
@@ -1059,6 +1066,7 @@ for ver in "${UPGRADE_POINTS_ARRAY[@]}"; do
         echo 'done'
     fi
 
+    wait_for_background_migrations
     check_gitlab_server_healthy 0
 
     enter_critical
