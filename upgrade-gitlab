@@ -932,6 +932,23 @@ else
     echo -e "\t- I checked this GitLab server is configured with the following runners:"
     docker exec "$CONTAINER_NAME" gitlab-psql -c "SELECT id, description, contacted_at, active FROM ci_runners ORDER BY id;"
     echo ''
+    PAUSED_RUNNER_IDS=""
+    active_runners=$(docker exec "$CONTAINER_NAME" gitlab-psql -tAc "SELECT COUNT(*) FROM ci_runners WHERE active = true;")
+    if [ "$active_runners" -gt 0 ]; then
+        echo "WARNING: $active_runners active runner(s) detected. Runners should be paused before upgrading."
+        if [ $auto_yes -eq 0 ]; then
+            echo -n "Pause runners automatically? (Y/n) > "
+            read -r runner_confirm < /dev/tty
+            if [ "$runner_confirm" == "n" ] || [ "$runner_confirm" == "N" ]; then
+                echo "Aborted. Pause runners in Admin > Runners, then re-run this script."
+                exit 1
+            fi
+        fi
+        echo "Pausing $active_runners active runner(s)..."
+        PAUSED_RUNNER_IDS=$(docker exec "$CONTAINER_NAME" gitlab-psql -tAc "SELECT id FROM ci_runners WHERE active = true;")
+        docker exec "$CONTAINER_NAME" gitlab-psql -c "UPDATE ci_runners SET active = false WHERE active = true;" > /dev/null
+        echo "Runners paused. They will be resumed after the upgrade."
+    fi
 fi
 if [ $use_all_tags -eq 0 ]; then
     echo -e "\t- I checked TARGET_URL is valid: $TARGET_URL"
@@ -1096,6 +1113,14 @@ check_gitlab_server_healthy 1
 
 # 최종 시크릿 무결성 확인
 check_secrets_integrity "post-upgrade"
+
+# 업그레이드 전 비활성화한 러너 복원
+if [ -n "$PAUSED_RUNNER_IDS" ]; then
+    id_list=$(echo "$PAUSED_RUNNER_IDS" | tr -s '[:space:]' ',' | sed 's/^,//;s/,$//')
+    docker exec "$CONTAINER_NAME" gitlab-psql -c "UPDATE ci_runners SET active = true WHERE id IN ($id_list);" > /dev/null
+    echo "Resumed previously paused runners: $id_list"
+    send_discord_webhook "NOTE" "Runners resumed" "IDs: $id_list"
+fi
 
 if [ "$auto_restart_enabled" == "$(docker inspect --format='{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER_NAME")" ] && [ "$auto_restart_enabled" == 'no' ]; then
     if [ $auto_yes -eq 0 ]; then
