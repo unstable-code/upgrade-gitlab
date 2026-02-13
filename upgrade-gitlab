@@ -450,7 +450,15 @@ check_disk_space() {
 check_secrets_integrity() {
     local phase=$1
     echo "Verifying secrets integrity ($phase)..."
-    if ! docker exec "$CONTAINER_NAME" gitlab-rake gitlab:doctor:secrets 2>/dev/null; then
+    # gitlab:doctor:secrets 는 GitLab 13.1 이상에서만 사용 가능
+    local output
+    output=$(docker exec "$CONTAINER_NAME" gitlab-rake gitlab:doctor:secrets 2>&1)
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        if echo "$output" | grep -q "Don't know how to build task"; then
+            echo "Skipping secrets integrity check ($phase): task not available in this version" >&2
+            return 0
+        fi
         echo "Warning: Secrets integrity check failed ($phase). Please review manually." >&2
         send_discord_webhook "WARN" "Secrets check failed ($phase)" "Run gitlab-rake gitlab:doctor:secrets"
         return 1
@@ -459,6 +467,16 @@ check_secrets_integrity() {
 }
 
 wait_for_background_migrations() {
+    # batched_background_migrations 테이블은 GitLab 13.10 이상에서만 존재
+    local table_exists
+    table_exists=$(docker exec "$CONTAINER_NAME" gitlab-psql -tAc \
+        "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'batched_background_migrations');" \
+        2>/dev/null | tr -d '[:space:]')
+    if [ "$table_exists" != "t" ]; then
+        echo "Skipping background migration check: table not available in this version"
+        return 0
+    fi
+
     echo "Waiting for background migrations to complete..."
     local spinner='/-\|'
     local spin_idx=0
@@ -939,7 +957,11 @@ auto_restart_enabled=$(docker inspect --format='{{.HostConfig.RestartPolicy.Name
 check_disk_space
 
 echo "Creating backups for $CURRENT_VERSION. Please wait until backup process is completed..."
-docker exec "$CONTAINER_NAME" gitlab-backup create
+if docker exec "$CONTAINER_NAME" which gitlab-backup &>/dev/null; then
+    docker exec "$CONTAINER_NAME" gitlab-backup create
+else
+    docker exec "$CONTAINER_NAME" gitlab-rake gitlab:backup:create
+fi
 BACKUP_DIR=$(docker exec "$CONTAINER_NAME" grep "'backup_path'" /etc/gitlab/gitlab.rb | awk -F"=" '{ print $2 }' | sed 's/\"//g' | sed 's/^ //')
 docker exec "$CONTAINER_NAME" sh -c "cp /etc/gitlab/gitlab-secrets.json $BACKUP_DIR/gitlab-secrets.json.${CURRENT_VERSION}-backup"
 docker exec "$CONTAINER_NAME" sh -c "cp /etc/gitlab/gitlab.rb $BACKUP_DIR/gitlab.rb.${CURRENT_VERSION}-backup"

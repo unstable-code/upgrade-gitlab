@@ -17,6 +17,12 @@ An automated upgrade script for Docker-based GitLab instances. Supports both CE 
 
 ## Requirements
 
+- **GitLab 12.2+** (recommended minimum version)
+  - <=12.1: auto-fallback from `gitlab-backup create` to `gitlab-rake gitlab:backup:create`
+  - <=13.0: `doctor:secrets` check auto-skipped (unavailable)
+  - <=13.9: background migration tracking auto-skipped (`batched_background_migrations` table unavailable)
+  - 13.1+: secrets integrity check enabled
+  - 13.10+: full background migration tracking enabled
 - Docker (Engine or Desktop)
 - `bash`, `curl`, `jq`, `sort` (with `-V` flag)
 - Root access or Docker group membership
@@ -24,13 +30,14 @@ An automated upgrade script for Docker-based GitLab instances. Supports both CE 
 ## Usage
 
 ```bash
-./upgrade-gitlab [OPTIONS] [FILE]
+./upgrade-gitlab [OPTIONS]
 ```
 
 ### Options
 
 | Flag | Description |
 |------|-------------|
+| `-y`, `--yes` | Skip confirmation prompts (non-interactive mode) |
 | `--help` | Show help message |
 | `--edition=ce\|ee` | Force GitLab edition (auto-detected if omitted) |
 | `--version=X.Y.Z` | Upgrade to a specific version instead of latest |
@@ -38,8 +45,7 @@ An automated upgrade script for Docker-based GitLab instances. Supports both CE 
 | `--discord-url=URL` | Discord webhook URL for notifications |
 | `--all-tags` | Parse all tags from Docker Hub instead of the upgrade-path API |
 | `--page-size=N` | Tags per page when using `--all-tags` (default: 25) |
-| `--extract` | Export sorted release tags to `/tmp/gitlab-released-tags.txt` |
-| `FILE` | Use a pre-sorted tags file to skip remote fetching |
+| `--extract` | Export sorted release tags to `/tmp/gitlab-released-tags.txt` (mutually exclusive with `--version`) |
 
 ### Environment Variables
 
