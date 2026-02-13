@@ -105,6 +105,33 @@ Post-upgrade:
 | SIGHUP | Exit | Deferred | Restart pull |
 | SIGQUIT (Ctrl+\\) | Exit | Exit | Exit |
 
+## Tips
+
+> [!TIP]
+> `--target-url` is only used by the script to check server readiness via `curl` after each upgrade step. Any address reachable from the host running the script is sufficient — there is no need for external access.
+>
+> ```bash
+> # localhost is perfectly fine when running on the same host
+> ./upgrade-gitlab --target-url=http://localhost:8929
+> ```
+>
+> Consider **disabling port forwarding** on your router during the upgrade to prevent external requests from reaching the server in an incomplete state.
+
+> [!TIP]
+> **Maintenance Mode (Premium/Ultimate 13.9+)**
+>
+> GitLab Premium and above provide a built-in [maintenance mode](https://docs.gitlab.com/administration/maintenance_mode/) that puts the instance into a read-only state. Enabling it before the upgrade prevents data changes while the server is being migrated.
+>
+> ```bash
+> # Enable before upgrade
+> docker exec <container> gitlab-rails runner \
+>   "::Gitlab::CurrentSettings.update!(maintenance_mode: true, maintenance_mode_message: 'Upgrade in progress')"
+>
+> # Disable after upgrade
+> docker exec <container> gitlab-rails runner \
+>   "::Gitlab::CurrentSettings.update!(maintenance_mode: false)"
+> ```
+
 ## License
 
 [MIT](LICENSE)
