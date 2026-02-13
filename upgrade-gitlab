@@ -6,7 +6,6 @@ DISCORD_URL=${DISCORD_URL:-}
 GITLAB_EDITION=
 PULL_PID=
 
-use_local_versions=/dev/null
 extract_versions_only=0
 use_all_tags=0
 target_version_tag=
@@ -83,7 +82,7 @@ pull_with_retry() {
 }
 
 if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
-    echo "Usage: $0 [-y] [--edition=ce|ee] [--all-tags [--page-size=25]] [--target-url=http] [--extract | [--version=0.0.0] [FILE]]"
+    echo "Usage: $0 [-y] [--edition=ce|ee] [--all-tags [--page-size=25]] [--target-url=http] [--discord-url=http] [--extract | --version=0.0.0]"
 
     echo -e '\n\e[0;1mOPTIONS\e[m'
     echo -e "-y\t\t\tAuto-confirm prompts for unattended/cron usage. Aborts on safety warnings and if upgrade path >= 3 steps."
@@ -96,7 +95,6 @@ if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
     echo -e "--target-url=http\tPerform a simple connection test for your GitLab server."
     echo -e "--discord-url=http\tNotify via Discord webhook."
     echo -e "--page-size=25\t\tSet the number of tags per page with --all-tags flag."
-    echo -e "FILE\t\t\tUse provided file with already ASC sorted contents."
 
     echo -e '\n\e[0;1mENV VALUES\e[m'
     echo -e "TARGET_URL=http\t\tSame as --target-url flag."
@@ -114,9 +112,11 @@ else
             elif [ "${params[$i]}" == "--all-tags" ]; then
                 use_all_tags=1
             elif [ "${params[$i]}" == "--extract" ] || [ "${params[$i]}" == "--export" ]; then
-                if [ "$use_local_versions" == '/dev/null' ] && [ -z "$target_version_tag" ]; then
-                    extract_versions_only=1
+                if [ -n "$target_version_tag" ]; then
+                    echo "Error: --extract and --version cannot be used together." >&2
+                    exit 1
                 fi
+                extract_versions_only=1
             elif [[ "${params[$i]}" == "--edition"* ]]; then
                 if [ "$temp" != "ce" ] && [ "$temp" != "ee" ]; then
                     echo "Error: --edition must be 'ce' or 'ee'" >&2
@@ -124,6 +124,10 @@ else
                 fi
                 edition_flag=$temp
             elif [[ "${params[$i]}" == "--version"* ]]; then
+                if [ $extract_versions_only -eq 1 ]; then
+                    echo "Error: --version and --extract cannot be used together." >&2
+                    exit 1
+                fi
                 if [ -n "$target_version_tag" ]; then
                     echo "Warning: Overriding target_version_tag from $target_version_tag to $temp"
                 fi
@@ -144,22 +148,6 @@ else
                     echo "Warning: Overriding PAGE_SIZE from $PAGE_SIZE to $temp"
                 fi
                 PAGE_SIZE=$temp
-            fi
-        elif [ -f "${params[$i]}" ] && [ "$use_local_versions" == '/dev/null' ] && [ $extract_versions_only -eq 0 ]; then
-            echo "Using ${params[$i]} file to reduce time spent sorting version tags"
-            if ! cat -A "${params[$i]}" | tail -n1 | grep '\$' &> /dev/null; then
-                echo '' >> "${params[$i]}"
-            fi
-
-            grep -viE '(rc|nightly|latest)' "${params[$i]}" > "${params[$i]}.tmp" && mv "${params[$i]}.tmp" "${params[$i]}"
-            requirements=$(grep -cE '^[0-9]+\.[0-9]+\.[0-9]+-(ce|ee)\.[0-9]+$' "${params[$i]}")
-            total=$(wc -l < "${params[$i]}")
-            if [ "$requirements" -ne "$total" ]; then
-                echo "Error: Provided file contents do not contain valid GitLab version tags" >&2
-                head -n 10 "${params[$i]}" >&2
-                continue
-            else
-                use_local_versions=${params[$i]}
             fi
         fi
     done
@@ -643,21 +631,14 @@ start_time=$SECONDS
 draw_progress() {
     local current=$1
     local total=$2
-    local bar_length=30
     local prefix=$3
     local item_name=$4
+    local cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
 
     local progress=0
     if [ "$total" -gt 0 ]; then
         progress=$(( current * 100 / total ))
     fi
-
-    local filled=$(( progress * bar_length / 100 ))
-    local empty=$(( bar_length - filled ))
-
-    local bar spaces
-    bar=$(printf '%*s' "$filled" '' | tr ' ' '=')
-    spaces=$(printf '%*s' "$empty" '')
 
     local elapsed=$(( SECONDS - start_time ))
 
@@ -670,16 +651,31 @@ draw_progress() {
     local m=$(( (eta % 3600) / 60 ))
     local s=$(( eta % 60 ))
 
-    printf "\r%s: [%s>%s] %d%% (%s %d/%d) ETA %02d:%02d:%02d" \
-        "$prefix" "$bar" "$spaces" "$progress" "$item_name" "$current" "$total" $h $m $s
+    # 바 이외 고정 부분 길이 계산: "prefix: [>] 100% (item_name total/total) ETA 00:00:00"
+    local suffix
+    suffix=$(printf " %d%% (%s %d/%d) ETA %02d:%02d:%02d" "$progress" "$item_name" "$current" "$total" $h $m $s)
+    local overhead=$(( ${#prefix} + 5 + ${#suffix} ))  # ": [" (3) + ">" (1) + "]" (1) + prefix + suffix
+    local bar_length=$(( cols - overhead ))
+    if [ "$bar_length" -lt 5 ]; then
+        bar_length=5
+    fi
+
+    local filled=$(( progress * bar_length / 100 ))
+    local empty=$(( bar_length - filled ))
+
+    local bar spaces line
+    bar=$(printf '%*s' "$filled" '' | tr ' ' '=')
+    spaces=$(printf '%*s' "$empty" '')
+    line=$(printf "%s: [%s>%s]%s" "$prefix" "$bar" "$spaces" "$suffix")
+
+    printf "\r\033[K%s" "${line:0:cols}"
 
     if (( current == total )); then
         echo ""
     fi
 }
 
-if [ "$use_local_versions" == '/dev/null' ]; then
-    if [ $use_all_tags -eq 0 ]; then
+if [ $use_all_tags -eq 0 ]; then
         TAGS_URL="https://gitlab-com.gitlab.io/support/toolbox/upgrade-path/path.json"
 
         echo "Processing GitLab-${GITLAB_EDITION^^} container tags... Location: $TAGS_URL"
@@ -693,7 +689,7 @@ if [ "$use_local_versions" == '/dev/null' ]; then
         fi
 
         if [ $extract_versions_only -eq 1 ]; then
-            echo "${ALL_TAGS[@]}" | tr ' ' '\n' > /tmp/gitlab-released-tags.txt
+            printf '%s\n' "${ALL_TAGS[@]}" | sed "s/${TAG_SUFFIX}$//" > /tmp/gitlab-released-tags.txt
             if [ "$(wc -l < /tmp/gitlab-released-tags.txt)" -gt 3 ]; then
                 echo -e "\nNote: Successfully exported gitlab-${GITLAB_EDITION} released tags. These tags are already sorted in ASC order. Location: /tmp/gitlab-released-tags.txt"
                 exit 0
@@ -763,7 +759,7 @@ if [ "$use_local_versions" == '/dev/null' ]; then
         done
         rm /tmp/gitlab-parsed.log &> /dev/null
         if [ $extract_versions_only -eq 1 ]; then
-            echo "${ALL_TAGS[@]}" | tr ' ' '\n' > /tmp/gitlab-released-tags.txt
+            printf '%s\n' "${ALL_TAGS[@]}" | sed -E "s/-(ce|ee)\.[0-9]*$//" > /tmp/gitlab-released-tags.txt
             if [ "$(wc -l < /tmp/gitlab-released-tags.txt)" -gt 3 ]; then
                 echo -e "\nNote: Successfully exported gitlab-${GITLAB_EDITION} released tags. These tags are already sorted in ASC order. Location: /tmp/gitlab-released-tags.txt"
                 exit 0
@@ -773,34 +769,6 @@ if [ "$use_local_versions" == '/dev/null' ]; then
                 exit 1
             fi
         fi
-    fi
-else
-    tr ' ' '\n' < "$use_local_versions" > "${use_local_versions}.tmp" && mv "${use_local_versions}.tmp" "$use_local_versions"
-    RAW_TAGS_N=$(sort -V "$use_local_versions" | grep -viE '(rc|nightly|latest)')
-    count=1
-    mapfile -t RAW_TAGS <<< "$RAW_TAGS_N"
-
-    if [ -n "$target_version_tag" ]; then
-        CUSTOM_TAGS=("$target_version_tag")
-        mapfile -t RAW_TAGS < <(printf "%s\n" "${RAW_TAGS[@]}" "${CUSTOM_TAGS[@]}" | sort -Vu)
-    fi
-
-    for idx in "${!RAW_TAGS[@]}"; do
-        tag="${RAW_TAGS[$idx]}"
-        draw_progress $count ${#RAW_TAGS[@]} "Verifying provided contents" 'Item'
-
-        ALL_TAGS+=("$tag")
-        count=$((count + 1))
-
-        if [ $((idx + 1)) -lt ${#RAW_TAGS[@]} ]; then
-            next_tag="${RAW_TAGS[$((idx + 1))]}"
-            first=$(printf '%s\n%s\n' "$tag" "$next_tag" | sort -V | head -n1)
-            if ! [[ "$first" == "$tag" ]]; then
-                echo -e "\nError: Tags are NOT in ASC order: $tag > $next_tag" >&2
-                exit 1
-            fi
-        fi
-    done
 fi
 
 # partial version resolve (--all-tags 모드에서만 도달)
