@@ -107,6 +107,22 @@ Post-upgrade:
 
 ## Tips
 
+### Pre-upgrade Checklist
+
+The script automatically handles disk space validation, backups, background migration tracking, and secrets integrity checks. The following manual steps are recommended before running the script:
+
+| Step | Description | Tier |
+|------|-------------|------|
+| 1. Pause Runners | Admin > Runners > Pause each runner. Wait for in-flight jobs to finish. | All |
+| 2. Notify users | Announce planned downtime (banner, email, etc.). Bundled Container Registry and Pages will also be unavailable during the upgrade. | All |
+| 3. Suppress monitoring | Mute external uptime monitors (e.g., UptimeRobot) to avoid false alerts. | All |
+| 4. Enable Maintenance Mode | Puts the instance into read-only state (see below). Also blocks scheduled pipelines. | Premium+ |
+| 5. Block external access | Disable port forwarding on your router to prevent external traffic. | All |
+
+After the upgrade completes, reverse these steps in the opposite order (5 → 1).
+
+### TARGET_URL
+
 > [!TIP]
 > `--target-url` is only used by the script to check server readiness via `curl` after each upgrade step. Any address reachable from the host running the script is sufficient — there is no need for external access.
 >
@@ -114,13 +130,11 @@ Post-upgrade:
 > # localhost is perfectly fine when running on the same host
 > ./upgrade-gitlab --target-url=http://localhost:8929
 > ```
->
-> Consider **disabling port forwarding** on your router during the upgrade to prevent external requests from reaching the server in an incomplete state.
+
+### Maintenance Mode (Premium/Ultimate 13.9+)
 
 > [!TIP]
-> **Maintenance Mode (Premium/Ultimate 13.9+)**
->
-> GitLab Premium and above provide a built-in [maintenance mode](https://docs.gitlab.com/administration/maintenance_mode/) that puts the instance into a read-only state. Enabling it before the upgrade prevents data changes while the server is being migrated.
+> GitLab Premium and above provide a built-in [maintenance mode](https://docs.gitlab.com/administration/maintenance_mode/) that puts the instance into a read-only state. Enabling it before the upgrade prevents data changes and blocks new pipeline triggers while the server is being migrated.
 >
 > ```bash
 > # Enable before upgrade
