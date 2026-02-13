@@ -567,31 +567,25 @@ check_migration_status() {
 
 wait_for_http_ready() {
     local label=$1
-    echo -n "waiting until $label server boots... "
-    local spinner='/-\|'
-    local n=${#spinner} i=0
-    echo -n ' '
-    while [ "$(curl -sf -o /dev/null "$TARGET_URL/users/sign_in" -w "%{http_code}\n")" != '200' ]; do
-        printf '\b%s' "${spinner:i++%n:1}"
-        print_stacktrace_errors
-        sleep 1
-    done
-    printf '\b\b%s' " "
+    echo "waiting until $label server boots..."
+    # shellcheck disable=SC2329
+    _http_ready_check() {
+        [ "$(curl -sf -o /dev/null "$TARGET_URL/users/sign_in" -w "%{http_code}" 2>/dev/null)" = '200' ]
+    }
+    poll_with_bouncing_bar "HTTP Ready" _http_ready_check
+    unset -f _http_ready_check
     echo 'done'
 }
 
 wait_for_healthy() {
     local label=$1
-    echo -n "waiting until $label container is ready... "
-    local spinner='/-\|'
-    local n=${#spinner} i=0
-    echo -n ' '
-    while [ "$(docker inspect --format='{{.State.Health.Status}}' "$CONTAINER_NAME" | grep -v unhealthy | grep -c healthy)" -ne 1 ]; do
-        printf '\b%s' "${spinner:i++%n:1}"
-        print_stacktrace_errors
-        sleep 1
-    done
-    printf '\b\b%s' " "
+    echo "waiting until $label container is ready..."
+    # shellcheck disable=SC2329
+    _healthy_check() {
+        [ "$(docker inspect --format='{{.State.Health.Status}}' "$CONTAINER_NAME" | grep -v unhealthy | grep -c healthy)" -eq 1 ]
+    }
+    poll_with_bouncing_bar "Health Check" _healthy_check
+    unset -f _healthy_check
     echo 'done'
 }
 
@@ -785,6 +779,92 @@ run_with_bouncing_bar() {
     local rc=$?
     rm -f "$tmpfile"
     return $rc
+}
+
+# poll_with_bouncing_bar <label> <check_cmd...>
+# check_cmd가 성공(exit 0)할 때까지 바운싱 바 + docker logs 표시
+poll_with_bouncing_bar() {
+    local label=$1
+    shift
+    local cond=("$@")
+    local tmpfile
+    tmpfile=$(mktemp)
+    local cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
+    local pos=0
+    local direction=1
+    local bounce='<===>'
+    local bounce_len=${#bounce}
+    local reset='\033[0m'
+    local bg_color bar_width padding_left padding_right bar_line
+    local last_line_count=0
+    local tick=0
+
+    # docker logs --follow --tail 0: 새로운 로그만 스트리밍
+    docker logs --follow --tail 0 "$CONTAINER_NAME" > "$tmpfile" 2>&1 &
+    local logs_pid=$!
+
+    while ! "${cond[@]}" 2>/dev/null; do
+        # 새 로그 출력 확인 및 표시
+        local current_lines
+        current_lines=$(wc -l < "$tmpfile")
+        if [ "$current_lines" -gt "$last_line_count" ]; then
+            printf '\r\033[K' > /dev/tty
+            sed -n "$((last_line_count + 1)),${current_lines}p" "$tmpfile"
+            last_line_count=$current_lines
+        fi
+
+        # bar_width 계산
+        bar_width=$(( cols - ${#label} - 5 ))
+        if [ "$bar_width" -lt 10 ]; then
+            bar_width=10
+        fi
+        if [ $pos -ge $((bar_width - bounce_len)) ]; then
+            pos=$((bar_width - bounce_len - 1))
+            direction=-1
+        fi
+
+        # 배경색
+        bg_color='\033[42;30m'
+        if [ "${_trap_active:-0}" -eq 1 ]; then
+            bg_color='\033[43;30m'
+        fi
+
+        # 바운싱 바 그리기
+        padding_left=$(printf '%*s' "$pos" '')
+        padding_right=$(printf '%*s' "$((bar_width - pos - bounce_len))" '')
+        bar_line=$(printf "${bg_color}[%s]${reset} [%s%s%s]" "$label" "$padding_left" "$bounce" "$padding_right")
+        printf '\r\033[K%s' "$bar_line" > /dev/tty
+
+        pos=$((pos + direction))
+        if [ $pos -ge $((bar_width - bounce_len)) ]; then
+            direction=-1
+        elif [ $pos -le 0 ]; then
+            direction=1
+        fi
+
+        # 컨테이너 사망 검사 (5회마다 = ~1초 간격)
+        tick=$((tick + 1))
+        if [ $((tick % 5)) -eq 0 ]; then
+            print_stacktrace_errors
+        fi
+
+        sleep 0.2
+    done
+
+    # docker logs 프로세스 종료
+    kill "$logs_pid" 2>/dev/null
+    wait "$logs_pid" 2>/dev/null
+
+    # 남은 로그 표시
+    local final_lines
+    final_lines=$(wc -l < "$tmpfile")
+    if [ "$final_lines" -gt "$last_line_count" ]; then
+        printf '\r\033[K' > /dev/tty
+        sed -n "$((last_line_count + 1)),${final_lines}p" "$tmpfile"
+    fi
+
+    printf '\r\033[K' > /dev/tty
+    rm -f "$tmpfile"
 }
 
 if [ $use_all_tags -eq 0 ]; then
@@ -1102,9 +1182,15 @@ if [ "$DETECTED_EDITION" != "$GITLAB_EDITION" ]; then
     enter_critical
 
     if docker ps --format "{{.Names}}" | grep -q "^$CONTAINER_NAME$"; then
-        echo -n "stopping $CURRENT_VERSION container with SIGINT signal..."
-        docker stop "$CONTAINER_NAME" &> /dev/null
-        echo ' done'
+        echo "stopping $CURRENT_VERSION container..."
+        run_with_bouncing_bar "Stopping" bash -c "
+            docker logs --follow --tail 0 \"$CONTAINER_NAME\" &
+            logs_pid=\$!
+            docker stop \"$CONTAINER_NAME\" 2>&1
+            kill \$logs_pid 2>/dev/null
+            wait \$logs_pid 2>/dev/null
+        "
+        echo 'done'
     fi
     echo -n "removing $CURRENT_VERSION container..."
     docker container rm "$CONTAINER_NAME" &> /dev/null
@@ -1160,9 +1246,15 @@ for ver in "${UPGRADE_POINTS_ARRAY[@]}"; do
     enter_critical
 
     if docker ps --format "{{.Names}}" | grep -q "^$CONTAINER_NAME$"; then
-        echo -n "stopping $CNT_VERSION container with SIGINT signal..."
-        docker stop "$CONTAINER_NAME" &> /dev/null
-        echo ' done'
+        echo "stopping $CNT_VERSION container..."
+        run_with_bouncing_bar "Stopping" bash -c "
+            docker logs --follow --tail 0 \"$CONTAINER_NAME\" &
+            logs_pid=\$!
+            docker stop \"$CONTAINER_NAME\" 2>&1
+            kill \$logs_pid 2>/dev/null
+            wait \$logs_pid 2>/dev/null
+        "
+        echo 'done'
     fi
     echo -n "removing $CNT_VERSION container..."
     docker container rm "$CONTAINER_NAME" &> /dev/null
