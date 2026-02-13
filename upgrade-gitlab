@@ -452,7 +452,7 @@ check_secrets_integrity() {
     echo "Verifying secrets integrity ($phase)..."
     # gitlab:doctor:secrets 는 GitLab 13.1 이상에서만 사용 가능
     local output
-    output=$(docker exec "$CONTAINER_NAME" gitlab-rake gitlab:doctor:secrets 2>&1)
+    output=$(run_with_bouncing_bar "Secrets Check" docker exec "$CONTAINER_NAME" gitlab-rake gitlab:doctor:secrets 2>&1)
     local rc=$?
     if [ $rc -ne 0 ]; then
         if echo "$output" | grep -q "Don't know how to build task"; then
@@ -554,12 +554,13 @@ wait_for_background_migrations() {
 }
 
 check_migration_status() {
+    local migrate_output
+    migrate_output=$(run_with_bouncing_bar "Migration Status" docker exec "$CONTAINER_NAME" gitlab-rake db:migrate:status 2>/dev/null)
     local down_count
-    down_count=$(docker exec "$CONTAINER_NAME" gitlab-rake db:migrate:status 2>/dev/null \
-        | grep -c "^\s*down")
+    down_count=$(echo "$migrate_output" | grep -c "^\s*down")
     if [ "$down_count" -gt 0 ]; then
         echo "Warning: $down_count migration(s) in 'down' state detected" >&2
-        docker exec "$CONTAINER_NAME" gitlab-rake db:migrate:status | grep "^\s*down" >&2
+        echo "$migrate_output" | grep "^\s*down" >&2
         send_discord_webhook "WARN" "Migration status issue" "$down_count migration(s) in down state"
     fi
 }
@@ -599,14 +600,14 @@ check_gitlab_server_healthy() {
     if docker exec "$CONTAINER_NAME" gitlab-ctl status; then
         enter_critical
         if [ "$skip_reconfigure" -eq 0 ]; then
-            docker exec "$CONTAINER_NAME" gitlab-ctl reconfigure
+            run_with_bouncing_bar "Reconfigure" docker exec "$CONTAINER_NAME" gitlab-ctl reconfigure
         else
-            docker exec "$CONTAINER_NAME" gitlab-ctl restart
+            run_with_bouncing_bar "Restart" docker exec "$CONTAINER_NAME" gitlab-ctl restart
         fi
-        docker exec "$CONTAINER_NAME" gitlab-ctl pg-upgrade
-        docker exec "$CONTAINER_NAME" gitlab-rake db:migrate
+        run_with_bouncing_bar "PG Upgrade" docker exec "$CONTAINER_NAME" gitlab-ctl pg-upgrade
+        run_with_bouncing_bar "DB Migrate" docker exec "$CONTAINER_NAME" gitlab-rake db:migrate
         exit_critical
-        docker exec "$CONTAINER_NAME" gitlab-ctl status || print_stacktrace_errors
+        run_with_bouncing_bar "Status" docker exec "$CONTAINER_NAME" gitlab-ctl status || print_stacktrace_errors
     else
         print_stacktrace_errors
     fi
@@ -691,6 +692,99 @@ draw_progress() {
     if (( current == total )); then
         echo ""
     fi
+}
+
+# run_with_bouncing_bar <label> <command...>
+# 명령을 실행하면서 하단에 바운싱 바 표시
+# 명령의 stdout/stderr를 stdout으로 패스스루하되, 출력 없는 구간에 바운싱 바 애니메이션
+# 바운싱 바 애니메이션은 /dev/tty로 직접 출력하여 stdout 캡처 시에도 터미널에 표시
+run_with_bouncing_bar() {
+    local label=$1
+    shift
+    local cmd=("$@")
+    local tmpfile
+    tmpfile=$(mktemp)
+    local cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
+    local pos=0
+    local direction=1
+    local bounce='<===>'
+    local bounce_len=${#bounce}
+    # bar_width = 터미널 너비 - "[label] [" (label+4) - "]" (1) 를 빼서 동적 계산
+    local bar_width=$(( cols - ${#label} - 5 ))
+    if [ "$bar_width" -lt 10 ]; then
+        bar_width=10
+    fi
+    local reset='\033[0m'
+    local bg_color current_lines last_output padding_left padding_right bar_line
+
+    # 명령을 백그라운드로 실행, 출력을 임시 파일에 기록
+    "${cmd[@]}" > "$tmpfile" 2>&1 &
+    local cmd_pid=$!
+    local last_line_count=0
+
+    while kill -0 "$cmd_pid" 2>/dev/null; do
+        # 새 출력 확인 및 표시
+        current_lines=$(wc -l < "$tmpfile")
+        if [ "$current_lines" -gt "$last_line_count" ]; then
+            printf '\r\033[K' > /dev/tty
+            sed -n "$((last_line_count + 1)),${current_lines}p" "$tmpfile"
+            last_line_count=$current_lines
+            # 마지막 출력에서 단계명 파싱
+            last_output=$(tail -1 "$tmpfile" | sed -n 's/.*-- \(.*\) \.\.\..*/\1/p')
+            if [ -n "$last_output" ]; then
+                label="Backup: $last_output"
+            fi
+        fi
+
+        # label 변경에 맞춰 bar_width 재계산
+        bar_width=$(( cols - ${#label} - 5 ))
+        if [ "$bar_width" -lt 10 ]; then
+            bar_width=10
+        fi
+        if [ $pos -ge $((bar_width - bounce_len)) ]; then
+            pos=$((bar_width - bounce_len - 1))
+            direction=-1
+        fi
+
+        # 라벨 배경색: critical section(노랑), 일반(초록)
+        bg_color='\033[42;30m'
+        if [ "${_trap_active:-0}" -eq 1 ]; then
+            bg_color='\033[43;30m'
+        fi
+
+        # 바운싱 바 그리기 (tty)
+        padding_left=$(printf '%*s' "$pos" '')
+        padding_right=$(printf '%*s' "$((bar_width - pos - bounce_len))" '')
+        bar_line=$(printf "${bg_color}[%s]${reset} [%s%s%s]" "$label" "$padding_left" "$bounce" "$padding_right")
+        printf '\r\033[K%s' "$bar_line" > /dev/tty
+
+        # 위치 업데이트
+        pos=$((pos + direction))
+        if [ $pos -ge $((bar_width - bounce_len)) ]; then
+            direction=-1
+        elif [ $pos -le 0 ]; then
+            direction=1
+        fi
+
+        sleep 0.2
+    done
+
+    # 남은 출력 표시 (stdout)
+    local final_lines
+    final_lines=$(wc -l < "$tmpfile")
+    if [ "$final_lines" -gt "$last_line_count" ]; then
+        printf '\r\033[K' > /dev/tty
+        sed -n "$((last_line_count + 1)),${final_lines}p" "$tmpfile"
+    fi
+
+    # 바운싱 바 지우기 (tty)
+    printf '\r\033[K' > /dev/tty
+
+    # 종료 코드 수집
+    wait "$cmd_pid"
+    local rc=$?
+    rm -f "$tmpfile"
+    return $rc
 }
 
 if [ $use_all_tags -eq 0 ]; then
@@ -975,9 +1069,9 @@ check_disk_space
 
 echo "Creating backups for $CURRENT_VERSION. Please wait until backup process is completed..."
 if docker exec "$CONTAINER_NAME" which gitlab-backup &>/dev/null; then
-    docker exec "$CONTAINER_NAME" gitlab-backup create
+    run_with_bouncing_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-backup create
 else
-    docker exec "$CONTAINER_NAME" gitlab-rake gitlab:backup:create
+    run_with_bouncing_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-rake gitlab:backup:create
 fi
 BACKUP_DIR=$(docker exec "$CONTAINER_NAME" grep "'backup_path'" /etc/gitlab/gitlab.rb | awk -F"=" '{ print $2 }' | sed 's/\"//g' | sed 's/^ //')
 docker exec "$CONTAINER_NAME" sh -c "cp /etc/gitlab/gitlab-secrets.json $BACKUP_DIR/gitlab-secrets.json.${CURRENT_VERSION}-backup"
