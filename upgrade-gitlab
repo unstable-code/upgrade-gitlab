@@ -558,6 +558,36 @@ check_migration_status() {
     fi
 }
 
+wait_for_http_ready() {
+    local label=$1
+    echo -n "waiting until $label server boots... "
+    local spinner='/-\|'
+    local n=${#spinner} i=0
+    echo -n ' '
+    while [ "$(curl -sf -o /dev/null "$TARGET_URL/explore/projects" -w "%{http_code}\n")" != '200' ]; do
+        printf '\b%s' "${spinner:i++%n:1}"
+        print_stacktrace_errors
+        sleep 1
+    done
+    printf '\b\b%s' " "
+    echo 'done'
+}
+
+wait_for_healthy() {
+    local label=$1
+    echo -n "waiting until $label container is ready... "
+    local spinner='/-\|'
+    local n=${#spinner} i=0
+    echo -n ' '
+    while [ "$(docker inspect --format='{{.State.Health.Status}}' "$CONTAINER_NAME" | grep -v unhealthy | grep -c healthy)" -ne 1 ]; do
+        printf '\b%s' "${spinner:i++%n:1}"
+        print_stacktrace_errors
+        sleep 1
+    done
+    printf '\b\b%s' " "
+    echo 'done'
+}
+
 check_gitlab_server_healthy() {
     local skip_reconfigure=${1:-0}
     if docker exec "$CONTAINER_NAME" gitlab-ctl status; then
@@ -599,18 +629,8 @@ print_stacktrace_errors() {
 }
 
 if ! docker ps --format "{{.Names}}" | grep -q "^$CONTAINER_NAME$"; then
-    echo -n 'waiting until GitLab server is back online... '
     docker start "$CONTAINER_NAME" &> /dev/null
-    spinner='/-\|'
-    n=${#spinner}
-    echo -n ' '
-    while [ "$(docker inspect --format='{{.State.Health.Status}}' "$CONTAINER_NAME" | grep -v unhealthy | grep -c healthy)" -ne 1 ]; do
-        printf '\b%s' "${spinner:i++%n:1}"
-        print_stacktrace_errors
-        sleep 1
-    done
-    printf '\b\b%s' " "
-    echo 'done'
+    wait_for_healthy "GitLab server"
 fi
 
 CURRENT_VERSION=$(docker exec "$CONTAINER_NAME" dpkg -l | grep gitlab | awk '{ print $3 }')
@@ -950,25 +970,23 @@ auto_restart_enabled=$(docker inspect --format='{{.HostConfig.RestartPolicy.Name
 # 0. 디스크 여유 공간 사전 검증
 check_disk_space
 
-if ! [ -r /tmp/upgrade-gitlab.lock ]; then
-    echo "Creating backups for $CURRENT_VERSION. Please wait until backup process is completed..."
-    docker exec "$CONTAINER_NAME" gitlab-backup create
-    BACKUP_DIR=$(docker exec "$CONTAINER_NAME" grep "'backup_path'" /etc/gitlab/gitlab.rb | awk -F"=" '{ print $2 }' | sed 's/\"//g' | sed 's/^ //')
-    docker exec "$CONTAINER_NAME" sh -c "cp /etc/gitlab/gitlab-secrets.json $BACKUP_DIR/gitlab-secrets.json.${CURRENT_VERSION}-backup"
-    docker exec "$CONTAINER_NAME" sh -c "cp /etc/gitlab/gitlab.rb $BACKUP_DIR/gitlab.rb.${CURRENT_VERSION}-backup"
+echo "Creating backups for $CURRENT_VERSION. Please wait until backup process is completed..."
+docker exec "$CONTAINER_NAME" gitlab-backup create
+BACKUP_DIR=$(docker exec "$CONTAINER_NAME" grep "'backup_path'" /etc/gitlab/gitlab.rb | awk -F"=" '{ print $2 }' | sed 's/\"//g' | sed 's/^ //')
+docker exec "$CONTAINER_NAME" sh -c "cp /etc/gitlab/gitlab-secrets.json $BACKUP_DIR/gitlab-secrets.json.${CURRENT_VERSION}-backup"
+docker exec "$CONTAINER_NAME" sh -c "cp /etc/gitlab/gitlab.rb $BACKUP_DIR/gitlab.rb.${CURRENT_VERSION}-backup"
 
-    # Secrets 무결성 기준선 확인
-    if ! check_secrets_integrity "pre-upgrade"; then
-        if [ $auto_yes -eq 1 ]; then
-            echo "Aborted due to secrets integrity check failure (-y mode)." >&2
-            exit 1
-        fi
-        echo -n "Continue despite secrets integrity warning? (y/N) > "
-        read -r secrets_confirm < /dev/tty
-        if [ "$secrets_confirm" != "y" ] && [ "$secrets_confirm" != "Y" ]; then
-            echo "Aborted due to secrets integrity check failure." >&2
-            exit 1
-        fi
+# Secrets 무결성 기준선 확인
+if ! check_secrets_integrity "pre-upgrade"; then
+    if [ $auto_yes -eq 1 ]; then
+        echo "Aborted due to secrets integrity check failure (-y mode)." >&2
+        exit 1
+    fi
+    echo -n "Continue despite secrets integrity warning? (y/N) > "
+    read -r secrets_confirm < /dev/tty
+    if [ "$secrets_confirm" != "y" ] && [ "$secrets_confirm" != "Y" ]; then
+        echo "Aborted due to secrets integrity check failure." >&2
+        exit 1
     fi
 fi
 
@@ -1002,29 +1020,8 @@ if [ "$DETECTED_EDITION" != "$GITLAB_EDITION" ]; then
 
     exit_critical
 
-    echo -n "waiting until $GITLAB_IMAGE:$EDITION_SWITCH_TAG server boots... "
-    spinner='/-\|'
-    n=${#spinner}
-    echo -n ' '
-    while [ "$(curl -sf -o /dev/null "$TARGET_URL/explore/projects" -w "%{http_code}\n")" != '200' ]; do
-        printf '\b%s' "${spinner:i++%n:1}"
-        print_stacktrace_errors
-        sleep 1
-    done
-    printf '\b\b%s' " "
-    echo 'done'
-
-    echo -n "waiting until $GITLAB_IMAGE:$EDITION_SWITCH_TAG container is ready... "
-    spinner='/-\|'
-    n=${#spinner}
-    echo -n ' '
-    while [ "$(docker inspect --format='{{.State.Health.Status}}' "$CONTAINER_NAME" | grep -v unhealthy | grep -c healthy)" -ne 1 ]; do
-        printf '\b%s' "${spinner:i++%n:1}"
-        print_stacktrace_errors
-        sleep 1
-    done
-    printf '\b\b%s' " "
-    echo 'done'
+    wait_for_http_ready "$GITLAB_IMAGE:$EDITION_SWITCH_TAG"
+    wait_for_healthy "$GITLAB_IMAGE:$EDITION_SWITCH_TAG"
 
     wait_for_background_migrations
     check_migration_status
@@ -1053,17 +1050,7 @@ for ver in "${UPGRADE_POINTS_ARRAY[@]}"; do
 
     if ! docker ps --format "{{.Names}}" | grep -q "^$CONTAINER_NAME$"; then
         docker start "$CONTAINER_NAME" &> /dev/null
-        echo -n "waiting until $GITLAB_IMAGE:$CNT_VERSION container is ready..."
-        spinner='/-\|'
-        n=${#spinner}
-        echo -n ' '
-        while [ "$(docker inspect --format='{{.State.Health.Status}}' "$CONTAINER_NAME" | grep -v unhealthy | grep -c healthy)" -ne 1 ]; do
-            printf '\b%s' "${spinner:i++%n:1}"
-            print_stacktrace_errors
-            sleep 1
-        done
-        printf '\b\b%s' " "
-        echo 'done'
+        wait_for_healthy "$GITLAB_IMAGE:$CNT_VERSION"
     fi
 
     wait_for_background_migrations
@@ -1097,29 +1084,8 @@ for ver in "${UPGRADE_POINTS_ARRAY[@]}"; do
 
     exit_critical
 
-    echo -n "waiting until $GITLAB_IMAGE:$ver server boots... "
-    spinner='/-\|'
-    n=${#spinner}
-    echo -n ' '
-    while [ "$(curl -sf -o /dev/null "$TARGET_URL/explore/projects" -w "%{http_code}\n")" != '200' ]; do
-        printf '\b%s' "${spinner:i++%n:1}"
-        print_stacktrace_errors
-        sleep 1
-    done
-    printf '\b\b%s' " "
-    echo 'done'
-
-    echo -n "waiting until $GITLAB_IMAGE:$ver container is ready... "
-    spinner='/-\|'
-    n=${#spinner}
-    echo -n ' '
-    while [ "$(docker inspect --format='{{.State.Health.Status}}' "$CONTAINER_NAME" | grep -v unhealthy | grep -c healthy)" -ne 1 ]; do
-        printf '\b%s' "${spinner:i++%n:1}"
-        print_stacktrace_errors
-        sleep 1
-    done
-    printf '\b\b%s' " "
-    echo 'done'
+    wait_for_http_ready "$GITLAB_IMAGE:$ver"
+    wait_for_healthy "$GITLAB_IMAGE:$ver"
 
     # 백그라운드 마이그레이션 완료 대기
     wait_for_background_migrations
@@ -1169,6 +1135,5 @@ fi
 echo "Successfully updated GitLab server from $CURRENT_VERSION to ${UPGRADE_POINTS_ARRAY[-1]}"
 echo "Updated traceroute: ${UPGRADE_POINTS_ARRAY[*]}"
 send_discord_webhook "NOTE" "Successfully upgraded GitLab server!" "GitLab version changed from $CURRENT_VERSION to ${UPGRADE_POINTS_ARRAY[-1]}"
-rm /tmp/upgrade-gitlab.lock &> /dev/null
 
 exit 0
