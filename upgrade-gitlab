@@ -570,7 +570,7 @@ wait_for_http_ready() {
     local spinner='/-\|'
     local n=${#spinner} i=0
     echo -n ' '
-    while [ "$(curl -sf -o /dev/null "$TARGET_URL/explore/projects" -w "%{http_code}\n")" != '200' ]; do
+    while [ "$(curl -sf -o /dev/null "$TARGET_URL/users/sign_in" -w "%{http_code}\n")" != '200' ]; do
         printf '\b%s' "${spinner:i++%n:1}"
         print_stacktrace_errors
         sleep 1
@@ -897,7 +897,7 @@ fi
 if [ ${#UPGRADE_POINTS_ARRAY[@]} -eq 0 ]; then
     echo "Requirements already satisfied: v$CURRENT_VERSION"
 
-    if ! curl -sf -o /dev/null "$TARGET_URL/explore/projects"; then
+    if ! curl -sf -o /dev/null "$TARGET_URL/users/sign_in"; then
         echo "NOTE: If your GitLab server does not work properly, please edit $(docker inspect "$CONTAINER_NAME" --format='{{range .Mounts}}{{.Source}}:{{.Destination}} {{end}}' | tr ' ' '\n' | grep /etc/gitlab | awk -F ':' '{ print $1 }')/gitlab.rb file or 'docker exec -it $CONTAINER_NAME /bin/bash && vi /etc/gitlab/gitlab.rb'"
     fi
     exit 0
