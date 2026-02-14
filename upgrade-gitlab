@@ -647,7 +647,7 @@ draw_progress() {
     local total=$2
     local prefix=$3
     local item_name=$4
-    local cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
+    local cols=${COLUMNS:-$(tput cols 2>/dev/null || stty size 2>/dev/null | awk '{print $2}' || echo 80)}
 
     local progress=0
     if [ "$total" -gt 0 ]; then
@@ -699,7 +699,7 @@ run_with_bouncing_bar() {
     local cmd=("$@")
     local tmpfile
     tmpfile=$(mktemp)
-    local cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
+    local cols=${COLUMNS:-$(tput cols 2>/dev/null || stty size 2>/dev/null | awk '{print $2}' || echo 80)}
     local pos=0
     local direction=1
     local bounce='<===>'
@@ -790,7 +790,7 @@ poll_with_bouncing_bar() {
     local cond=("$@")
     local tmpfile
     tmpfile=$(mktemp)
-    local cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
+    local cols=${COLUMNS:-$(tput cols 2>/dev/null || stty size 2>/dev/null | awk '{print $2}' || echo 80)}
     local pos=0
     local direction=1
     local bounce='<===>'
