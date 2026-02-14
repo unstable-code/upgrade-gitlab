@@ -621,6 +621,7 @@ print_stacktrace_errors() {
         # shellcheck disable=SC2016
         echo 'upgrade-gitlab script does not recover this issue. Please restore previous backup with `gitlab-rake gitlab:backup:restore`' >&2
         echo 'For more information, please visit: https://docs.gitlab.com/administration/backup_restore' >&2
+        echo 'Troubleshooting guide: https://gitlab.com/unstable-code/upgrade-gitlab/-/wikis/Troubleshooting' >&2
         if [ -z "$BACKUP_DIR" ]; then
             BACKUP_DIR=$(docker exec "$CONTAINER_NAME" grep "'backup_path'" /etc/gitlab/gitlab.rb 2>/dev/null | awk -F"=" '{ print $2 }' | sed 's/\"//g' | sed 's/^ //')
         fi
