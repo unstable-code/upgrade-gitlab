@@ -105,46 +105,12 @@ Post-upgrade:
 | SIGHUP | Exit | Deferred | Restart pull |
 | SIGQUIT (Ctrl+\\) | Exit | Exit | Exit |
 
-## Tips
+## Wiki
 
-### Pre-upgrade Checklist
+For detailed guides, see the [project wiki](https://gitlab.com/unstable-code/upgrade-gitlab/-/wikis/home):
 
-The script automatically handles disk space validation, backups, background migration tracking, and secrets integrity checks. The following manual steps are recommended before running the script:
-
-| Step | Description | Tier |
-|------|-------------|------|
-| 1. Pause Runners | Admin > Runners > Pause each runner. Wait for in-flight jobs to finish. | All |
-| 2. Notify users | Announce planned downtime (banner, email, etc.). Bundled Container Registry and Pages will also be unavailable during the upgrade. | All |
-| 3. Suppress monitoring | Mute external uptime monitors (e.g., UptimeRobot) to avoid false alerts. | All |
-| 4. Enable Maintenance Mode | Puts the instance into read-only state (see below). Also blocks scheduled pipelines. | Premium+ |
-| 5. Block external access | Disable port forwarding on your router to prevent external traffic. | All |
-
-After the upgrade completes, reverse these steps in the opposite order (5 → 1).
-
-### TARGET_URL
-
-> [!TIP]
-> `--target-url` is only used by the script to check server readiness via `curl` after each upgrade step. Any address reachable from the host running the script is sufficient — there is no need for external access.
->
-> ```bash
-> # localhost is perfectly fine when running on the same host
-> ./upgrade-gitlab --target-url=http://localhost:8929
-> ```
-
-### Maintenance Mode (Premium/Ultimate 13.9+)
-
-> [!TIP]
-> GitLab Premium and above provide a built-in [maintenance mode](https://docs.gitlab.com/administration/maintenance_mode/) that puts the instance into a read-only state. Enabling it before the upgrade prevents data changes and blocks new pipeline triggers while the server is being migrated.
->
-> ```bash
-> # Enable before upgrade
-> docker exec <container> gitlab-rails runner \
->   "::Gitlab::CurrentSettings.update!(maintenance_mode: true, maintenance_mode_message: 'Upgrade in progress')"
->
-> # Disable after upgrade
-> docker exec <container> gitlab-rails runner \
->   "::Gitlab::CurrentSettings.update!(maintenance_mode: false)"
-> ```
+- [Pre-upgrade Checklist](https://gitlab.com/unstable-code/upgrade-gitlab/-/wikis/Pre-upgrade-Checklist) — Manual steps to complete before running the script
+- [Troubleshooting](https://gitlab.com/unstable-code/upgrade-gitlab/-/wikis/Troubleshooting) — Solutions for DB migration failures and debugging tips
 
 ## License
 
