@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 
-PAGE_SIZE=${PAGE_SIZE:-25}
 BACKUP_DIR=
 DISCORD_URL=${DISCORD_URL:-}
 GITLAB_EDITION=
 PULL_PID=
 
-extract_versions_only=0
-use_all_tags=0
+skip_latest=0
 target_version_tag=
 auto_restart_enabled=no
 _in_stacktrace=0
@@ -82,24 +80,20 @@ pull_with_retry() {
 }
 
 if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
-    echo "Usage: $0 [-y] [--edition=ce|ee] [--all-tags [--page-size=25]] [--target-url=http] [--discord-url=http] [--extract | --version=0.0.0]"
+    echo "Usage: $0 [-y] [--edition=ce|ee] [--target-url=http] [--discord-url=http] [--version=0.0.0] [--skip-latest]"
 
     echo -e '\n\e[0;1mOPTIONS\e[m'
     echo -e "-y\t\t\tAuto-confirm prompts for unattended/cron usage. Aborts on safety warnings and if upgrade path >= 3 steps."
     echo -e "--help\t\t\tShow this help."
     echo -e "--edition=ce|ee\t\tForce GitLab edition (ce or ee). Auto-detected if omitted."
-    echo -e "--extract\t\tDownload GitLab released tags file. (aka. export)"
-    echo -e "\t\t\tTags file will be saved to /tmp/gitlab-released-tags.txt"
-    echo -e "--all-tags\t\tParse all tags from Docker Hub instead of GitLab upgrade-path site."
-    echo -e "--version=0.0.0\t\tUse provided tag instead of latest tag."
+    echo -e "--version=0.0.0\t\tUse provided tag instead of latest tag. Partial versions (e.g. 18) are resolved automatically."
+    echo -e "--skip-latest\t\tTarget the second-latest version (N-1 strategy). (alias: --n-1)"
     echo -e "--target-url=http\tPerform a simple connection test for your GitLab server."
     echo -e "--discord-url=http\tNotify via Discord webhook."
-    echo -e "--page-size=25\t\tSet the number of tags per page with --all-tags flag."
 
     echo -e '\n\e[0;1mENV VALUES\e[m'
     echo -e "TARGET_URL=http\t\tSame as --target-url flag."
     echo -e "DISCORD_URL=http\tSame as --discord-url flag."
-    echo -e "PAGE_SIZE=25\t\tSame as --page-size flag."
     exit 0
 else
     params=("${@}")
@@ -109,14 +103,8 @@ else
 
             if [ "${params[$i]}" == "-y" ] || [ "${params[$i]}" == "--yes" ]; then
                 auto_yes=1
-            elif [ "${params[$i]}" == "--all-tags" ]; then
-                use_all_tags=1
-            elif [ "${params[$i]}" == "--extract" ] || [ "${params[$i]}" == "--export" ]; then
-                if [ -n "$target_version_tag" ]; then
-                    echo "Error: --extract and --version cannot be used together." >&2
-                    exit 1
-                fi
-                extract_versions_only=1
+            elif [ "${params[$i]}" == "--skip-latest" ] || [ "${params[$i]}" == "--n-1" ]; then
+                skip_latest=1
             elif [[ "${params[$i]}" == "--edition"* ]]; then
                 if [ "$temp" != "ce" ] && [ "$temp" != "ee" ]; then
                     echo "Error: --edition must be 'ce' or 'ee'" >&2
@@ -124,8 +112,8 @@ else
                 fi
                 edition_flag=$temp
             elif [[ "${params[$i]}" == "--version"* ]]; then
-                if [ $extract_versions_only -eq 1 ]; then
-                    echo "Error: --version and --extract cannot be used together." >&2
+                if [ $skip_latest -eq 1 ]; then
+                    echo "Error: --version and --skip-latest cannot be used together." >&2
                     exit 1
                 fi
                 if [ -n "$target_version_tag" ]; then
@@ -143,11 +131,6 @@ else
                     echo "Warning: Overriding DISCORD_URL from $DISCORD_URL to $temp"
                 fi
                 DISCORD_URL=$temp
-            elif [[ "${params[$i]}" == "--page-size"* ]]; then
-                if [ -n "$PAGE_SIZE" ]; then
-                    echo "Warning: Overriding PAGE_SIZE from $PAGE_SIZE to $temp"
-                fi
-                PAGE_SIZE=$temp
             fi
         fi
     done
@@ -277,11 +260,6 @@ _partial_version=0
 if [ -n "$target_version_tag" ]; then
     # partial version 감지 (x 또는 x.y 형식)
     if [[ "$target_version_tag" =~ ^[0-9]+$ ]] || [[ "$target_version_tag" =~ ^[0-9]+\.[0-9]+$ ]]; then
-        if [ $use_all_tags -eq 0 ]; then
-            echo "Error: Partial version (--version=$target_version_tag) requires --all-tags flag." >&2
-            echo "Hint: Use exact version (e.g. --version=16.9.1) or add --all-tags to resolve from Docker Hub." >&2
-            exit 1
-        fi
         _partial_version=1
         echo "Partial version provided: $target_version_tag (will resolve after fetching tags)"
     else
@@ -291,7 +269,6 @@ if [ -n "$target_version_tag" ]; then
 
         if curl -sf "https://hub.docker.com/v2/repositories/${GITLAB_IMAGE}/tags/$target_version_tag" &> /dev/null; then
             echo "Using $target_version_tag instead of latest"
-            extract_versions_only=0
         else
             echo "Error: No such $target_version_tag tag in Docker Hub. Using alternative tag: latest" >&2
             target_version_tag=
@@ -868,107 +845,32 @@ poll_with_bouncing_bar() {
     rm -f "$tmpfile"
 }
 
-if [ $use_all_tags -eq 0 ]; then
-        TAGS_URL="https://gitlab-com.gitlab.io/support/toolbox/upgrade-path/path.json"
+TAGS_URL="https://gitlab-com.gitlab.io/support/toolbox/upgrade-path/path.json"
+echo "Processing GitLab-${GITLAB_EDITION^^} container tags... Location: $TAGS_URL"
 
-        echo "Processing GitLab-${GITLAB_EDITION^^} container tags... Location: $TAGS_URL"
-        ALL_TAGS=()
-        if [ -z "$target_version_tag" ]; then
-            mapfile -t ALL_TAGS < <(curl -sf "$TAGS_URL" | jq -r '.all | unique[]' | sort -V | sed "s/\$/${TAG_SUFFIX}/g")
-        else
-            mapfile -t TAGS < <(curl -sf "$TAGS_URL" | jq -r '.all[]' | sed "s/\$/${TAG_SUFFIX}/g")
-            CUSTOM_TAGS=("$target_version_tag")
-            mapfile -t ALL_TAGS < <(printf "%s\n" "${TAGS[@]}" "${CUSTOM_TAGS[@]}" | sort -Vu)
-        fi
+PATH_JSON=$(curl -sf "$TAGS_URL")
+ALL_TAGS=()
 
-        if [ $extract_versions_only -eq 1 ]; then
-            printf '%s\n' "${ALL_TAGS[@]}" | sed "s/${TAG_SUFFIX}$//" > /tmp/gitlab-released-tags.txt
-            if [ "$(wc -l < /tmp/gitlab-released-tags.txt)" -gt 3 ]; then
-                echo -e "\nNote: Successfully exported gitlab-${GITLAB_EDITION} released tags. These tags are already sorted in ASC order. Location: /tmp/gitlab-released-tags.txt"
-                exit 0
-            else
-                echo -e "\nError: Failed to export gitlab-${GITLAB_EDITION} released tags. Internal error occurred." >&2
-                rm /tmp/gitlab-released-tags.txt &> /dev/null
-                exit 1
-            fi
-        fi
-    else
-        TAGS_URL="https://hub.docker.com/v2/repositories/${GITLAB_IMAGE}/tags/?page_size=$PAGE_SIZE"
-
-        RESPONSE=$(curl -sL "$TAGS_URL")
-        TOTAL_COUNT=$(echo "$RESPONSE" | jq '.count')
-
-        TOTAL_PAGES=$(( (TOTAL_COUNT + PAGE_SIZE - 1) / PAGE_SIZE ))
-
-        ALL_TAGS=()
-
-        echo "Spooling GitLab-${GITLAB_EDITION^^} container tags... Location: $TAGS_URL"
-        while [ -n "$TAGS_URL" ]; do
-            RESPONSE=$(curl -sL "$TAGS_URL")
-            mapfile -t TAGS < <(echo "$RESPONSE" | jq -r '.results[].name')
-            if [ ${#TAGS[@]} -eq 0 ]; then
-                break
-            else
-                CURRENT_PAGE=$(echo "$TAGS_URL" | grep -oE 'page=[0-9]+' | grep -oE '[0-9]+' || echo 1)
-                draw_progress "$CURRENT_PAGE" "$TOTAL_PAGES" 'Querying GitLab Releases' 'Page'
-            fi
-            ALL_TAGS+=("${TAGS[@]}")
-            TAGS_URL=$(echo "$RESPONSE" | jq -r '.next // empty')
-        done
-
-        echo -e "\nSorting ASC GitLab-${GITLAB_EDITION^^} released tags..."
-
-        printf '%s\n' "${ALL_TAGS[@]}" | tr ' ' '\n' > /tmp/gitlab-parsed.log
-
-        RAW_TAGS_N=$(sort -V /tmp/gitlab-parsed.log | grep -viE '(rc|nightly|latest)')
-        count=1
-        mapfile -t RAW_TAGS <<< "$RAW_TAGS_N"
-
-        if [ ${#RAW_TAGS[@]} -lt 2 ]; then
-            echo 'Error: Unexpected EOF while parsing version tags' >&2
-            exit 1
-        fi
-
-        ALL_TAGS=()
-        for idx in "${!RAW_TAGS[@]}"; do
-            tag="${RAW_TAGS[$idx]}"
-            if [ $extract_versions_only -eq 1 ]; then
-                draw_progress $count ${#RAW_TAGS[@]} "Exporting provided contents" 'Item'
-            else
-                draw_progress $count ${#RAW_TAGS[@]} "Including provided contents" 'Item'
-            fi
-
-            ALL_TAGS+=("$tag")
-            count=$((count + 1))
-
-            if [ $((idx + 1)) -lt ${#RAW_TAGS[@]} ]; then
-                next_tag="${RAW_TAGS[$((idx + 1))]}"
-                first=$(printf '%s\n%s\n' "$tag" "$next_tag" | sort -V | head -n1)
-                if ! [[ "$first" == "$tag" ]]; then
-                    echo -e "\nError: Tags are NOT in ASC order: $tag > $next_tag" >&2
-                    exit 1
-                fi
-            fi
-        done
-        rm /tmp/gitlab-parsed.log &> /dev/null
-        if [ $extract_versions_only -eq 1 ]; then
-            printf '%s\n' "${ALL_TAGS[@]}" | sed -E "s/-(ce|ee)\.[0-9]*$//" > /tmp/gitlab-released-tags.txt
-            if [ "$(wc -l < /tmp/gitlab-released-tags.txt)" -gt 3 ]; then
-                echo -e "\nNote: Successfully exported gitlab-${GITLAB_EDITION} released tags. These tags are already sorted in ASC order. Location: /tmp/gitlab-released-tags.txt"
-                exit 0
-            else
-                echo -e "\nError: Failed to export gitlab-${GITLAB_EDITION} released tags. Internal error occurred." >&2
-                rm /tmp/gitlab-released-tags.txt &> /dev/null
-                exit 1
-            fi
-        fi
+if [ $skip_latest -eq 1 ] && [ -z "$target_version_tag" ]; then
+    # N-1: all 배열의 마지막 직전 버전을 타겟으로 설정
+    n1_version=$(echo "$PATH_JSON" | jq -r '.all[-2]')
+    target_version_tag="${n1_version}${TAG_SUFFIX}"
+    echo "Skip-latest (N-1) mode: targeting $target_version_tag"
 fi
 
-# partial version resolve (--all-tags 모드에서만 도달)
+if [ -z "$target_version_tag" ]; then
+    mapfile -t ALL_TAGS < <(echo "$PATH_JSON" | jq -r '.all | unique[]' | sort -V | sed "s/\$/${TAG_SUFFIX}/g")
+else
+    mapfile -t TAGS < <(echo "$PATH_JSON" | jq -r '.all[]' | sed "s/\$/${TAG_SUFFIX}/g")
+    CUSTOM_TAGS=("$target_version_tag")
+    mapfile -t ALL_TAGS < <(printf "%s\n" "${TAGS[@]}" "${CUSTOM_TAGS[@]}" | sort -Vu)
+fi
+
+# partial version resolve
 if [ "$_partial_version" -eq 1 ]; then
     resolved=$(printf '%s\n' "${ALL_TAGS[@]}" | grep "^${target_version_tag}\." | sort -V | tail -1)
     if [ -z "$resolved" ]; then
-        echo "Error: No tags matching '${target_version_tag}.*' found in Docker Hub." >&2
+        echo "Error: No tags matching '${target_version_tag}.*' found." >&2
         target_version_tag=
     else
         target_version_tag="$resolved"
@@ -1007,36 +909,8 @@ if [ -n "$target_version_tag" ]; then
 fi
 
 # 2. 업그레이드 경로 구성
-if [ $use_all_tags -eq 1 ]; then
-    # --all-tags: Docker Hub 전체 태그에서 마이너 릴리즈별 첫/최신 버전 선택
-    declare -A MINOR_FIRST
-    declare -A MINOR_LATEST
-    count=1
-    for idx in "${!UPDATABLE_TAGS[@]}"; do
-        tag="${UPDATABLE_TAGS[$idx]}"
-        minor=$(echo "$tag" | cut -d. -f1,2)
-        draw_progress $count ${#UPDATABLE_TAGS[@]} "Creating Upgrade Path" 'Item'
-        if [[ -z "${MINOR_FIRST[$minor]}" ]]; then
-            MINOR_FIRST[$minor]="$tag"
-        fi
-        if [[ -z "${MINOR_LATEST[$minor]}" ]] || [[ "$(printf '%s\n%s\n' "${MINOR_LATEST[$minor]}" "$tag" | sort -V | tail -n1)" == "$tag" ]]; then
-            MINOR_LATEST[$minor]="$tag"
-        fi
-        count=$((count + 1))
-    done
-
-    mapfile -t UPGRADE_POINTS_ARRAY < <(
-        for minor in $(printf '%s\n' "${!MINOR_FIRST[@]}" | sort -V); do
-            echo "${MINOR_FIRST[$minor]}"
-            if [[ "${MINOR_FIRST[$minor]}" != "${MINOR_LATEST[$minor]}" ]]; then
-                echo "${MINOR_LATEST[$minor]}"
-            fi
-        done
-    )
-else
-    # path.json: 이미 필수 경유 버전이므로 그대로 사용
-    UPGRADE_POINTS_ARRAY=("${UPDATABLE_TAGS[@]}")
-fi
+# path.json: 이미 필수 경유 버전이므로 그대로 사용
+UPGRADE_POINTS_ARRAY=("${UPDATABLE_TAGS[@]}")
 
 # CE → EE 전환 시 같은 버전의 EE 태그를 라우팅 포인트 맨 앞에 추가
 if [ "$DETECTED_EDITION" != "$GITLAB_EDITION" ]; then
@@ -1089,9 +963,7 @@ fi
 if [ ${#UPGRADE_POINTS_ARRAY[@]} -le 5 ]; then
     echo -e "\ttraceroute: ${UPGRADE_POINTS_ARRAY[*]}"
 fi
-if [ $use_all_tags -eq 0 ]; then
-    echo "Follow this link to get more information: https://gitlab-com.gitlab.io/support/toolbox/upgrade-path/?current=${CURRENT_VERSION%%-*}&target=${UPGRADE_POINTS_ARRAY[-1]%%-*}&distro=docker&edition=${GITLAB_EDITION}"
-fi
+echo "Follow this link to get more information: https://gitlab-com.gitlab.io/support/toolbox/upgrade-path/?current=${CURRENT_VERSION%%-*}&target=${UPGRADE_POINTS_ARRAY[-1]%%-*}&distro=docker&edition=${GITLAB_EDITION}"
 echo ''
 echo -e "\t- I understood that this action DOES NOT SUPPORT rollback"
 echo -e "\t- I understood that this action may take a long time due to the ROUTING COUNT."
@@ -1125,11 +997,7 @@ else
         echo "Runners paused. They will be resumed after the upgrade."
     fi
 fi
-if [ $use_all_tags -eq 0 ]; then
-    echo -e "\t- I checked TARGET_URL is valid: $TARGET_URL"
-else
-    echo -e "\t- I checked PAGE_SIZE and TARGET_URL values: PAGE_SIZE: $PAGE_SIZE, TARGET_URL: $TARGET_URL"
-fi
+echo -e "\t- I checked TARGET_URL is valid: $TARGET_URL"
 
 if [ $auto_yes -eq 1 ]; then
     echo -e "\nAuto-confirmed (-y mode)."
