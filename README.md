@@ -40,12 +40,10 @@ An automated upgrade script for Docker-based GitLab instances. Supports both CE 
 | `-y`, `--yes` | Skip confirmation prompts (non-interactive mode) |
 | `--help` | Show help message |
 | `--edition=ce\|ee` | Force GitLab edition (auto-detected if omitted) |
-| `--version=X.Y.Z` | Upgrade to a specific version instead of latest |
+| `--version=X.Y.Z` | Upgrade to a specific version instead of latest. Partial versions (e.g. `18`) are resolved automatically. |
+| `--skip-latest`, `--n-1` | Target the second-latest version (N-1 strategy). Mutually exclusive with `--version`. |
 | `--target-url=URL` | GitLab server URL for connection testing |
 | `--discord-url=URL` | Discord webhook URL for notifications |
-| `--all-tags` | Parse all tags from Docker Hub instead of the upgrade-path API |
-| `--page-size=N` | Tags per page when using `--all-tags` (default: 25) |
-| `--extract` | Export sorted release tags to `/tmp/gitlab-released-tags.txt` (mutually exclusive with `--version`) |
 
 ### Environment Variables
 
@@ -53,7 +51,6 @@ An automated upgrade script for Docker-based GitLab instances. Supports both CE 
 |----------|-------------|
 | `TARGET_URL` | Same as `--target-url` |
 | `DISCORD_URL` | Same as `--discord-url` |
-| `PAGE_SIZE` | Same as `--page-size` |
 
 ### Examples
 
@@ -67,8 +64,8 @@ An automated upgrade script for Docker-based GitLab instances. Supports both CE 
 # Switch from CE to EE during upgrade
 ./upgrade-gitlab --edition=ee --target-url=https://gitlab.example.com
 
-# Export available release tags
-./upgrade-gitlab --extract
+# Upgrade to the second-latest version (N-1 strategy)
+./upgrade-gitlab --skip-latest --target-url=https://gitlab.example.com
 ```
 
 ## Upgrade Flow
