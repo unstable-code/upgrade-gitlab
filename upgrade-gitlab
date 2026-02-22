@@ -849,6 +849,11 @@ TAGS_URL="https://gitlab-com.gitlab.io/support/toolbox/upgrade-path/path.json"
 echo "Processing GitLab-${GITLAB_EDITION^^} container tags... Location: $TAGS_URL"
 
 PATH_JSON=$(curl -sf "$TAGS_URL")
+if [ -z "$PATH_JSON" ]; then
+    echo "FATAL ERROR: Failed to fetch upgrade path data from $TAGS_URL" >&2
+    echo "Please check your network connectivity and try again." >&2
+    exit 1
+fi
 ALL_TAGS=()
 
 if [ $skip_latest -eq 1 ] && [ -z "$target_version_tag" ]; then
