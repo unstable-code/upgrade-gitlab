@@ -41,7 +41,7 @@ An automated upgrade script for Docker-based GitLab instances. Supports both CE 
 | `--help` | Show help message |
 | `--edition=ce\|ee` | Force GitLab edition (auto-detected if omitted) |
 | `--version=X.Y.Z` | Upgrade to a specific version instead of latest. Partial versions (e.g. `18`) are resolved automatically. |
-| `--skip-latest`, `--n-1` | Target the second-latest version (N-1 strategy). Mutually exclusive with `--version`. |
+| `--skip-latest`, `--n-1` | Target the latest patch of the previous minor version (N-1 strategy). Mutually exclusive with `--version`. |
 | `--target-url=URL` | GitLab server URL for connection testing |
 | `--discord-url=URL` | Discord webhook URL for notifications |
 
@@ -64,7 +64,8 @@ An automated upgrade script for Docker-based GitLab instances. Supports both CE 
 # Switch from CE to EE during upgrade
 ./upgrade-gitlab --edition=ee --target-url=https://gitlab.example.com
 
-# Upgrade to the second-latest version (N-1 strategy)
+# Upgrade to the latest patch of the previous minor (N-1 strategy)
+# e.g. if latest is 18.9.x, targets the latest 18.8.x patch
 ./upgrade-gitlab --skip-latest --target-url=https://gitlab.example.com
 ```
 

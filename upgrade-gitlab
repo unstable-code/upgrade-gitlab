@@ -87,7 +87,7 @@ if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
     echo -e "--help\t\t\tShow this help."
     echo -e "--edition=ce|ee\t\tForce GitLab edition (ce or ee). Auto-detected if omitted."
     echo -e "--version=0.0.0\t\tUse provided tag instead of latest tag. Partial versions (e.g. 18) are resolved automatically."
-    echo -e "--skip-latest\t\tTarget the second-latest version (N-1 strategy). (alias: --n-1)"
+    echo -e "--skip-latest\t\tTarget the latest patch of the previous minor version (N-1 strategy). (alias: --n-1)"
     echo -e "--target-url=http\tPerform a simple connection test for your GitLab server."
     echo -e "--discord-url=http\tNotify via Discord webhook."
 
@@ -857,8 +857,12 @@ fi
 ALL_TAGS=()
 
 if [ $skip_latest -eq 1 ] && [ -z "$target_version_tag" ]; then
-    # N-1: all 배열의 마지막 직전 버전을 타겟으로 설정
-    n1_version=$(echo "$PATH_JSON" | jq -r '.all[-2]')
+    # N-1: 최신 마이너를 제외한 이전 마이너의 최신 패치 버전을 타겟으로 설정
+    n1_version=$(echo "$PATH_JSON" | jq -r '
+      .all as $a |
+      ($a[-1] | split(".") | .[0:2]) as $latest |
+      [ $a[] | select(split(".") | .[0:2] != $latest) ] | last
+    ')
     target_version_tag="${n1_version}${TAG_SUFFIX}"
     echo "Skip-latest (N-1) mode: targeting $target_version_tag"
 fi
