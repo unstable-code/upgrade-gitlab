@@ -1,7 +1,7 @@
 # upgrade-gitlab
 
 [![pipeline status](https://gitlab.com/unstable-code/upgrade-gitlab/badges/master/pipeline.svg)](https://gitlab.com/unstable-code/upgrade-gitlab/-/commits/master)
-[![coverage report](https://gitlab.com/unstable-code/upgrade-gitlab/badges/master/coverage.svg)](https://gitlab.com/unstable-code/upgrade-gitlab/-/commits/master)
+[![coverage report](https://gitlab.com/unstable-code/upgrade-gitlab/badges/master/coverage.svg?job=integration-test)](https://gitlab.com/unstable-code/upgrade-gitlab/-/commits/master)
 
 An automated upgrade script for Docker-based GitLab instances. Supports both CE and EE editions with safe, step-by-step version upgrades following the [official upgrade path](https://gitlab.com/gitlab-org/gitlab/-/blob/master/config/upgrade_path.yml).
 

@@ -20,7 +20,6 @@ logic-test:
     - kcov --include-pattern=/upgrade-gitlab/upgrade-gitlab coverage_output bats tests/
     - coverage_pct=$(jq -r '.percent_covered' coverage_output/bats/coverage.json 2>/dev/null || echo "0.0")
     - echo "Coverage:${coverage_pct}%"
-  coverage: '/Coverage:(\d+[\.,]\d+)%/'
   artifacts:
     reports:
       coverage_report:
@@ -35,7 +34,7 @@ logic-test:
 
 integration-test:
   stage: test
-  image: docker:latest
+  image: kcov/kcov:latest-alpine
   services:
     - docker:dind
   variables:
@@ -44,7 +43,7 @@ integration-test:
     DOCKER_HOST: tcp://docker:2375
     DOCKER_TLS_CERTDIR: ""
   before_script:
-    - apk add --no-cache bash jq curl coreutils
+    - apk add --no-cache bash jq curl coreutils docker-cli
   script:
     - |
       docker run -d --name gitlab \
@@ -62,10 +61,22 @@ integration-test:
         done
       '
       echo "GitLab is healthy."
-    - bash ./upgrade-gitlab -y --no-step-limit --target-url=http://docker
+    - kcov --include-pattern=/upgrade-gitlab/upgrade-gitlab coverage_output bash ./upgrade-gitlab -y --no-step-limit --target-url=http://docker
     - |
       FINAL_VERSION=$(docker exec gitlab dpkg -l | grep "gitlab-${GITLAB_EDITION}" | awk '{print $3}')
       echo "Final version: $FINAL_VERSION"
+    - |
+      coverage_pct=$(jq -r '.percent_covered' coverage_output/bash/coverage.json 2>/dev/null || echo "0.0")
+      echo "Coverage:${coverage_pct}%"
+  coverage: '/Coverage:(\d+[\.,]\d+)%/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage_output/bash/cobertura.xml
+    paths:
+      - coverage_output/
+    when: always
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
     - if: $CI_PIPELINE_SOURCE == "web"
