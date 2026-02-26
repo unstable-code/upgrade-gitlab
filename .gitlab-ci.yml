@@ -13,9 +13,10 @@ shellcheck:
 
 logic-test:
   stage: test
-  image: bats/bats:latest
+  image: alpine:latest
   before_script:
-    - apk add --no-cache curl jq coreutils bash
+    - apk add --no-cache bash curl jq coreutils
+    - apk add --no-cache bats --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community
   script:
     - bats tests/upgrade_path.bats
   rules:
