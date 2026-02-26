@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Mock du: return fixed 1GB used
+echo "1048576	${*: -1}"

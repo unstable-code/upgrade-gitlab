@@ -15,3 +15,15 @@ export PATH="$PROJECT_ROOT/tests/mocks:$PATH"
 export MOCK_GITLAB_VERSION="${MOCK_GITLAB_VERSION:-16.11.0-ce.0}"
 
 # Note: UID is a readonly bash variable, no need to set it
+
+# State management for full-flow tests
+setup_mock_state() {
+    MOCK_STATE_DIR=$(mktemp -d)
+    export MOCK_STATE_DIR
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+}
+
+teardown_mock_state() {
+    [ -n "$MOCK_STATE_DIR" ] && rm -rf "$MOCK_STATE_DIR"
+    unset MOCK_STATE_DIR
+}

@@ -4,30 +4,28 @@
 
 FIXTURES_DIR="${FIXTURES_DIR:-$(cd "$(dirname "$0")/../fixtures" && pwd)}"
 
-# Parse curl arguments to find URL
+# Parse curl arguments to find URL and flags
 url=""
-silent=0
-fail=0
+write_out=""
+skip_next=""
 for arg in "$@"; do
+    if [ -n "$skip_next" ]; then
+        if [ "$skip_next" = "w" ]; then
+            case "$arg" in
+                *http_code*) write_out="http_code" ;;
+            esac
+        fi
+        skip_next=""
+        continue
+    fi
     case "$arg" in
-        -sf|-fs) silent=1; fail=1 ;;
-        -s) silent=1 ;;
-        -f) fail=1 ;;
-        -o) ;; # skip next arg handling done below
+        -s|-f|-sf|-fs) ;;
+        -o) skip_next="skip" ;;
+        -w) skip_next="w" ;;
+        -d|-H|-X) skip_next="skip" ;;
         http*) url="$arg" ;;
     esac
 done
-
-# If no URL found via simple scan, try harder (handle -o /dev/null etc.)
-if [ -z "$url" ]; then
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            -o) shift ;; # skip the output file arg
-            http*) url="$1" ;;
-        esac
-        shift
-    done
-fi
 
 case "$url" in
     *"upgrade_path.yml"*)
@@ -65,6 +63,9 @@ case "$url" in
         ;;
     *"users/sign_in"*)
         # GitLab connectivity check
+        if [ "$write_out" = "http_code" ]; then
+            echo "200"
+        fi
         exit 0
         ;;
     *)

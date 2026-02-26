@@ -2,10 +2,17 @@
 # Mock docker CLI for BATS tests
 
 MOCK_GITLAB_VERSION="${MOCK_GITLAB_VERSION:-16.11.0-ce.0}"
+
+# State-based version tracking (for full-flow tests)
+if [ -n "$MOCK_STATE_DIR" ] && [ -f "$MOCK_STATE_DIR/current_version" ]; then
+    MOCK_GITLAB_VERSION=$(cat "$MOCK_STATE_DIR/current_version")
+fi
+
 MOCK_EDITION="${MOCK_GITLAB_VERSION##*-}"   # ce.0 or ee.0
 MOCK_EDITION="${MOCK_EDITION%%.*}"          # ce or ee
 MOCK_CONTAINER="gitlab"
 MOCK_IMAGE="gitlab/gitlab-${MOCK_EDITION}:${MOCK_GITLAB_VERSION}"
+MOCK_RUNNER_COUNT="${MOCK_RUNNER_COUNT:-0}"
 
 args="$*"
 
@@ -34,6 +41,9 @@ case "$args" in
     *"inspect"*"NetworkSettings.Ports"*)
         echo "443/tcp -> 443 80/tcp -> 80 22/tcp -> 22"
         ;;
+    *"inspect"*"ExitCode"*)
+        echo "0"
+        ;;
     *"exec"*"dpkg -l"*)
         echo "ii  gitlab-${MOCK_EDITION}  ${MOCK_GITLAB_VERSION}  amd64  GitLab ${MOCK_EDITION^^}"
         ;;
@@ -46,17 +56,91 @@ case "$args" in
     *"exec"*"grep"*"backup_path"*)
         echo ""
         ;;
-    *"exec"*"gitlab-psql"*"ci_runners"*)
+    # gitlab-psql: patterns must follow argument order in the expanded args string
+    # e.g. "exec gitlab gitlab-psql -tAc SELECT COUNT(*) FROM ci_runners WHERE active = true;"
+    #       → COUNT appears before ci_runners before active = true
+    *"exec"*"gitlab-psql"*"information_schema"*)
+        echo "t"
+        ;;
+    *"exec"*"gitlab-psql"*"job_class_name"*)
+        echo ""
+        ;;
+    *"exec"*"gitlab-psql"*"status NOT IN"*)
         echo "0"
+        ;;
+    *"exec"*"gitlab-psql"*"COUNT"*"ci_runners"*"active = true"*)
+        echo "$MOCK_RUNNER_COUNT"
+        ;;
+    *"exec"*"gitlab-psql"*"SELECT id"*"ci_runners"*"active = true"*)
+        if [ "$MOCK_RUNNER_COUNT" -gt 0 ] 2>/dev/null; then
+            printf '1\n2\n'
+        fi
+        ;;
+    *"exec"*"gitlab-psql"*"COUNT"*"ci_runners"*)
+        echo "$MOCK_RUNNER_COUNT"
+        ;;
+    *"exec"*"gitlab-psql"*"UPDATE"*)
+        exit 0
+        ;;
+    *"exec"*"gitlab-psql"*"ci_runners"*"ORDER BY"*)
+        if [ "$MOCK_RUNNER_COUNT" -gt 0 ] 2>/dev/null; then
+            echo " id | description | contacted_at | active"
+            echo "----+-------------+--------------+--------"
+            echo "  1 | runner-1    | 2024-01-01   | t"
+            echo "  2 | runner-2    | 2024-01-01   | t"
+        fi
+        ;;
+    *"exec"*"gitlab-psql"*)
+        exit 0
+        ;;
+    *"exec"*"which"*)
+        exit 0
+        ;;
+    *"exec"*"gitlab-backup"*)
+        exit 0
+        ;;
+    *"exec"*"gitlab-ctl reconfigure"*)
+        exit 0
+        ;;
+    *"exec"*"gitlab-ctl restart"*)
+        exit 0
+        ;;
+    *"exec"*"gitlab-ctl pg-upgrade"*)
+        exit 0
         ;;
     *"exec"*"gitlab-ctl status"*)
         exit 0
         ;;
+    *"exec"*"gitlab-rake"*"db:migrate:status"*)
+        echo "  up  20240101  TestMigration"
+        ;;
     *"exec"*"gitlab-rake"*)
+        exit 0
+        ;;
+    *"exec"*"sh -c"*)
         exit 0
         ;;
     *"image inspect"*)
         echo "$MOCK_IMAGE"
+        ;;
+    *"run"*)
+        # Update state file with new version tag for full-flow simulation
+        if [ -n "$MOCK_STATE_DIR" ]; then
+            _tag=$(echo "$args" | sed -n 's/.*gitlab\/gitlab-[^:]*:\([^ ]*\).*/\1/p')
+            if [ -n "$_tag" ]; then
+                echo "$_tag" > "$MOCK_STATE_DIR/current_version"
+            fi
+        fi
+        exit 0
+        ;;
+    *"update"*)
+        exit 0
+        ;;
+    *"container rm"*)
+        exit 0
+        ;;
+    *"image rm"*)
+        exit 0
         ;;
     *"start"*)
         exit 0
@@ -65,9 +149,6 @@ case "$args" in
         exit 0
         ;;
     *"rm"*)
-        exit 0
-        ;;
-    *"run"*)
         exit 0
         ;;
     *"pull"*)
