@@ -16,6 +16,10 @@ no_step_limit=0
 _interrupted=0
 _trap_active=0
 _pull_pid=
+_tty=/dev/tty
+if [ ! -e /dev/tty ]; then
+    _tty=/dev/null
+fi
 _pull_interrupted=0
 
 # shellcheck disable=SC2329
@@ -255,7 +259,7 @@ else
     GITLAB_EDITION=$DETECTED_EDITION
     if [ "$GITLAB_EDITION" == "ce" ] && [ $auto_yes -eq 0 ]; then
         echo -en "Detected edition: CE. Would you like to switch to EE? (y/N) > "
-        read -r switch_ee < /dev/tty
+        read -r switch_ee < "$_tty"
         if [ "$switch_ee" == "y" ] || [ "$switch_ee" == "Y" ]; then
             GITLAB_EDITION="ee"
             echo "Edition switch requested: ce -> ee"
@@ -301,7 +305,7 @@ VOLUMES=$(docker inspect "$CONTAINER_NAME" --format='{{range .Mounts}}{{.Source}
 # --------------------------
 # 2️⃣ 포트 매핑 추출
 # --------------------------
-PORTS=$(docker inspect "$CONTAINER_NAME" --format='{{range $p, $conf := .HostConfig.PortBindings}}{{$p}}:{{(index $conf 0).HostPort}} {{end}}' \
+PORTS=$(docker inspect "$CONTAINER_NAME" --format='{{range $p, $conf := .HostConfig.PortBindings}}{{if $conf}}{{$p}}:{{(index $conf 0).HostPort}} {{end}}{{end}}' \
     | tr ' ' '\n' \
     | sed '/^$/d' \
     | sed 's/\/tcp//g' \
@@ -429,7 +433,7 @@ check_disk_space() {
             exit 1
         fi
         echo -n "Continue anyway? (y/N) > "
-        read -r disk_confirm < /dev/tty
+        read -r disk_confirm < "$_tty"
         if [ "$disk_confirm" != "y" ] && [ "$disk_confirm" != "Y" ]; then
             echo "Aborted due to insufficient disk space." >&2
             exit 1
@@ -501,45 +505,66 @@ wait_for_background_migrations() {
                 echo "Background migrations: all completed"
                 break
             fi
-            printf "Background migrations: waiting for response... %s" "${spinner:spin_idx++%${#spinner}:1}"
-            prev_lines=1
-            for ((s=0; s<5; s++)); do
-                sleep 1
-                printf '\r'"Background migrations: waiting for response... %s" "${spinner:spin_idx++%${#spinner}:1}"
-            done
+            if [ -e /dev/tty ]; then
+                printf "Background migrations: waiting for response... %s" "${spinner:spin_idx++%${#spinner}:1}"
+                prev_lines=1
+                for ((s=0; s<5; s++)); do
+                    sleep 1
+                    printf '\r'"Background migrations: waiting for response... %s" "${spinner:spin_idx++%${#spinner}:1}"
+                done
+            else
+                echo "Background migrations: waiting for response..."
+                sleep 5
+            fi
             continue
         fi
 
         local active_count all_done=true interval
         active_count=$(echo "$PROGRESS" | wc -l)
-        printf "Background migrations: [%d active] %s" "$active_count" "${spinner:spin_idx++%${#spinner}:1}"
-        prev_lines=1
 
-        while IFS='|' read -r name completed total; do
-            if [ -z "$total" ] || [ "$total" -eq 0 ] 2>/dev/null; then
-                printf "\n  %s: Pending" "$name"
-                all_done=false
-            else
-                local pct=$((completed * 100 / total))
-                printf "\n  %s: %d%% (%d/%d)" "$name" "$pct" "$completed" "$total"
-                if [ "$completed" -ne "$total" ]; then
+        if [ -e /dev/tty ]; then
+            printf "Background migrations: [%d active] %s" "$active_count" "${spinner:spin_idx++%${#spinner}:1}"
+            prev_lines=1
+
+            while IFS='|' read -r name completed total; do
+                if [ -z "$total" ] || [ "$total" -eq 0 ] 2>/dev/null; then
+                    printf "\n  %s: Pending" "$name"
+                    all_done=false
+                else
+                    local pct=$((completed * 100 / total))
+                    printf "\n  %s: %d%% (%d/%d)" "$name" "$pct" "$completed" "$total"
+                    if [ "$completed" -ne "$total" ]; then
+                        all_done=false
+                    fi
+                fi
+                prev_lines=$((prev_lines + 1))
+            done <<< "$PROGRESS"
+
+            if [ "$all_done" = true ]; then interval=5; else interval=15; fi
+            for ((s=0; s<interval; s++)); do
+                sleep 1
+                if [ "$prev_lines" -gt 1 ]; then
+                    printf '\033[%dA' "$((prev_lines - 1))"
+                fi
+                printf '\r'"Background migrations: [%d active] %s" "$active_count" "${spinner:spin_idx++%${#spinner}:1}"
+                if [ "$prev_lines" -gt 1 ]; then
+                    printf '\033[%dB' "$((prev_lines - 1))"
+                fi
+            done
+        else
+            # CI/non-TTY: 스피너 없이 상태 한 줄 출력 후 대기
+            local summary="Background migrations: [${active_count} active]"
+            while IFS='|' read -r name completed total; do
+                if [ -z "$total" ] || [ "$total" -eq 0 ] 2>/dev/null; then
+                    all_done=false
+                elif [ "$completed" -ne "$total" ]; then
                     all_done=false
                 fi
-            fi
-            prev_lines=$((prev_lines + 1))
-        done <<< "$PROGRESS"
-
-        if [ "$all_done" = true ]; then interval=5; else interval=15; fi
-        for ((s=0; s<interval; s++)); do
-            sleep 1
-            if [ "$prev_lines" -gt 1 ]; then
-                printf '\033[%dA' "$((prev_lines - 1))"
-            fi
-            printf '\r'"Background migrations: [%d active] %s" "$active_count" "${spinner:spin_idx++%${#spinner}:1}"
-            if [ "$prev_lines" -gt 1 ]; then
-                printf '\033[%dB' "$((prev_lines - 1))"
-            fi
-        done
+            done <<< "$PROGRESS"
+            echo "$summary"
+            if [ "$all_done" = true ]; then interval=5; else interval=15; fi
+            sleep "$interval"
+        fi
     done
 }
 
@@ -672,10 +697,11 @@ draw_progress() {
     spaces=$(printf '%*s' "$empty" '')
     line=$(printf "%s: [%s>%s]%s" "$prefix" "$bar" "$spaces" "$suffix")
 
-    printf "\r\033[K%s" "${line:0:cols}"
-
-    if (( current == total )); then
-        echo ""
+    if [ -e /dev/tty ]; then
+        printf "\r\033[K%s" "${line:0:cols}"
+        if (( current == total )); then
+            echo ""
+        fi
     fi
 }
 
@@ -711,7 +737,7 @@ run_with_bouncing_bar() {
         # 새 출력 확인 및 표시
         current_lines=$(wc -l < "$tmpfile")
         if [ "$current_lines" -gt "$last_line_count" ]; then
-            printf '\r\033[K' > /dev/tty
+            printf '\r\033[K' > "$_tty"
             sed -n "$((last_line_count + 1)),${current_lines}p" "$tmpfile"
             last_line_count=$current_lines
             # 마지막 출력에서 단계명 파싱
@@ -741,7 +767,7 @@ run_with_bouncing_bar() {
         padding_left=$(printf '%*s' "$pos" '')
         padding_right=$(printf '%*s' "$((bar_width - pos - bounce_len))" '')
         bar_line=$(printf "${bg_color}[%s]${reset} [%s%s%s]" "$label" "$padding_left" "$bounce" "$padding_right")
-        printf '\r\033[K%s' "$bar_line" > /dev/tty
+        printf '\r\033[K%s' "$bar_line" > "$_tty"
 
         # 위치 업데이트
         pos=$((pos + direction))
@@ -758,12 +784,12 @@ run_with_bouncing_bar() {
     local final_lines
     final_lines=$(wc -l < "$tmpfile")
     if [ "$final_lines" -gt "$last_line_count" ]; then
-        printf '\r\033[K' > /dev/tty
+        printf '\r\033[K' > "$_tty"
         sed -n "$((last_line_count + 1)),${final_lines}p" "$tmpfile"
     fi
 
     # 바운싱 바 지우기 (tty)
-    printf '\r\033[K' > /dev/tty
+    printf '\r\033[K' > "$_tty"
 
     # 종료 코드 수집
     wait "$cmd_pid"
@@ -799,7 +825,7 @@ poll_with_bouncing_bar() {
         local current_lines
         current_lines=$(wc -l < "$tmpfile")
         if [ "$current_lines" -gt "$last_line_count" ]; then
-            printf '\r\033[K' > /dev/tty
+            printf '\r\033[K' > "$_tty"
             sed -n "$((last_line_count + 1)),${current_lines}p" "$tmpfile"
             last_line_count=$current_lines
         fi
@@ -824,7 +850,7 @@ poll_with_bouncing_bar() {
         padding_left=$(printf '%*s' "$pos" '')
         padding_right=$(printf '%*s' "$((bar_width - pos - bounce_len))" '')
         bar_line=$(printf "${bg_color}[%s]${reset} [%s%s%s]" "$label" "$padding_left" "$bounce" "$padding_right")
-        printf '\r\033[K%s' "$bar_line" > /dev/tty
+        printf '\r\033[K%s' "$bar_line" > "$_tty"
 
         pos=$((pos + direction))
         if [ $pos -ge $((bar_width - bounce_len)) ]; then
@@ -850,11 +876,11 @@ poll_with_bouncing_bar() {
     local final_lines
     final_lines=$(wc -l < "$tmpfile")
     if [ "$final_lines" -gt "$last_line_count" ]; then
-        printf '\r\033[K' > /dev/tty
+        printf '\r\033[K' > "$_tty"
         sed -n "$((last_line_count + 1)),${final_lines}p" "$tmpfile"
     fi
 
-    printf '\r\033[K' > /dev/tty
+    printf '\r\033[K' > "$_tty"
     rm -f "$tmpfile"
 }
 
@@ -1035,7 +1061,7 @@ if [ -z "$TARGET_URL" ]; then
     echo 'TARGET_URL is not configured yet. Please enter your GitLab server URL.'
     echo 'e.g.: https://gitlab.com'
     echo -n '> '
-    read -r TARGET_URL < /dev/tty
+    read -r TARGET_URL < "$_tty"
     if [ -z "$TARGET_URL" ]; then
         echo 'User abort'
         exit 1
@@ -1074,7 +1100,8 @@ echo ''
 echo -e "\t- I understood that this action DOES NOT SUPPORT rollback"
 echo -e "\t- I understood that this action may take a long time due to the ROUTING COUNT."
 echo -e "\t- I checked container restart policy: $(docker inspect --format='{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER_NAME")"
-echo -e "\t- I checked container PORTS: $(docker inspect "$CONTAINER_NAME" --format='{{range $p, $conf := .NetworkSettings.Ports}}{{$p}} -> {{(index $conf 0).HostPort}} {{end}}')"
+_ports=$(docker inspect "$CONTAINER_NAME" --format='{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{$p}} -> {{(index $conf 0).HostPort}} {{end}}{{end}}' 2>/dev/null)
+echo -e "\t- I checked container PORTS: ${_ports:-not configured}"
 echo -e "\t- I checked container DRIVE: $(docker inspect "$CONTAINER_NAME" --format='{{range .Mounts}}{{.Source}}:{{.Destination}} {{end}}')"
 echo -e "\t- I checked gitlab external_url in gitlab.rb file: $(docker exec "$CONTAINER_NAME" grep '^external_url' /etc/gitlab/gitlab.rb | awk -F"'" '{print $2}')"
 echo -e "\t- I checked gitlab backup_path in gitlab.rb file: $(docker exec "$CONTAINER_NAME" grep "'backup_path'" /etc/gitlab/gitlab.rb | awk -F"=" '{print $2}' | sed 's/\"//g' | sed 's/^ //')"
@@ -1091,7 +1118,7 @@ else
         echo "WARNING: $active_runners active runner(s) detected. Runners should be paused before upgrading."
         if [ $auto_yes -eq 0 ]; then
             echo -n "Pause runners automatically? (Y/n) > "
-            read -r runner_confirm < /dev/tty
+            read -r runner_confirm < "$_tty"
             if [ "$runner_confirm" == "n" ] || [ "$runner_confirm" == "N" ]; then
                 echo "Aborted. Pause runners in Admin > Runners, then re-run this script."
                 exit 1
@@ -1109,7 +1136,7 @@ if [ $auto_yes -eq 1 ]; then
     echo -e "\nAuto-confirmed (-y mode)."
 else
     echo -en "\nI accept the above notice and continue this job (y/N) > "
-    read -r n < /dev/tty
+    read -r n < "$_tty"
     if [ "$n" != "y" ] && [ "$n" != "Y" ]; then
         echo 'User abort' >&2
         exit 1
@@ -1139,7 +1166,7 @@ if ! check_secrets_integrity "pre-upgrade"; then
         exit 1
     fi
     echo -n "Continue despite secrets integrity warning? (y/N) > "
-    read -r secrets_confirm < /dev/tty
+    read -r secrets_confirm < "$_tty"
     if [ "$secrets_confirm" != "y" ] && [ "$secrets_confirm" != "Y" ]; then
         echo "Aborted due to secrets integrity check failure." >&2
         exit 1
@@ -1292,7 +1319,7 @@ if [ "$auto_restart_enabled" == "$(docker inspect --format='{{.HostConfig.Restar
         echo -e 'always\t\t\t\tAlways restart the container if it stops. If it is manually stopped, it is restarted only when Docker daemon restarts or the container itself is manually restarted.'
         echo -e 'unless-stopped\t\t\tSimilar to always, except that when the container is stopped (manually or otherwise), it is not restarted even after Docker daemon restarts.'
         echo -n '> '
-        read -r n < /dev/tty
+        read -r n < "$_tty"
         case "$n" in
             no|always|unless-stopped|on-failure|on-failure:[0-9]*)
                 docker update --restart="$n" "$CONTAINER_NAME"

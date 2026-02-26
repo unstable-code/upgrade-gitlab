@@ -45,11 +45,10 @@ integration-test:
         -v gitlab-data:/var/opt/gitlab \
         gitlab/gitlab-${GITLAB_EDITION}:${START_VERSION}-${GITLAB_EDITION}.0
     - |
-      echo "Waiting for GitLab to become healthy..."
+      echo "Waiting for GitLab to become healthy (timeout 10m)..."
       timeout 600 bash -c '
         until [ "$(docker inspect --format="{{.State.Health.Status}}" gitlab 2>/dev/null)" = "healthy" ]; do
           sleep 15
-          echo "  still waiting..."
         done
       '
       echo "GitLab is healthy."
