@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Mock curl for BATS tests
+# Handles: upgrade_path.yml, Docker Hub API, generic URLs
+
+FIXTURES_DIR="${FIXTURES_DIR:-$(cd "$(dirname "$0")/../fixtures" && pwd)}"
+
+# Parse curl arguments to find URL
+url=""
+silent=0
+fail=0
+for arg in "$@"; do
+    case "$arg" in
+        -sf|-fs) silent=1; fail=1 ;;
+        -s) silent=1 ;;
+        -f) fail=1 ;;
+        -o) ;; # skip next arg handling done below
+        http*) url="$arg" ;;
+    esac
+done
+
+# If no URL found via simple scan, try harder (handle -o /dev/null etc.)
+if [ -z "$url" ]; then
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -o) shift ;; # skip the output file arg
+            http*) url="$1" ;;
+        esac
+        shift
+    done
+fi
+
+case "$url" in
+    *"upgrade_path.yml"*)
+        cat "$FIXTURES_DIR/upgrade_path.yml"
+        ;;
+    *"hub.docker.com/v2/repositories/"*"/tags/?name="*)
+        # Extract edition (ce or ee) from URL path
+        edition=$(echo "$url" | sed -n 's|.*gitlab/gitlab-\([^/]*\)/.*|\1|p')
+        # Extract major version from name= parameter
+        major=$(echo "$url" | sed -n 's/.*name=\([0-9]*\)\..*/\1/p')
+        if [ -z "$major" ]; then
+            major=$(echo "$url" | sed -n 's/.*name=\([0-9]*\).*/\1/p')
+        fi
+        fixture_file="$FIXTURES_DIR/dockerhub_${major}.json"
+        if [ -f "$fixture_file" ]; then
+            if [ -n "$edition" ]; then
+                # Filter results to only include tags matching the requested edition
+                jq --arg ed "$edition" '{count, next, results: [.results[] | select(.name | test("-" + $ed + "\\."))] }' "$fixture_file"
+            else
+                cat "$fixture_file"
+            fi
+        else
+            echo '{"count":0,"next":null,"results":[]}'
+        fi
+        ;;
+    *"hub.docker.com/v2/repositories/"*"/tags/"*)
+        # Single tag check: extract the tag name and check if it exists in any fixture
+        tag=$(echo "$url" | sed 's|.*/tags/||')
+        # Search across all fixture files
+        if grep -rq "\"$tag\"" "$FIXTURES_DIR"/dockerhub_*.json 2>/dev/null; then
+            exit 0
+        else
+            exit 1
+        fi
+        ;;
+    *"users/sign_in"*)
+        # GitLab connectivity check
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac

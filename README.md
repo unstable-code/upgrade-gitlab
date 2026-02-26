@@ -42,6 +42,8 @@ An automated upgrade script for Docker-based GitLab instances. Supports both CE 
 | `--edition=ce\|ee` | Force GitLab edition (auto-detected if omitted) |
 | `--version=X.Y.Z` | Upgrade to a specific version instead of latest. Partial versions (e.g. `18`) are resolved automatically. |
 | `--skip-latest`, `--n-1` | Target the latest patch of the previous minor version (N-1 strategy). Mutually exclusive with `--version`. |
+| `--dry-run` | Compute and display upgrade path without executing. Implies `-y`. |
+| `--no-step-limit` | Disable the 3-step safety limit for `-y` mode. Requires `CI=true`. |
 | `--target-url=URL` | GitLab server URL for connection testing |
 | `--discord-url=URL` | Discord webhook URL for notifications |
 
@@ -67,6 +69,9 @@ An automated upgrade script for Docker-based GitLab instances. Supports both CE 
 # Upgrade to the latest patch of the previous minor (N-1 strategy)
 # e.g. if latest is 18.9.x, targets the latest 18.8.x patch
 ./upgrade-gitlab --skip-latest --target-url=https://gitlab.example.com
+
+# Preview upgrade path without executing
+./upgrade-gitlab --dry-run
 ```
 
 ## Upgrade Flow
@@ -102,6 +107,20 @@ Post-upgrade:
 | SIGTSTP (Ctrl+Z) | Exit | Deferred | Restart pull |
 | SIGHUP | Exit | Deferred | Restart pull |
 | SIGQUIT (Ctrl+\\) | Exit | Exit | Exit |
+
+## Testing
+
+### Logic tests (BATS)
+
+Runs parameter parsing and upgrade path computation against mock data:
+
+```bash
+bats tests/upgrade_path.bats
+```
+
+### Integration test (CI only)
+
+Runs a real GitLab upgrade via Docker-in-Docker. Triggered by scheduled or manual pipeline in GitLab CI.
 
 ## Wiki
 

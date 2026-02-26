@@ -1,5 +1,6 @@
 stages:
   - lint
+  - test
 
 shellcheck:
   stage: lint
@@ -9,3 +10,53 @@ shellcheck:
   rules:
     - if: $CI_COMMIT_BRANCH == "master"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+logic-test:
+  stage: test
+  image: bats/bats:latest
+  before_script:
+    - apk add --no-cache curl jq coreutils bash
+  script:
+    - bats tests/upgrade_path.bats
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+integration-test:
+  stage: test
+  image: docker:latest
+  services:
+    - docker:dind
+  variables:
+    START_VERSION: "17.7.0"
+    GITLAB_EDITION: "ce"
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - apk add --no-cache bash jq curl coreutils
+  script:
+    - |
+      docker run -d --name gitlab \
+        --hostname gitlab.test \
+        -p 80:80 \
+        -v gitlab-config:/etc/gitlab \
+        -v gitlab-logs:/var/log/gitlab \
+        -v gitlab-data:/var/opt/gitlab \
+        gitlab/gitlab-${GITLAB_EDITION}:${START_VERSION}-${GITLAB_EDITION}.0
+    - |
+      echo "Waiting for GitLab to become healthy..."
+      timeout 600 bash -c '
+        until [ "$(docker inspect --format="{{.State.Health.Status}}" gitlab 2>/dev/null)" = "healthy" ]; do
+          sleep 15
+          echo "  still waiting..."
+        done
+      '
+      echo "GitLab is healthy."
+    - bash ./upgrade-gitlab -y --no-step-limit --target-url=http://docker
+    - |
+      FINAL_VERSION=$(docker exec gitlab dpkg -l | grep "gitlab-${GITLAB_EDITION}" | awk '{print $3}')
+      echo "Final version: $FINAL_VERSION"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+  timeout: 6h
