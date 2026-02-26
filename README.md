@@ -1,11 +1,11 @@
 # upgrade-gitlab
 
-An automated upgrade script for Docker-based GitLab instances. Supports both CE and EE editions with safe, step-by-step version upgrades following the [official upgrade path](https://gitlab-com.gitlab.io/support/toolbox/upgrade-path/).
+An automated upgrade script for Docker-based GitLab instances. Supports both CE and EE editions with safe, step-by-step version upgrades following the [official upgrade path](https://gitlab.com/gitlab-org/gitlab/-/blob/master/config/upgrade_path.yml).
 
 ## Features
 
 - **CE/EE auto-detection** — Automatically detects the running edition from the container image. Supports CE-to-EE migration at the same version before proceeding with upgrades.
-- **Safe upgrade path** — Fetches recommended upgrade stops from GitLab's official upgrade-path API and applies them sequentially.
+- **Safe upgrade path** — Fetches required upgrade stops from GitLab's `upgrade_path.yml` and resolves each to the latest patch version via Docker Hub API.
 - **Background migration tracking** — Waits for batched background migrations to complete between each version hop, with per-migration progress display.
 - **Migration status verification** — Checks for `down` state migrations after each upgrade step.
 - **Disk space pre-check** — Validates that data and backup volumes have at least 1.5x free space before starting.
