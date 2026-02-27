@@ -802,6 +802,232 @@ run_with_bouncing_bar() {
     return $rc
 }
 
+# _query_project_sizes <container> <outfile>
+# gitlab-psql로 프로젝트별 사이즈(repository, lfs, artifacts, uploads) 조회
+_query_project_sizes() {
+    local container=$1 outfile=$2
+    docker exec "$container" gitlab-psql -tAF $'\t' -c "
+      WITH RECURSIVE ns_tree AS (
+        SELECT id, name, parent_id, name::text AS full_path
+        FROM namespaces WHERE parent_id IS NULL
+        UNION ALL
+        SELECT n.id, n.name, n.parent_id, (nt.full_path || '/' || n.name)::text
+        FROM namespaces n JOIN ns_tree nt ON n.parent_id = nt.id
+      )
+      SELECT nt.full_path || '/' || p.path,
+             ps.repository_size, ps.lfs_objects_size,
+             ps.build_artifacts_size, ps.uploads_size
+      FROM projects p
+      JOIN project_statistics ps ON ps.project_id = p.id
+      JOIN ns_tree nt ON p.namespace_id = nt.id
+      WHERE ps.repository_size > 0 OR ps.lfs_objects_size > 0
+         OR ps.build_artifacts_size > 0 OR ps.uploads_size > 0;
+    " > "$outfile" 2>/dev/null
+}
+
+# run_with_progress_bar <label> <command...>
+# 백업 명령 실행 시 psql 데이터를 기반으로 실제 진행률 바 표시
+# psql 미가용/비대상 스테이지에서는 바운싱 바로 폴백
+run_with_progress_bar() {
+    local label=$1
+    shift
+    local cmd=("$@")
+    local tmpfile psql_file
+    tmpfile=$(mktemp)
+    psql_file=$(mktemp)
+    local cols=${COLUMNS:-$(tput cols 2>/dev/null || stty size 2>/dev/null | awk '{print $2}' || echo 80)}
+    local reset='\033[0m'
+
+    # 바운싱 바 상태
+    local pos=0
+    local direction=1
+    local bounce='<===>'
+    local bounce_len=${#bounce}
+
+    # 진행률 바 상태
+    local blink_toggle=0
+
+    # psql 쿼리 백그라운드 실행
+    local container_name
+    container_name=$(echo "${cmd[*]}" | sed -n 's/.*exec[[:space:]]\+\(-e[[:space:]]\+[^ ]\+[[:space:]]\+\)\?\([^ ]\+\).*/\2/p')
+    _query_project_sizes "$container_name" "$psql_file" &
+    local psql_pid=$!
+
+    # 프로젝트 사이즈 연관 배열
+    declare -A size_repo size_lfs size_artifacts size_uploads
+    local psql_ready=0
+    local total_repo=0 total_lfs=0 total_artifacts=0 total_uploads=0
+
+    # 현재 스테이지 추적
+    local current_stage=""
+    local done_repo=0 done_lfs=0 done_artifacts=0 done_uploads=0
+    local last_line_count=0
+
+    # 스테이지-사이즈 매핑 함수
+    _get_stage_total() {
+        case "$1" in
+            "Dumping repositories") echo "$total_repo" ;;
+            "Dumping uploads") echo "$total_uploads" ;;
+            "Dumping artifacts") echo "$total_artifacts" ;;
+            "Dumping lfs objects") echo "$total_lfs" ;;
+            *) echo 0 ;;
+        esac
+    }
+    _get_stage_done() {
+        case "$1" in
+            "Dumping repositories") echo "$done_repo" ;;
+            "Dumping uploads") echo "$done_uploads" ;;
+            "Dumping artifacts") echo "$done_artifacts" ;;
+            "Dumping lfs objects") echo "$done_lfs" ;;
+            *) echo 0 ;;
+        esac
+    }
+
+    # 명령 백그라운드 실행
+    "${cmd[@]}" > "$tmpfile" 2>&1 &
+    local cmd_pid=$!
+
+    while kill -0 "$cmd_pid" 2>/dev/null; do
+        # psql 완료 확인 및 파싱
+        if [ "$psql_ready" -eq 0 ] && ! kill -0 "$psql_pid" 2>/dev/null; then
+            wait "$psql_pid" 2>/dev/null
+            local psql_rc=$?
+            if [ "$psql_rc" -eq 0 ] && [ -s "$psql_file" ]; then
+                while IFS=$'\t' read -r proj repo lfs arts ups; do
+                    [ -z "$proj" ] && continue
+                    size_repo["$proj"]=$repo
+                    size_lfs["$proj"]=$lfs
+                    size_artifacts["$proj"]=$arts
+                    size_uploads["$proj"]=$ups
+                    total_repo=$((total_repo + repo))
+                    total_lfs=$((total_lfs + lfs))
+                    total_artifacts=$((total_artifacts + arts))
+                    total_uploads=$((total_uploads + ups))
+                done < "$psql_file"
+            fi
+            psql_ready=1
+        fi
+
+        # 새 출력 확인
+        local current_lines
+        current_lines=$(wc -l < "$tmpfile")
+        if [ "$current_lines" -gt "$last_line_count" ]; then
+            printf '\r\033[K' > "$_tty"
+            # 새 라인 파싱
+            local line
+            while IFS= read -r line; do
+                # 스테이지 전환 감지
+                local stage_name
+                stage_name=$(echo "$line" | sed -n 's/^-- \(.*\) \.\.\..*/\1/p')
+                if [ -n "$stage_name" ]; then
+                    current_stage="$stage_name"
+                    label="Backup: $stage_name"
+                fi
+                # [DONE] 파싱으로 완료 사이즈 누적
+                local done_path
+                done_path=$(echo "$line" | sed -n 's/^ \* \([^ ]*\).* \.\.\. \[DONE\]$/\1/p')
+                if [ -n "$done_path" ]; then
+                    case "$current_stage" in
+                        "Dumping repositories")
+                            done_repo=$((done_repo + ${size_repo["$done_path"]:-0})) ;;
+                        "Dumping uploads")
+                            done_uploads=$((done_uploads + ${size_uploads["$done_path"]:-0})) ;;
+                        "Dumping artifacts")
+                            done_artifacts=$((done_artifacts + ${size_artifacts["$done_path"]:-0})) ;;
+                        "Dumping lfs objects")
+                            done_lfs=$((done_lfs + ${size_lfs["$done_path"]:-0})) ;;
+                    esac
+                fi
+            done < <(sed -n "$((last_line_count + 1)),${current_lines}p" "$tmpfile")
+            last_line_count=$current_lines
+        fi
+
+        # bar_width 계산
+        local bar_width=$(( cols - ${#label} - 5 ))
+        if [ "$bar_width" -lt 10 ]; then
+            bar_width=10
+        fi
+
+        # 라벨 배경색
+        local bg_color='\033[42;30m'
+        if [ "${_trap_active:-0}" -eq 1 ]; then
+            bg_color='\033[43;30m'
+        fi
+
+        # 진행률 바 vs 바운싱 바 결정
+        local stage_total stage_done
+        stage_total=$(_get_stage_total "$current_stage")
+        stage_done=$(_get_stage_done "$current_stage")
+
+        if [ "$psql_ready" -eq 1 ] && [ "$stage_total" -gt 0 ]; then
+            # 진행률 바 렌더링
+            local pct filled fill_display
+            pct=$(awk "BEGIN { printf \"%.1f\", ($stage_done / $stage_total) * 100 }")
+            filled=$(awk "BEGIN { printf \"%d\", ($stage_done / $stage_total) * $bar_width }")
+            if [ "$filled" -gt "$bar_width" ]; then
+                filled=$bar_width
+            fi
+
+            # 경계 blink 효과
+            fill_display=$filled
+            if [ "$filled" -gt 0 ] && [ "$filled" -lt "$bar_width" ]; then
+                blink_toggle=$(( 1 - blink_toggle ))
+                if [ "$blink_toggle" -eq 1 ]; then
+                    fill_display=$((filled + 1))
+                fi
+            fi
+
+            local bar_filled bar_empty bar_line
+            bar_filled=$(printf '%*s' "$fill_display" '' | tr ' ' '#')
+            bar_empty=$(printf '%*s' "$((bar_width - fill_display))" '' | sed 's/ /·/g')
+            bar_line=$(printf "${bg_color}[%s]${reset} [%s%s] %s%%" "$label" "$bar_filled" "$bar_empty" "$pct")
+            printf '\r\033[K%s' "$bar_line" > "$_tty"
+        else
+            # 바운싱 바 폴백
+            if [ $pos -ge $((bar_width - bounce_len)) ]; then
+                pos=$((bar_width - bounce_len - 1))
+                direction=-1
+            fi
+            local padding_left padding_right bar_line
+            padding_left=$(printf '%*s' "$pos" '')
+            padding_right=$(printf '%*s' "$((bar_width - pos - bounce_len))" '')
+            bar_line=$(printf "${bg_color}[%s]${reset} [%s%s%s]" "$label" "$padding_left" "$bounce" "$padding_right")
+            printf '\r\033[K%s' "$bar_line" > "$_tty"
+            pos=$((pos + direction))
+            if [ $pos -ge $((bar_width - bounce_len)) ]; then
+                direction=-1
+            elif [ $pos -le 0 ]; then
+                direction=1
+            fi
+        fi
+
+        sleep 0.2
+    done
+
+    # 남은 출력 표시
+    local final_lines
+    final_lines=$(wc -l < "$tmpfile")
+    if [ "$final_lines" -gt "$last_line_count" ]; then
+        printf '\r\033[K' > "$_tty"
+        sed -n "$((last_line_count + 1)),${final_lines}p" "$tmpfile"
+    fi
+
+    # 바 지우기
+    printf '\r\033[K' > "$_tty"
+
+    # psql 프로세스 정리
+    if kill -0 "$psql_pid" 2>/dev/null; then
+        kill "$psql_pid" 2>/dev/null
+        wait "$psql_pid" 2>/dev/null
+    fi
+
+    # 종료 코드 수집
+    wait "$cmd_pid"
+    local rc=$?
+    rm -f "$tmpfile" "$psql_file"
+    return $rc
+}
+
 # poll_with_bouncing_bar <label> <check_cmd...>
 # check_cmd가 성공(exit 0)할 때까지 바운싱 바 + docker logs 표시
 poll_with_bouncing_bar() {
@@ -1159,15 +1385,15 @@ if [ $skip_lfs -eq 1 ]; then
 fi
 if docker exec "$CONTAINER_NAME" which gitlab-backup &>/dev/null; then
     if [ $skip_lfs -eq 1 ]; then
-        run_with_bouncing_bar "Backup" docker exec -e SKIP=lfs "$CONTAINER_NAME" gitlab-backup create
+        run_with_progress_bar "Backup" docker exec -e SKIP=lfs "$CONTAINER_NAME" gitlab-backup create
     else
-        run_with_bouncing_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-backup create
+        run_with_progress_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-backup create
     fi
 else
     if [ $skip_lfs -eq 1 ]; then
-        run_with_bouncing_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-rake gitlab:backup:create SKIP=lfs
+        run_with_progress_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-rake gitlab:backup:create SKIP=lfs
     else
-        run_with_bouncing_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-rake gitlab:backup:create
+        run_with_progress_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-rake gitlab:backup:create
     fi
 fi
 BACKUP_DIR=$(docker exec "$CONTAINER_NAME" grep "'backup_path'" /etc/gitlab/gitlab.rb | awk -F"=" '{ print $2 }' | sed 's/\"//g' | sed 's/^ //')
