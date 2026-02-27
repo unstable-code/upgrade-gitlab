@@ -35,13 +35,9 @@ logic-test:
 integration-test:
   stage: test
   image: kcov/kcov:latest-alpine
-  services:
-    - docker:dind
   variables:
     START_VERSION: "17.7.0"
     GITLAB_EDITION: "ce"
-    DOCKER_HOST: tcp://docker:2375
-    DOCKER_TLS_CERTDIR: ""
   before_script:
     - apk add --no-cache bash jq curl coreutils docker-cli
   script:
@@ -63,7 +59,7 @@ integration-test:
       echo "GitLab is healthy."
     - |
       kcov --include-pattern=/upgrade-gitlab/upgrade-gitlab coverage_output \
-        ./upgrade-gitlab -y --no-step-limit --target-url=http://docker \
+        ./upgrade-gitlab -y --no-step-limit --target-url=http://localhost \
         > upgrade.log 2>&1 || { tail -100 upgrade.log; exit 1; }
       tail -20 upgrade.log
     - |
