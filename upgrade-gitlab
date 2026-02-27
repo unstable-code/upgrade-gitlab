@@ -13,6 +13,7 @@ edition_flag=
 auto_yes=0
 dry_run=0
 no_step_limit=0
+skip_lfs=0
 _interrupted=0
 _trap_active=0
 _pull_pid=
@@ -86,7 +87,7 @@ pull_with_retry() {
 }
 
 if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
-    echo "Usage: $0 [-y] [--edition=ce|ee] [--target-url=http] [--discord-url=http] [--version=0.0.0] [--skip-latest] [--dry-run]"
+    echo "Usage: $0 [-y] [--edition=ce|ee] [--target-url=http] [--discord-url=http] [--version=0.0.0] [--skip-latest] [--skip-lfs] [--dry-run]"
 
     echo -e '\n\e[0;1mOPTIONS\e[m'
     echo -e "-y\t\t\tAuto-confirm prompts for unattended/cron usage. Aborts on safety warnings and if upgrade path >= 3 steps."
@@ -97,6 +98,7 @@ if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
     echo -e "--dry-run\t\tCompute and display upgrade path without executing. Implies -y."
     echo -e "--no-step-limit\t\tDisable the 3-step safety limit for -y mode. Requires CI=true."
     echo -e "--target-url=http\tPerform a simple connection test for your GitLab server."
+    echo -e "--skip-lfs\t\tSkip LFS objects during backup (passes SKIP=lfs to gitlab-backup)."
     echo -e "--discord-url=http\tNotify via Discord webhook."
 
     echo -e '\n\e[0;1mENV VALUES\e[m'
@@ -122,6 +124,8 @@ else
                 no_step_limit=1
             elif [ "${params[$i]}" == "--skip-latest" ] || [ "${params[$i]}" == "--n-1" ]; then
                 skip_latest=1
+            elif [ "${params[$i]}" == "--skip-lfs" ]; then
+                skip_lfs=1
             elif [[ "${params[$i]}" == "--edition"* ]]; then
                 if [ "$temp" != "ce" ] && [ "$temp" != "ee" ]; then
                     echo "Error: --edition must be 'ce' or 'ee'" >&2
@@ -1150,10 +1154,21 @@ auto_restart_enabled=$(docker inspect --format='{{.HostConfig.RestartPolicy.Name
 check_disk_space
 
 echo "Creating backups for $CURRENT_VERSION. Please wait until backup process is completed..."
+if [ $skip_lfs -eq 1 ]; then
+    echo "Note: LFS objects will be skipped during backup (--skip-lfs)."
+fi
 if docker exec "$CONTAINER_NAME" which gitlab-backup &>/dev/null; then
-    run_with_bouncing_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-backup create
+    if [ $skip_lfs -eq 1 ]; then
+        run_with_bouncing_bar "Backup" docker exec -e SKIP=lfs "$CONTAINER_NAME" gitlab-backup create
+    else
+        run_with_bouncing_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-backup create
+    fi
 else
-    run_with_bouncing_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-rake gitlab:backup:create
+    if [ $skip_lfs -eq 1 ]; then
+        run_with_bouncing_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-rake gitlab:backup:create SKIP=lfs
+    else
+        run_with_bouncing_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-rake gitlab:backup:create
+    fi
 fi
 BACKUP_DIR=$(docker exec "$CONTAINER_NAME" grep "'backup_path'" /etc/gitlab/gitlab.rb | awk -F"=" '{ print $2 }' | sed 's/\"//g' | sed 's/^ //')
 docker exec "$CONTAINER_NAME" sh -c "cp /etc/gitlab/gitlab-secrets.json $BACKUP_DIR/gitlab-secrets.json.${CURRENT_VERSION}-backup"

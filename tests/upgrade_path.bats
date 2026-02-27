@@ -117,7 +117,15 @@ setup() {
     [[ "$output" == *"=== DRY-RUN: Upgrade Path ==="* ]]
 }
 
-# ---------- Test 12: --discord-url and --target-url are accepted ----------
+# ---------- Test 12: --skip-lfs is accepted ----------
+@test "--skip-lfs flag is accepted without error" {
+    export MOCK_GITLAB_VERSION="18.0.1-ce.0"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --skip-lfs
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"=== DRY-RUN: Upgrade Path ==="* ]]
+}
+
+# ---------- Test 13: --discord-url and --target-url are accepted ----------
 @test "--discord-url and --target-url set variables correctly" {
     export MOCK_GITLAB_VERSION="18.0.1-ce.0"
     run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --discord-url=https://discord.test/hook --target-url=http://gitlab.test
