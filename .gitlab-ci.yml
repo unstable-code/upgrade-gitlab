@@ -63,7 +63,7 @@ integration-test:
       echo "GitLab is healthy."
     - |
       kcov --include-pattern=/upgrade-gitlab/upgrade-gitlab coverage_output \
-        bash ./upgrade-gitlab -y --no-step-limit --target-url=http://docker \
+        ./upgrade-gitlab -y --no-step-limit --target-url=http://docker \
         > upgrade.log 2>&1 || { tail -100 upgrade.log; exit 1; }
       tail -20 upgrade.log
     - |
