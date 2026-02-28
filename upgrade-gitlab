@@ -1059,8 +1059,7 @@ _fetch_cached() {
                         local hub_tag
                         hub_tag=$(_resolve_patch_from_hub "$scoped_major" "$n1_minor")
                         if [ -n "$hub_tag" ]; then
-                            # hub_tag에서 suffix 제거하여 bare 버전 추출
-                            n1_bare=$(echo "$hub_tag" | sed "s/${TAG_SUFFIX}$//")
+                            n1_bare="${hub_tag%"$TAG_SUFFIX"}"
                         fi
                     fi
                 fi
