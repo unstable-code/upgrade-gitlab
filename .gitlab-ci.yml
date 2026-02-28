@@ -1,6 +1,7 @@
 stages:
   - lint
   - test
+  - promote
 
 shellcheck:
   stage: lint
@@ -8,6 +9,7 @@ shellcheck:
   script:
     - shellcheck upgrade-gitlab
   rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
     - if: $CI_COMMIT_BRANCH == "master"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
@@ -29,8 +31,20 @@ logic-test:
       - coverage_output/
     when: always
   rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
     - if: $CI_COMMIT_BRANCH == "master"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+promote-to-master:
+  stage: promote
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache git
+  script:
+    - git remote set-url origin "https://push-token:${PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+    - git push origin HEAD:master
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
 
 integration-test:
   stage: test
