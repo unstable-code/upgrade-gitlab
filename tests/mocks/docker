@@ -90,13 +90,6 @@ case "$args" in
             echo "  2 | runner-2    | 2024-01-01   | t"
         fi
         ;;
-    *"exec"*"gitlab-psql"*"project_statistics"*)
-        if [ "${MOCK_PSQL_NO_STATS:-0}" -ne 1 ]; then
-            printf 'group-a/project-1\t1048576\t2097152\t524288\t262144\n'
-            printf 'group-a/project-2\t524288\t0\t1048576\t0\n'
-            printf 'group-b/subgroup/project-3\t2097152\t4194304\t0\t524288\n'
-        fi
-        ;;
     *"exec"*"gitlab-psql"*)
         exit 0
         ;;
@@ -104,21 +97,6 @@ case "$args" in
         exit 0
         ;;
     *"exec"*"gitlab-backup"*)
-        echo "-- Dumping repositories ..."
-        echo " * group-a/project-1 (@hashed/ab/cd/abc) ... [DONE]"
-        echo " * group-a/project-2 (@hashed/ef/gh/efg) ... [DONE]"
-        echo " * group-b/subgroup/project-3 (@hashed/ij/kl/ijk) ... [DONE]"
-        echo "-- Dumping uploads ..."
-        echo " * group-a/project-1 ... [DONE]"
-        echo " * group-b/subgroup/project-3 ... [DONE]"
-        echo "-- Dumping builds ..."
-        echo "-- Dumping artifacts ..."
-        echo " * group-a/project-1 ... [DONE]"
-        echo " * group-a/project-2 ... [DONE]"
-        echo "-- Dumping pages ..."
-        echo "-- Dumping lfs objects ..."
-        echo " * group-a/project-1 ... [DONE]"
-        echo " * group-b/subgroup/project-3 ... [DONE]"
         exit 0
         ;;
     *"exec"*"gitlab-ctl reconfigure"*)

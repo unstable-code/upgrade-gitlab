@@ -17,7 +17,6 @@ An automated upgrade script for Docker-based GitLab instances. Supports both CE 
 - **Background pre-pull** — Downloads the next version image in the background while the current version stabilizes.
 - **Discord notifications** — Optional webhook alerts for upgrade progress, warnings, and errors.
 - **Automatic backup** — Creates a GitLab backup and copies `gitlab-secrets.json` and `gitlab.rb` before upgrading.
-- **Real progress bar** — Queries `project_statistics` via `gitlab-psql` to show actual percentage progress (`[###···] 52.0%`) during backup. Falls back to a bouncing bar when stats are unavailable or for stages without size data.
 
 ## Requirements
 
