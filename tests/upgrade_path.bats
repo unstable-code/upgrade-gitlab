@@ -64,9 +64,16 @@ setup() {
 }
 
 # ---------- Test 6: --version + --skip-latest = error ----------
-@test "--version and --skip-latest together produce error" {
+@test "--version and --skip-latest together produce error (skip-latest first)" {
     export MOCK_GITLAB_VERSION="16.11.0-ce.0"
     run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --skip-latest --version=17.5
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"--version and --skip-latest cannot be used together"* ]]
+}
+
+@test "--version and --skip-latest together produce error (version first)" {
+    export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --version=17.5 --skip-latest
     [ "$status" -eq 1 ]
     [[ "$output" == *"--version and --skip-latest cannot be used together"* ]]
 }
