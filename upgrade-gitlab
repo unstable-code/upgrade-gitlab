@@ -14,6 +14,7 @@ auto_yes=0
 dry_run=0
 no_step_limit=0
 skip_lfs=0
+upgrade_source=""   # "" = auto, "cached" = path.json, "live" = yml+DockerHub
 _interrupted=0
 _trap_active=0
 _pull_pid=
@@ -87,7 +88,7 @@ pull_with_retry() {
 }
 
 if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
-    echo "Usage: $0 [-y] [--edition=ce|ee] [--target-url=http] [--discord-url=http] [--version=0.0.0] [--skip-latest] [--skip-lfs] [--dry-run]"
+    echo "Usage: $0 [-y] [--edition=ce|ee] [--target-url=http] [--discord-url=http] [--version=0.0.0] [--skip-latest] [--skip-lfs] [--source=cached|live] [--dry-run]"
 
     echo -e '\n\e[0;1mOPTIONS\e[m'
     echo -e "-y\t\t\tAuto-confirm prompts for unattended/cron usage. Aborts on safety warnings and if upgrade path >= 3 steps."
@@ -99,6 +100,7 @@ if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
     echo -e "--no-step-limit\t\tDisable the 3-step safety limit for -y mode. Requires CI=true."
     echo -e "--target-url=http\tPerform a simple connection test for your GitLab server."
     echo -e "--skip-lfs\t\tSkip LFS objects during backup (passes SKIP=lfs to gitlab-backup)."
+    echo -e "--source=cached|live\tUpgrade path data source. cached=path.json, live=upgrade_path.yml+Docker Hub."
     echo -e "--discord-url=http\tNotify via Discord webhook."
 
     echo -e '\n\e[0;1mENV VALUES\e[m'
@@ -126,6 +128,12 @@ else
                 skip_latest=1
             elif [ "${params[$i]}" == "--skip-lfs" ]; then
                 skip_lfs=1
+            elif [[ "${params[$i]}" == "--source"* ]]; then
+                if [ "$temp" != "cached" ] && [ "$temp" != "live" ]; then
+                    echo "Error: --source must be 'cached' or 'live'" >&2
+                    exit 1
+                fi
+                upgrade_source=$temp
             elif [[ "${params[$i]}" == "--edition"* ]]; then
                 if [ "$temp" != "ce" ] && [ "$temp" != "ee" ]; then
                     echo "Error: --edition must be 'ce' or 'ee'" >&2
@@ -1114,61 +1122,172 @@ poll_with_bouncing_bar() {
     rm -f "$tmpfile"
 }
 
-# --- upgrade_path.yml 가져오기 + 파싱 ---
+# --- 업그레이드 경로 데이터 소스 결정 ---
+_UPGRADE_PATH_PROJECT="29943108"
+_TAGS_URL="https://gitlab-com.gitlab.io/support/toolbox/upgrade-path/path.json"
 UPGRADE_STOPS_URL="https://gitlab.com/gitlab-org/gitlab/-/raw/master/config/upgrade_path.yml"
-echo "Processing GitLab-${GITLAB_EDITION^^} upgrade path..."
 
-UPGRADE_STOPS_YML=$(curl -sf "$UPGRADE_STOPS_URL")
-if [ -z "$UPGRADE_STOPS_YML" ]; then
-    echo "FATAL ERROR: Failed to fetch upgrade path data from $UPGRADE_STOPS_URL" >&2
-    echo "Please check your network connectivity and try again." >&2
-    exit 1
-fi
+_schedule_hour=""  # 프롬프트에서 사용 (함수 밖에서 접근 가능)
 
-# YAML 파싱: "8.11" "8.12" ... "18.8" "18.11"
-mapfile -t REQUIRED_STOPS < <(echo "$UPGRADE_STOPS_YML" | awk '/major:/{m=$NF} /minor:/{print m"."$NF}')
+_resolve_upgrade_source() {
+    # --source 명시 시 바로 반환
+    if [ "$upgrade_source" = "cached" ] || [ "$upgrade_source" = "live" ]; then
+        echo "$upgrade_source"
+        return
+    fi
 
-# --- Docker Hub 태그 일괄 조회 ---
-cur_major=${CURRENT_VERSION%%.*}
-max_stop_major=$(printf '%s\n' "${REQUIRED_STOPS[@]}" | awk -F. '{print $1}' | sort -n | tail -1)
-max_major=$(( max_stop_major > cur_major ? max_stop_major + 1 : cur_major + 1 ))
+    # 스케줄 파이프라인 상태 확인 (단일 jq 호출로 status + created_at 추출)
+    local pipeline_json pipeline_status created_at
+    pipeline_json=$(curl -sf "https://gitlab.com/api/v4/projects/${_UPGRADE_PATH_PROJECT}/pipelines?source=schedule&per_page=1")
+    read -r pipeline_status created_at < <(echo "$pipeline_json" | jq -r '.[0] | [.status, .created_at] | map(. // "") | join(" ")' 2>/dev/null)
 
-ALL_DOCKER_TAGS=""
-echo "Fetching Docker Hub tags for ${GITLAB_IMAGE} (major ${cur_major}-${max_major})..."
-for (( maj=cur_major; maj<=max_major; maj++ )); do
-    page_url="https://hub.docker.com/v2/repositories/${GITLAB_IMAGE}/tags/?name=${maj}.&page_size=100"
-    while [ -n "$page_url" ]; do
-        response=$(curl -sf "$page_url")
-        [ -z "$response" ] && break
-        # 태그명 추출 후 정확한 메이저만 필터 (name= 은 substring match)
-        page_tags=$(echo "$response" | jq -r '.results[].name' | grep -E "^${maj}\.")
-        ALL_DOCKER_TAGS="${ALL_DOCKER_TAGS}${page_tags}"$'\n'
-        # 다음 페이지
-        next=$(echo "$response" | jq -r '.next // empty')
-        page_url="$next"
-    done
-done
-ALL_DOCKER_TAGS=$(echo "$ALL_DOCKER_TAGS" | sed '/^$/d' | sort -Vu)
+    if [ -z "$pipeline_status" ]; then
+        echo "Warning: Could not check upgrade-path CI — using live source" >&2
+        echo "live"
+        return
+    fi
 
-if [ -z "$ALL_DOCKER_TAGS" ]; then
-    echo "FATAL ERROR: No Docker Hub tags found for ${GITLAB_IMAGE}" >&2
-    exit 1
-fi
+    if [ "$pipeline_status" != "success" ]; then
+        echo "Warning: upgrade-path CI status: $pipeline_status — using live source" >&2
+        echo "live"
+        return
+    fi
 
-# --- 최신 버전 결정 ---
-LATEST_VERSION_TAG=$(echo "$ALL_DOCKER_TAGS" | sort -V | tail -1)
+    # 스케줄 시간 추론 (created_at에서 date/hour 추출)
+    local pipeline_date today utc_hour
+    pipeline_date=${created_at%%T*}
+    _schedule_hour=$(echo "${created_at#*T}" | cut -d: -f1)
+    _schedule_hour=${_schedule_hour:-21}
+    today=$(date -u +%Y-%m-%d)
+    utc_hour=$(date -u +%H)
 
-# --- N-1 전략 ---
-if [ $skip_latest -eq 1 ] && [ -z "$target_version_tag" ]; then
-    latest_major=$(echo "$LATEST_VERSION_TAG" | awk -F. '{print $1}')
-    latest_minor=$(echo "$LATEST_VERSION_TAG" | awk -F'[.-]' '{print $2}')
+    # 오늘 파이프라인이 아직 안 돌았으면 프롬프트
+    if [ "$pipeline_date" != "$today" ] && [ "$utc_hour" -lt "$_schedule_hour" ]; then
+        if [ $auto_yes -eq 1 ]; then
+            echo "Note: Running before UTC ${_schedule_hour}:00 — latest release may not be in path.json" >&2
+            echo "cached"
+            return
+        fi
+        # 빈 문자열 = 프롬프트 필요
+        echo ""
+        return
+    fi
+
+    echo "cached"
+}
+
+# --- N-1 버전 결정 (공통 헬퍼) ---
+# 인자: 최신버전, 후보목록(줄바꿈 구분)
+# stdout: N-1 태그 (없으면 빈 문자열)
+_resolve_n1() {
+    local latest_ver=$1 candidates=$2
+    local latest_major latest_minor
+    latest_major=${latest_ver%%.*}
+    latest_minor=$(echo "$latest_ver" | awk -F'[.-]' '{print $2}')
 
     if [ "$latest_minor" -eq 0 ]; then
-        # 이전 메이저의 마지막 마이너
-        prev_major=$((latest_major - 1))
-        prev_major_tags=$(echo "$ALL_DOCKER_TAGS" | grep -E "^${prev_major}\.")
-        if [ -z "$prev_major_tags" ]; then
-            # 추가 조회
+        local prev_major=$((latest_major - 1))
+        echo "$candidates" | grep -E "^${prev_major}\." | sort -V | tail -1
+    else
+        local prev_minor=$((latest_minor - 1))
+        echo "$candidates" | grep -E "^${latest_major}\.${prev_minor}\.[0-9]+" | sort -V | tail -1
+    fi
+}
+
+# --- cached 경로: path.json ---
+_fetch_cached() {
+    local path_json
+    path_json=$(curl -sf "$_TAGS_URL")
+    if [ -z "$path_json" ]; then
+        if [ "$upgrade_source" = "cached" ]; then
+            echo "FATAL ERROR: Failed to fetch path.json from $_TAGS_URL" >&2
+            exit 1
+        fi
+        echo "Warning: Failed to fetch path.json — falling back to live source" >&2
+        _fetch_live
+        return
+    fi
+
+    echo "Using cached upgrade path (path.json)"
+
+    # 단일 jq 호출: 정렬된 전체 목록 + 최신 버전을 한번에 추출
+    local bare_all bare_latest
+    bare_all=$(echo "$path_json" | jq -r '.all | unique | sort_by(split(".") | map(tonumber? // 0)) | .[]')
+    bare_latest=$(echo "$bare_all" | tail -1)
+    LATEST_VERSION_TAG="${bare_latest}${TAG_SUFFIX}"
+
+    if [ $skip_latest -eq 1 ] && [ -z "$target_version_tag" ]; then
+        local n1_bare
+        n1_bare=$(_resolve_n1 "$bare_latest" "$bare_all")
+
+        if [ -n "$n1_bare" ]; then
+            target_version_tag="${n1_bare}${TAG_SUFFIX}"
+            echo "Skip-latest (N-1) mode: targeting $target_version_tag"
+        else
+            echo "Warning: Could not determine N-1 version, using latest" >&2
+        fi
+    fi
+
+    # ALL_TAGS: 전체 태그 목록 (에디션 suffix 추가, jq에서 직접 append)
+    ALL_TAGS=()
+    local suffix="${TAG_SUFFIX}"
+    mapfile -t ALL_TAGS < <(echo "$bare_all" | sed "/^$/d;s/$/${suffix}/")
+}
+
+# --- live 경로: upgrade_path.yml + Docker Hub ---
+_fetch_live() {
+    echo "Using live upgrade path (upgrade_path.yml + Docker Hub)"
+
+    local upgrade_stops_yml
+    upgrade_stops_yml=$(curl -sf "$UPGRADE_STOPS_URL")
+    if [ -z "$upgrade_stops_yml" ]; then
+        echo "FATAL ERROR: Failed to fetch upgrade path data from $UPGRADE_STOPS_URL" >&2
+        echo "Please check your network connectivity and try again." >&2
+        exit 1
+    fi
+
+    # YAML 파싱: "8.11" "8.12" ... "18.8" "18.11"
+    local -a required_stops
+    mapfile -t required_stops < <(echo "$upgrade_stops_yml" | awk '/major:/{m=$NF} /minor:/{print m"."$NF}')
+
+    # Docker Hub 태그 일괄 조회
+    local cur_major max_stop_major max_major all_docker_tags=""
+    cur_major=${CURRENT_VERSION%%.*}
+    max_stop_major=$(printf '%s\n' "${required_stops[@]}" | awk -F. '{print $1}' | sort -n | tail -1)
+    max_major=$(( max_stop_major > cur_major ? max_stop_major + 1 : cur_major + 1 ))
+
+    echo "Fetching Docker Hub tags for ${GITLAB_IMAGE} (major ${cur_major}-${max_major})..."
+    local maj page_url response page_tags next
+    for (( maj=cur_major; maj<=max_major; maj++ )); do
+        page_url="https://hub.docker.com/v2/repositories/${GITLAB_IMAGE}/tags/?name=${maj}.&page_size=100"
+        while [ -n "$page_url" ]; do
+            response=$(curl -sf "$page_url")
+            [ -z "$response" ] && break
+            page_tags=$(echo "$response" | jq -r '.results[].name' | grep -E "^${maj}\.")
+            all_docker_tags="${all_docker_tags}${page_tags}"$'\n'
+            next=$(echo "$response" | jq -r '.next // empty')
+            page_url="$next"
+        done
+    done
+    all_docker_tags=$(echo "$all_docker_tags" | sed '/^$/d' | sort -Vu)
+
+    if [ -z "$all_docker_tags" ]; then
+        echo "FATAL ERROR: No Docker Hub tags found for ${GITLAB_IMAGE}" >&2
+        exit 1
+    fi
+
+    # 최신 버전 결정
+    LATEST_VERSION_TAG=$(echo "$all_docker_tags" | sort -V | tail -1)
+
+    # N-1 전략
+    if [ $skip_latest -eq 1 ] && [ -z "$target_version_tag" ]; then
+        local n1_tag
+        n1_tag=$(_resolve_n1 "$LATEST_VERSION_TAG" "$all_docker_tags")
+
+        # N-1 대상이 현재 태그에 없으면 해당 메이저 추가 조회
+        if [ -z "$n1_tag" ]; then
+            local prev_major prev_major_tags=""
+            prev_major=$(( ${LATEST_VERSION_TAG%%.*} - 1 ))
             page_url="https://hub.docker.com/v2/repositories/${GITLAB_IMAGE}/tags/?name=${prev_major}.&page_size=100"
             while [ -n "$page_url" ]; do
                 response=$(curl -sf "$page_url")
@@ -1178,41 +1297,65 @@ if [ $skip_latest -eq 1 ] && [ -z "$target_version_tag" ]; then
                 next=$(echo "$response" | jq -r '.next // empty')
                 page_url="$next"
             done
+            n1_tag=$(echo "$prev_major_tags" | sed '/^$/d' | sort -V | tail -1)
         fi
-        n1_tag=$(echo "$prev_major_tags" | sed '/^$/d' | sort -V | tail -1)
-    else
-        prev_minor=$((latest_minor - 1))
-        n1_tag=$(echo "$ALL_DOCKER_TAGS" | grep -E "^${latest_major}\.${prev_minor}\.[0-9]+" | sort -V | tail -1)
+
+        if [ -n "$n1_tag" ]; then
+            target_version_tag="$n1_tag"
+            echo "Skip-latest (N-1) mode: targeting $target_version_tag"
+        else
+            echo "Warning: Could not determine N-1 version, using latest" >&2
+        fi
     fi
 
-    if [ -n "$n1_tag" ]; then
-        target_version_tag="$n1_tag"
-        echo "Skip-latest (N-1) mode: targeting $target_version_tag"
+    # ALL_TAGS 구성
+    ALL_TAGS=()
+    local stop stop_major stop_minor resolved
+    for stop in "${required_stops[@]}"; do
+        stop_major=${stop%%.*}
+        stop_minor=${stop#*.}
+        resolved=$(echo "$all_docker_tags" | grep -E "^${stop_major}\.${stop_minor}\.[0-9]+" | sort -V | tail -1)
+        [ -n "$resolved" ] && ALL_TAGS+=("$resolved")
+    done
+
+    # 최신 버전 또는 target_version_tag 추가
+    if [ -n "$target_version_tag" ]; then
+        ALL_TAGS+=("$target_version_tag")
     else
-        echo "Warning: Could not determine N-1 version, using latest" >&2
+        ALL_TAGS+=("$LATEST_VERSION_TAG")
     fi
+
+    # 정렬 + 중복 제거
+    mapfile -t ALL_TAGS < <(printf '%s\n' "${ALL_TAGS[@]}" | sort -Vu)
+}
+
+echo "Processing GitLab-${GITLAB_EDITION^^} upgrade path..."
+
+# 소스 결정
+_resolved_source=$(_resolve_upgrade_source)
+
+# 프롬프트 필요 (auto + stale + interactive)
+if [ -z "$_resolved_source" ]; then
+    echo ""
+    echo "Note: upgrade-path nightly CI has not yet run today (runs at UTC ${_schedule_hour:-21}:00)."
+    echo "      Latest release may not be reflected in path.json."
+    echo ""
+    echo "Select upgrade path source:"
+    echo "  1) cached  — Use path.json (fast, may be stale)"
+    echo "  2) live    — Compute from upgrade_path.yml + Docker Hub (slower, always fresh)"
+    printf "Choice [1/2]: "
+    read -r _source_choice < "$_tty"
+    case "$_source_choice" in
+        1) _resolved_source="cached" ;;
+        *) _resolved_source="live" ;;
+    esac
 fi
 
-# --- ALL_TAGS 구성 ---
-ALL_TAGS=()
-
-# 각 required stop의 최신 패치 버전 resolve
-for stop in "${REQUIRED_STOPS[@]}"; do
-    stop_major=${stop%%.*}
-    stop_minor=${stop#*.}
-    resolved=$(echo "$ALL_DOCKER_TAGS" | grep -E "^${stop_major}\.${stop_minor}\.[0-9]+" | sort -V | tail -1)
-    [ -n "$resolved" ] && ALL_TAGS+=("$resolved")
-done
-
-# 최신 버전 또는 target_version_tag 추가
-if [ -n "$target_version_tag" ]; then
-    ALL_TAGS+=("$target_version_tag")
+if [ "$_resolved_source" = "cached" ]; then
+    _fetch_cached
 else
-    ALL_TAGS+=("$LATEST_VERSION_TAG")
+    _fetch_live
 fi
-
-# 정렬 + 중복 제거
-mapfile -t ALL_TAGS < <(printf '%s\n' "${ALL_TAGS[@]}" | sort -Vu)
 
 # partial version resolve
 if [ "$_partial_version" -eq 1 ]; then
@@ -1257,7 +1400,7 @@ if [ -n "$target_version_tag" ]; then
 fi
 
 # 2. 업그레이드 경로 구성
-# upgrade_path.yml + Docker Hub 태그 기반 필수 경유 버전이므로 그대로 사용
+# cached(path.json) 또는 live(upgrade_path.yml+Docker Hub) 기반 필수 경유 버전
 UPGRADE_POINTS_ARRAY=("${UPDATABLE_TAGS[@]}")
 
 # CE → EE 전환 시 같은 버전의 EE 태그를 라우팅 포인트 맨 앞에 추가

@@ -8,7 +8,7 @@ An automated upgrade script for Docker-based GitLab instances. Supports both CE 
 ## Features
 
 - **CE/EE auto-detection** — Automatically detects the running edition from the container image. Supports CE-to-EE migration at the same version before proceeding with upgrades.
-- **Safe upgrade path** — Fetches required upgrade stops from GitLab's `upgrade_path.yml` and resolves each to the latest patch version via Docker Hub API.
+- **Safe upgrade path** — By default, uses the pre-computed `path.json` from the [upgrade-path](https://gitlab.com/gitlab-com/support/toolbox/upgrade-path) project (fast). Automatically falls back to computing the path live from `upgrade_path.yml` + Docker Hub API when the upstream CI is unhealthy. Override with `--source=cached|live`.
 - **Background migration tracking** — Waits for batched background migrations to complete between each version hop, with per-migration progress display.
 - **Migration status verification** — Checks for `down` state migrations after each upgrade step.
 - **Disk space pre-check** — Validates that data and backup volumes have at least 1.5x free space before starting.
@@ -48,6 +48,7 @@ An automated upgrade script for Docker-based GitLab instances. Supports both CE 
 | `--skip-latest`, `--n-1` | Target the latest patch of the previous minor version (N-1 strategy). Mutually exclusive with `--version`. |
 | `--dry-run` | Compute and display upgrade path without executing. Implies `-y`. |
 | `--skip-lfs` | Skip LFS objects during backup |
+| `--source=cached\|live` | Upgrade path data source. `cached` = path.json (fast), `live` = upgrade_path.yml + Docker Hub (always fresh). Auto-detected if omitted. |
 | `--no-step-limit` | Disable the 3-step safety limit for `-y` mode. Requires `CI=true`. |
 | `--target-url=URL` | GitLab server URL for connection testing |
 | `--discord-url=URL` | Discord webhook URL for notifications |

@@ -132,3 +132,53 @@ setup() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"=== DRY-RUN: Upgrade Path ==="* ]]
 }
+
+# ---------- Test 14: Fallback to live when pipeline failed ----------
+@test "fallback to live when pipeline failed" {
+    export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    export MOCK_PIPELINE_FAILED=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"using live source"* ]]
+    [[ "$output" == *"=== DRY-RUN: Upgrade Path ==="* ]]
+    [[ "$output" == *"Target: 18.0.1-ce.0"* ]]
+}
+
+# ---------- Test 15: Fallback to live when pipeline unreachable ----------
+@test "fallback to live when pipeline unreachable" {
+    export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    export MOCK_PIPELINE_UNAVAIL=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"using live source"* ]]
+    [[ "$output" == *"=== DRY-RUN: Upgrade Path ==="* ]]
+    [[ "$output" == *"Target: 18.0.1-ce.0"* ]]
+}
+
+# ---------- Test 16: --source=live forces direct computation ----------
+@test "--source=live forces direct computation" {
+    export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --source=live
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Using live upgrade path"* ]]
+    [[ "$output" == *"=== DRY-RUN: Upgrade Path ==="* ]]
+    [[ "$output" == *"Target: 18.0.1-ce.0"* ]]
+}
+
+# ---------- Test 17: --source=cached forces path.json ----------
+@test "--source=cached forces path.json" {
+    export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --source=cached
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Using cached upgrade path"* ]]
+    [[ "$output" == *"=== DRY-RUN: Upgrade Path ==="* ]]
+    [[ "$output" == *"Target: 18.0.1-ce.0"* ]]
+}
+
+# ---------- Test 18: Invalid --source value ----------
+@test "invalid --source=xxx produces error" {
+    export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --source=xxx
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"--source must be 'cached' or 'live'"* ]]
+}

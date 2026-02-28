@@ -28,6 +28,21 @@ for arg in "$@"; do
 done
 
 case "$url" in
+    *"api/v4/projects/"*"/pipelines?source=schedule"*)
+        if [ "${MOCK_PIPELINE_FAILED:-0}" -eq 1 ]; then
+            echo '[{"status":"failed","created_at":"2026-01-01T21:00:00Z"}]'
+        elif [ "${MOCK_PIPELINE_UNAVAIL:-0}" -eq 1 ]; then
+            exit 1
+        else
+            echo "[{\"status\":\"success\",\"created_at\":\"$(date -u +%Y-%m-%dT21:00:00Z)\"}]"
+        fi
+        ;;
+    *"path.json"*)
+        if [ "${MOCK_PATH_JSON_FAIL:-0}" -eq 1 ]; then
+            exit 1
+        fi
+        cat "$FIXTURES_DIR/path.json"
+        ;;
     *"upgrade_path.yml"*)
         cat "$FIXTURES_DIR/upgrade_path.yml"
         ;;
