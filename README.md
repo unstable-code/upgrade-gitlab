@@ -20,12 +20,17 @@ An automated upgrade script for Docker-based GitLab instances. Supports both CE 
 
 ## Requirements
 
-- **GitLab 12.2+** (recommended minimum version)
-  - <=12.1: auto-fallback from `gitlab-backup create` to `gitlab-rake gitlab:backup:create`
-  - <=13.0: `doctor:secrets` check auto-skipped (unavailable)
-  - <=13.9: background migration tracking auto-skipped (`batched_background_migrations` table unavailable)
-  - 13.1+: secrets integrity check enabled
+>>> [!WARNING] Data loss risk
+Versions below 13.10 cannot track batched background migrations, which may cause data corruption during upgrades.
+
+EOS (end-of-support) versions are checked via GitLab releases API but not exhaustively tested.
+>>>
+
+- **GitLab 13.10+** (recommended minimum version)
   - 13.10+: full background migration tracking enabled
+  - 13.1+: secrets integrity check enabled
+  - <=13.0: `doctor:secrets` check auto-skipped (unavailable)
+  - <=12.1: auto-fallback from `gitlab-backup create` to `gitlab-rake gitlab:backup:create`
 - Docker (Engine or Desktop)
 - `bash`, `curl`, `jq`, `sort` (with `-V` flag)
 - Root access or Docker group membership
