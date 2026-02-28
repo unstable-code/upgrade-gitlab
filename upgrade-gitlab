@@ -906,7 +906,6 @@ _GITLAB_PROJECT_ID="278964"  # gitlab-org/gitlab
 _TAGS_URL="https://gitlab-com.gitlab.io/support/toolbox/upgrade-path/path.json"
 UPGRADE_STOPS_URL="https://gitlab.com/gitlab-org/gitlab/-/raw/master/config/upgrade_path.yml"
 
-_schedule_hour=""  # 프롬프트에서 사용 (함수 밖에서 접근 가능)
 
 _resolve_upgrade_source() {
     # --source 명시 시 바로 반환
@@ -932,18 +931,22 @@ _resolve_upgrade_source() {
         return
     fi
 
-    # 스케줄 시간 추론 (created_at에서 date/hour 추출)
-    local pipeline_date today utc_hour
-    pipeline_date=${created_at%%T*}
-    _schedule_hour=$(echo "${created_at#*T}" | cut -d: -f1)
-    _schedule_hour=${_schedule_hour:-21}
-    today=$(date -u +%Y-%m-%d)
-    utc_hour=$(date -u +%H)
+    # 마지막 파이프라인 경과 시간 확인 (타임존 무관)
+    local pipeline_epoch now_epoch elapsed_hours
+    pipeline_epoch=$(date -d "$created_at" +%s 2>/dev/null)
+    now_epoch=$(date +%s)
 
-    # 오늘 파이프라인이 아직 안 돌았으면 프롬프트
-    if [ "$pipeline_date" != "$today" ] && [ "$utc_hour" -lt "$_schedule_hour" ]; then
+    if [ -z "$pipeline_epoch" ]; then
+        echo "cached"
+        return
+    fi
+
+    elapsed_hours=$(( (now_epoch - pipeline_epoch) / 3600 ))
+
+    # 24시간 이내면 cached, 초과면 프롬프트
+    if [ "$elapsed_hours" -gt 24 ]; then
         if [ $auto_yes -eq 1 ]; then
-            echo "Note: Running before UTC ${_schedule_hour}:00 — latest release may not be in path.json" >&2
+            echo "Note: Last path.json update was ${elapsed_hours}h ago — latest release may not be reflected" >&2
             echo "cached"
             return
         fi
@@ -1230,7 +1233,7 @@ _resolved_source=$(_resolve_upgrade_source)
 # 프롬프트 필요 (auto + stale + interactive)
 if [ -z "$_resolved_source" ]; then
     echo ""
-    echo "Note: upgrade-path nightly CI has not yet run today (runs at UTC ${_schedule_hour:-21}:00)."
+    echo "Note: Last path.json update was more than 24 hours ago."
     echo "      Latest release may not be reflected in path.json."
     echo ""
     echo "Select upgrade path source:"
