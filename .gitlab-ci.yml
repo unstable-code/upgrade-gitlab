@@ -36,7 +36,7 @@ integration-test:
   stage: test
   image: kcov/kcov:latest-alpine
   variables:
-    START_VERSION: "17.7.0"
+    START_VERSION: "17.10.0"
     GITLAB_EDITION: "ce"
   before_script:
     - apk add --no-cache bash jq curl coreutils docker-cli
