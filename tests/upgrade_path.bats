@@ -38,6 +38,7 @@ setup() {
 # ---------- Test 3: --version=17.5 (partial version resolve) ----------
 @test "--version=17.5 resolves to latest 17.5.x patch" {
     export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    export MOCK_EOS_UNAVAIL=1  # bypass EOS check (17.5 is EOS in mock)
     run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --version=17.5
     [ "$status" -eq 0 ]
     [[ "$output" == *"Partial version provided: 17.5"* ]]
@@ -48,6 +49,7 @@ setup() {
 # ---------- Test 4: --version=17.5.2-ce.0 (exact version) ----------
 @test "--version=17.5.2-ce.0 targets exact version" {
     export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    export MOCK_EOS_UNAVAIL=1  # bypass EOS check (17.5 is EOS in mock)
     run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --version=17.5.2-ce.0
     [ "$status" -eq 0 ]
     [[ "$output" == *"Using 17.5.2-ce.0 instead of latest"* ]]
@@ -63,19 +65,19 @@ setup() {
     [[ "$output" == *"Edition: ee"* ]]
 }
 
-# ---------- Test 6: --version + --skip-latest = error ----------
-@test "--version and --skip-latest together produce error (skip-latest first)" {
+# ---------- Test 6: --version (non-major) + --skip-latest = error ----------
+@test "--version=17.5 and --skip-latest together produce error (skip-latest first)" {
     export MOCK_GITLAB_VERSION="16.11.0-ce.0"
     run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --skip-latest --version=17.5
     [ "$status" -eq 1 ]
-    [[ "$output" == *"--version and --skip-latest cannot be used together"* ]]
+    [[ "$output" == *"--skip-latest can only be combined with major-only --version"* ]]
 }
 
-@test "--version and --skip-latest together produce error (version first)" {
+@test "--version=17.5 and --skip-latest together produce error (version first)" {
     export MOCK_GITLAB_VERSION="16.11.0-ce.0"
     run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --version=17.5 --skip-latest
     [ "$status" -eq 1 ]
-    [[ "$output" == *"--version and --skip-latest cannot be used together"* ]]
+    [[ "$output" == *"--skip-latest can only be combined with major-only --version"* ]]
 }
 
 # ---------- Test 7: Invalid --edition=xx = error ----------
@@ -188,4 +190,64 @@ setup() {
     run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --source=xxx
     [ "$status" -eq 1 ]
     [[ "$output" == *"--source must be 'cached' or 'live'"* ]]
+}
+
+# ---------- Test 19: --version=17 --skip-latest → major-scoped N-1 ----------
+@test "--version=17 --skip-latest targets N-1 within major 17" {
+    export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --version=17 --skip-latest
+    [ "$status" -eq 0 ]
+    # Latest in major 17 = 17.11.3, N-1 = 17.10 (arithmetic: 11-1=10)
+    # 17.10 not in path.json → Docker Hub fallback → 17.10.2-ce.0
+    [[ "$output" == *"Skip-latest (N-1) mode: targeting 17.10.2-ce.0"* ]]
+    [[ "$output" == *"Target: 17.10.2-ce.0"* ]]
+}
+
+# ---------- Test 20: --version=18 --skip-latest → minor=0, N-1 crosses major ----------
+@test "--version=18 --skip-latest targets previous major's last minor" {
+    export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --version=18 --skip-latest
+    [ "$status" -eq 0 ]
+    # path.json has only 18.0.1 → minor=0 → N-1 = prev major's latest = 17.11.3
+    [[ "$output" == *"Skip-latest (N-1) mode: targeting 17.11.3-ce.0"* ]]
+    [[ "$output" == *"Target: 17.11.3-ce.0"* ]]
+}
+
+# ---------- Test 21: --version=16 → EOS error ----------
+@test "--version=16 is rejected as end-of-support" {
+    export MOCK_GITLAB_VERSION="15.0.0-ce.0"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --version=16
+    [ "$status" -eq 1 ]
+    # mock releases: [18.0, 17.11, 17.10] → 16.11 not supported
+    [[ "$output" == *"end-of-support"* ]]
+    [[ "$output" == *"Supported tracks:"* ]]
+}
+
+# ---------- Test 22: --version=17.3 → EOS error ----------
+@test "--version=17.3 is rejected as end-of-support" {
+    export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --version=17.3
+    [ "$status" -eq 1 ]
+    # 17.3 not in supported tracks [18.0, 17.11, 17.10]
+    [[ "$output" == *"end-of-support"* ]]
+}
+
+# ---------- Test 23: EOS API failure → warning only, continues ----------
+@test "EOS API failure shows warning but continues" {
+    export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    export MOCK_EOS_UNAVAIL=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --version=17.7
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Could not check EOS status"* ]]
+    [[ "$output" == *"=== DRY-RUN: Upgrade Path ==="* ]]
+}
+
+# ---------- Test 24: --version=17.10 resolves via Docker Hub fallback ----------
+@test "--version=17.10 resolves via Docker Hub when not in path.json" {
+    export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --version=17.10
+    [ "$status" -eq 0 ]
+    # 17.10 not in path.json stops, but exists on Docker Hub → fallback
+    [[ "$output" == *"Resolved partial version to: 17.10.2-ce.0"* ]]
+    [[ "$output" == *"Target: 17.10.2-ce.0"* ]]
 }

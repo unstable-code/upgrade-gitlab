@@ -94,8 +94,8 @@ if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
     echo -e "-y, --yes\t\tAuto-confirm prompts for unattended/cron usage. Aborts on safety warnings and if upgrade path >= 3 steps."
     echo -e "--help\t\t\tShow this help."
     echo -e "--edition=ce|ee\t\tForce GitLab edition (ce or ee). Auto-detected if omitted."
-    echo -e "--version=0.0.0\t\tUse provided tag instead of latest tag. Partial versions (e.g. 18) are resolved automatically."
-    echo -e "--skip-latest\t\tTarget the latest patch of the previous minor version (N-1 strategy). (alias: --n-1)"
+    echo -e "--version=0.0.0\t\tUse provided tag instead of latest tag. Partial versions (e.g. 18) are resolved automatically. EOS versions are rejected."
+    echo -e "--skip-latest\t\tTarget the latest patch of the previous minor version (N-1 strategy). Can combine with major-only --version (e.g. --version=18 --skip-latest). (alias: --n-1)"
     echo -e "--dry-run\t\tCompute and display upgrade path without executing. Implies -y."
     echo -e "--no-step-limit\t\tDisable the 3-step safety limit for -y mode. Requires CI=true."
     echo -e "--target-url=http\tPerform a simple connection test for your GitLab server."
@@ -125,8 +125,8 @@ else
                 fi
                 no_step_limit=1
             elif [ "${params[$i]}" == "--skip-latest" ] || [ "${params[$i]}" == "--n-1" ]; then
-                if [ -n "$target_version_tag" ]; then
-                    echo "Error: --version and --skip-latest cannot be used together." >&2
+                if [ -n "$target_version_tag" ] && ! [[ "$target_version_tag" =~ ^[0-9]+$ ]]; then
+                    echo "Error: --skip-latest can only be combined with major-only --version (e.g. --version=18)." >&2
                     exit 1
                 fi
                 skip_latest=1
@@ -145,8 +145,8 @@ else
                 fi
                 edition_flag=$temp
             elif [[ "${params[$i]}" == "--version"* ]]; then
-                if [ $skip_latest -eq 1 ]; then
-                    echo "Error: --version and --skip-latest cannot be used together." >&2
+                if [ $skip_latest -eq 1 ] && ! [[ "$temp" =~ ^[0-9]+$ ]]; then
+                    echo "Error: --skip-latest can only be combined with major-only --version (e.g. --version=18)." >&2
                     exit 1
                 fi
                 if [ -n "$target_version_tag" ]; then
@@ -902,6 +902,7 @@ poll_with_bouncing_bar() {
 
 # --- 업그레이드 경로 데이터 소스 결정 ---
 _UPGRADE_PATH_PROJECT="29943108"
+_GITLAB_PROJECT_ID="278964"  # gitlab-org/gitlab
 _TAGS_URL="https://gitlab-com.gitlab.io/support/toolbox/upgrade-path/path.json"
 UPGRADE_STOPS_URL="https://gitlab.com/gitlab-org/gitlab/-/raw/master/config/upgrade_path.yml"
 
@@ -972,6 +973,44 @@ _resolve_n1() {
     fi
 }
 
+# --- Docker Hub에서 특정 major.minor의 최신 패치 조회 ---
+# stdout: 태그 (예: 17.10.2-ce.0), 없으면 빈 문자열
+_resolve_patch_from_hub() {
+    local major=$1 minor=$2
+    local page_url response
+    page_url="https://hub.docker.com/v2/repositories/${GITLAB_IMAGE}/tags/?name=${major}.${minor}.&page_size=100"
+    response=$(curl -sf "$page_url")
+    [ -z "$response" ] && return
+    echo "$response" | jq -r '.results[].name' | grep -E "^${major}\.${minor}\.[0-9]+" | sort -V | tail -1
+}
+
+# --- EOS (End-of-Support) 체크 ---
+# GitLab 공개 API로 현재 지원 중인 3개 마이너 트랙 조회
+_check_eos() {
+    # target_version_tag가 없으면 (latest 대상) 스킵
+    [ -z "$target_version_tag" ] && return 0
+
+    local releases supported_minors target_major target_minor
+    releases=$(curl -sf "https://gitlab.com/api/v4/projects/${_GITLAB_PROJECT_ID}/releases?per_page=3")
+    if [ -z "$releases" ]; then
+        echo "Warning: Could not check EOS status (GitLab API unreachable)" >&2
+        return 0  # API 실패 시 차단하지 않음
+    fi
+
+    # 지원 트랙 추출: v18.9.0-ee → 18.9
+    supported_minors=$(echo "$releases" | jq -r '.[].tag_name' | sed 's/^v//;s/\.[0-9]*-.*$//')
+
+    # 타겟의 major.minor 추출 (suffix 제거)
+    target_major=$(echo "$target_version_tag" | awk -F'[.-]' '{print $1}')
+    target_minor=$(echo "$target_version_tag" | awk -F'[.-]' '{print $2}')
+
+    if ! echo "$supported_minors" | grep -qx "${target_major}\.${target_minor}"; then
+        echo "Error: ${target_major}.${target_minor} is end-of-support." >&2
+        echo "Supported tracks: $(echo "$supported_minors" | tr '\n' ', ' | sed 's/,$//')" >&2
+        exit 1
+    fi
+}
+
 # --- cached 경로: path.json ---
 _fetch_cached() {
     local path_json
@@ -994,15 +1033,56 @@ _fetch_cached() {
     bare_latest=$(echo "$bare_all" | tail -1)
     LATEST_VERSION_TAG="${bare_latest}${TAG_SUFFIX}"
 
-    if [ $skip_latest -eq 1 ] && [ -z "$target_version_tag" ]; then
-        local n1_bare
-        n1_bare=$(_resolve_n1 "$bare_latest" "$bare_all")
+    if [ $skip_latest -eq 1 ]; then
+        if [[ "$target_version_tag" =~ ^[0-9]+$ ]]; then
+            # major-scoped N-1: 해당 major 내에서 산술 N-1
+            local scoped_major=$target_version_tag
+            local scoped_candidates
+            scoped_candidates=$(echo "$bare_all" | grep "^${scoped_major}\.")
+            local latest_in_major
+            latest_in_major=$(echo "$scoped_candidates" | sort -V | tail -1)
 
-        if [ -n "$n1_bare" ]; then
-            target_version_tag="${n1_bare}${TAG_SUFFIX}"
-            echo "Skip-latest (N-1) mode: targeting $target_version_tag"
-        else
-            echo "Warning: Could not determine N-1 version, using latest" >&2
+            if [ -z "$latest_in_major" ]; then
+                echo "Warning: No versions found for major ${scoped_major} — skipping N-1" >&2
+            else
+                local n1_bare
+                n1_bare=$(_resolve_n1 "$latest_in_major" "$bare_all")
+
+                # path.json은 sparse 데이터 → N-1 minor가 없을 수 있음 → Docker Hub 폴백
+                if [ -z "$n1_bare" ]; then
+                    local n1_minor
+                    n1_minor=$(( $(echo "$latest_in_major" | awk -F'[.-]' '{print $2}') - 1 ))
+                    if [ "$n1_minor" -ge 0 ]; then
+                        local hub_tag
+                        hub_tag=$(_resolve_patch_from_hub "$scoped_major" "$n1_minor")
+                        if [ -n "$hub_tag" ]; then
+                            # hub_tag에서 suffix 제거하여 bare 버전 추출
+                            n1_bare=$(echo "$hub_tag" | sed "s/${TAG_SUFFIX}$//")
+                        fi
+                    fi
+                fi
+
+                if [ -n "$n1_bare" ]; then
+                    target_version_tag="${n1_bare}${TAG_SUFFIX}"
+                    _partial_version=0
+                    echo "Skip-latest (N-1) mode: targeting $target_version_tag"
+                else
+                    # N-1 불가 → latest within major 사용
+                    target_version_tag="${latest_in_major}${TAG_SUFFIX}"
+                    _partial_version=0
+                    echo "Warning: Could not determine N-1 for ${scoped_major}.x — using latest ${target_version_tag}" >&2
+                fi
+            fi
+        elif [ -z "$target_version_tag" ]; then
+            # 기존 전체 범위 N-1
+            local n1_bare
+            n1_bare=$(_resolve_n1 "$bare_latest" "$bare_all")
+            if [ -n "$n1_bare" ]; then
+                target_version_tag="${n1_bare}${TAG_SUFFIX}"
+                echo "Skip-latest (N-1) mode: targeting $target_version_tag"
+            else
+                echo "Warning: Could not determine N-1 version, using latest" >&2
+            fi
         fi
     fi
 
@@ -1010,6 +1090,13 @@ _fetch_cached() {
     ALL_TAGS=()
     local suffix="${TAG_SUFFIX}"
     mapfile -t ALL_TAGS < <(echo "$bare_all" | sed "/^$/d;s/$/${suffix}/")
+
+    # target이 필수 경유 버전이 아닌 경우 (N-1 등) ALL_TAGS에 추가
+    # _partial_version=1이면 아직 resolve 전이므로 여기서 추가하지 않음
+    if [ "$_partial_version" -eq 0 ] && [ -n "$target_version_tag" ] && [[ " ${ALL_TAGS[*]} " != *" $target_version_tag "* ]]; then
+        ALL_TAGS+=("$target_version_tag")
+        mapfile -t ALL_TAGS < <(printf '%s\n' "${ALL_TAGS[@]}" | sort -Vu)
+    fi
 }
 
 # --- live 경로: upgrade_path.yml + Docker Hub ---
@@ -1058,31 +1145,59 @@ _fetch_live() {
     LATEST_VERSION_TAG=$(echo "$all_docker_tags" | sort -V | tail -1)
 
     # N-1 전략
-    if [ $skip_latest -eq 1 ] && [ -z "$target_version_tag" ]; then
-        local n1_tag
-        n1_tag=$(_resolve_n1 "$LATEST_VERSION_TAG" "$all_docker_tags")
+    if [ $skip_latest -eq 1 ]; then
+        if [[ "$target_version_tag" =~ ^[0-9]+$ ]]; then
+            # major-scoped N-1: Docker Hub 데이터는 dense → _resolve_n1 직접 사용
+            local scoped_major=$target_version_tag
+            local scoped_candidates
+            scoped_candidates=$(echo "$all_docker_tags" | grep "^${scoped_major}\.")
+            local latest_in_major
+            latest_in_major=$(echo "$scoped_candidates" | sort -V | tail -1)
 
-        # N-1 대상이 현재 태그에 없으면 해당 메이저 추가 조회
-        if [ -z "$n1_tag" ]; then
-            local prev_major prev_major_tags=""
-            prev_major=$(( ${LATEST_VERSION_TAG%%.*} - 1 ))
-            page_url="https://hub.docker.com/v2/repositories/${GITLAB_IMAGE}/tags/?name=${prev_major}.&page_size=100"
-            while [ -n "$page_url" ]; do
-                response=$(curl -sf "$page_url")
-                [ -z "$response" ] && break
-                page_tags=$(echo "$response" | jq -r '.results[].name' | grep -E "^${prev_major}\.")
-                prev_major_tags="${prev_major_tags}${page_tags}"$'\n'
-                next=$(echo "$response" | jq -r '.next // empty')
-                page_url="$next"
-            done
-            n1_tag=$(echo "$prev_major_tags" | sed '/^$/d' | sort -V | tail -1)
-        fi
+            if [ -z "$latest_in_major" ]; then
+                echo "Warning: No versions found for major ${scoped_major} — skipping N-1" >&2
+            else
+                local n1_tag
+                n1_tag=$(_resolve_n1 "$latest_in_major" "$all_docker_tags")
 
-        if [ -n "$n1_tag" ]; then
-            target_version_tag="$n1_tag"
-            echo "Skip-latest (N-1) mode: targeting $target_version_tag"
-        else
-            echo "Warning: Could not determine N-1 version, using latest" >&2
+                if [ -n "$n1_tag" ]; then
+                    target_version_tag="$n1_tag"
+                    _partial_version=0
+                    echo "Skip-latest (N-1) mode: targeting $target_version_tag"
+                else
+                    # N-1 불가 → latest within major 사용
+                    target_version_tag="$latest_in_major"
+                    _partial_version=0
+                    echo "Warning: Could not determine N-1 for ${scoped_major}.x — using latest ${target_version_tag}" >&2
+                fi
+            fi
+        elif [ -z "$target_version_tag" ]; then
+            # 기존 전체 범위 N-1
+            local n1_tag
+            n1_tag=$(_resolve_n1 "$LATEST_VERSION_TAG" "$all_docker_tags")
+
+            # N-1 대상이 현재 태그에 없으면 해당 메이저 추가 조회
+            if [ -z "$n1_tag" ]; then
+                local prev_major prev_major_tags=""
+                prev_major=$(( ${LATEST_VERSION_TAG%%.*} - 1 ))
+                page_url="https://hub.docker.com/v2/repositories/${GITLAB_IMAGE}/tags/?name=${prev_major}.&page_size=100"
+                while [ -n "$page_url" ]; do
+                    response=$(curl -sf "$page_url")
+                    [ -z "$response" ] && break
+                    page_tags=$(echo "$response" | jq -r '.results[].name' | grep -E "^${prev_major}\.")
+                    prev_major_tags="${prev_major_tags}${page_tags}"$'\n'
+                    next=$(echo "$response" | jq -r '.next // empty')
+                    page_url="$next"
+                done
+                n1_tag=$(echo "$prev_major_tags" | sed '/^$/d' | sort -V | tail -1)
+            fi
+
+            if [ -n "$n1_tag" ]; then
+                target_version_tag="$n1_tag"
+                echo "Skip-latest (N-1) mode: targeting $target_version_tag"
+            else
+                echo "Warning: Could not determine N-1 version, using latest" >&2
+            fi
         fi
     fi
 
@@ -1138,14 +1253,30 @@ fi
 # partial version resolve
 if [ "$_partial_version" -eq 1 ]; then
     resolved=$(printf '%s\n' "${ALL_TAGS[@]}" | grep "^${target_version_tag}\." | sort -V | tail -1)
+
+    # ALL_TAGS에 없으면 Docker Hub에서 조회 (path.json은 필수 경유 버전만 포함)
+    if [ -z "$resolved" ] && [[ "$target_version_tag" =~ ^[0-9]+\.[0-9]+$ ]]; then
+        partial_major=${target_version_tag%%.*}
+        partial_minor=${target_version_tag#*.}
+        resolved=$(_resolve_patch_from_hub "$partial_major" "$partial_minor")
+    fi
+
     if [ -z "$resolved" ]; then
         echo "Error: No tags matching '${target_version_tag}.*' found." >&2
         target_version_tag=
     else
         target_version_tag="$resolved"
         echo "Resolved partial version to: $target_version_tag"
+        # ALL_TAGS에 없으면 추가
+        if [[ " ${ALL_TAGS[*]} " != *" $target_version_tag "* ]]; then
+            ALL_TAGS+=("$target_version_tag")
+            mapfile -t ALL_TAGS < <(printf '%s\n' "${ALL_TAGS[@]}" | sort -Vu)
+        fi
     fi
 fi
+
+# EOS (End-of-Support) 체크
+_check_eos
 
 # 1. 현재 버전 이후만 필터링
 UPDATABLE_TAGS=()

@@ -43,8 +43,8 @@ An automated upgrade script for Docker-based GitLab instances. Supports both CE 
 | `-y`, `--yes` | Skip confirmation prompts (non-interactive mode) |
 | `--help` | Show help message |
 | `--edition=ce\|ee` | Force GitLab edition (auto-detected if omitted) |
-| `--version=X.Y.Z` | Upgrade to a specific version instead of latest. Partial versions (e.g. `18`) are resolved automatically. |
-| `--skip-latest`, `--n-1` | Target the latest patch of the previous minor version (N-1 strategy). Mutually exclusive with `--version`. |
+| `--version=X.Y.Z` | Upgrade to a specific version instead of latest. Partial versions (e.g. `18`) are resolved automatically. End-of-support versions are rejected via GitLab releases API. |
+| `--skip-latest`, `--n-1` | Target the latest patch of the previous minor version (N-1 strategy). Can combine with major-only `--version` (e.g. `--version=18 --skip-latest` targets N-1 within major 18). |
 | `--dry-run` | Compute and display upgrade path without executing. Implies `-y`. |
 | `--skip-lfs` | Skip LFS objects during backup |
 | `--source=cached\|live` | Upgrade path data source. `cached` = path.json (fast), `live` = upgrade_path.yml + Docker Hub (always fresh). Auto-detected if omitted. |
@@ -74,6 +74,10 @@ An automated upgrade script for Docker-based GitLab instances. Supports both CE 
 # Upgrade to the latest patch of the previous minor (N-1 strategy)
 # e.g. if latest is 18.9.x, targets the latest 18.8.x patch
 ./upgrade-gitlab --skip-latest --target-url=https://gitlab.example.com
+
+# N-1 within a specific major version
+# e.g. if latest in major 18 is 18.9.x, targets the latest 18.8.x patch
+./upgrade-gitlab --version=18 --skip-latest --target-url=https://gitlab.example.com
 
 # Preview upgrade path without executing
 ./upgrade-gitlab --dry-run
