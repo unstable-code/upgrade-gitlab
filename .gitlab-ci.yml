@@ -49,21 +49,36 @@ promote-to-master:
 integration-test:
   stage: test
   image: kcov/kcov:latest-alpine
+  services:
+    - docker:dind
   variables:
-    DOCKER_HOST: unix:///var/run/docker.sock
-    START_VERSION: "17.10.0"
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
     GITLAB_EDITION: "ce"
   before_script:
     - apk add --no-cache bash jq curl coreutils docker-cli
   script:
     - |
+      LATEST=$(curl -s "https://hub.docker.com/v2/repositories/gitlab/gitlab-${GITLAB_EDITION}/tags?page_size=100&ordering=last_updated&name=${GITLAB_EDITION}.0" \
+        | jq -r '[.results[].name | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-'${GITLAB_EDITION}'\\.0$"))] | sort_by(split(".") | map(split("-")[0]) | map(tonumber)) | reverse | .[0]')
+      LATEST_MAJOR=$(echo "$LATEST" | cut -d. -f1)
+      LATEST_MINOR=$(echo "$LATEST" | cut -d. -f2)
+      N2_MINOR=$((LATEST_MINOR - 2))
+      if [ "$N2_MINOR" -lt 0 ]; then
+        LATEST_MAJOR=$((LATEST_MAJOR - 1))
+        N2_MINOR=$((N2_MINOR + 12))
+      fi
+      START_TAG=$(curl -s "https://hub.docker.com/v2/repositories/gitlab/gitlab-${GITLAB_EDITION}/tags?page_size=100&ordering=last_updated&name=${GITLAB_EDITION}.0" \
+        | jq -r --arg prefix "${LATEST_MAJOR}.${N2_MINOR}." \
+          '[.results[].name | select(startswith($prefix))] | sort_by(split(".") | map(split("-")[0]) | map(tonumber)) | reverse | .[0]')
+      echo "Latest: $LATEST / Starting from N-2: $START_TAG"
       docker run -d --name gitlab \
         --hostname gitlab.test \
         -p 80:80 \
         -v gitlab-config:/etc/gitlab \
         -v gitlab-logs:/var/log/gitlab \
         -v gitlab-data:/var/opt/gitlab \
-        gitlab/gitlab-${GITLAB_EDITION}:${START_VERSION}-${GITLAB_EDITION}.0
+        gitlab/gitlab-${GITLAB_EDITION}:${START_TAG}
     - |
       echo "Waiting for GitLab to become healthy (timeout 10m)..."
       timeout 600 bash -c '
@@ -92,10 +107,6 @@ integration-test:
     paths:
       - coverage_output/
     when: always
-  tags:
-    - linux
-    - self-hosted
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
     - if: $CI_PIPELINE_SOURCE == "web"
-  timeout: 6h
