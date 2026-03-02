@@ -88,10 +88,10 @@ integration-test:
       '
       echo "GitLab is healthy."
     - |
+      set -o pipefail
       kcov --include-pattern=/upgrade-gitlab/upgrade-gitlab coverage_output \
         ./upgrade-gitlab -y --no-step-limit --target-url=http://localhost \
-        > upgrade.log 2>&1 || { tail -100 upgrade.log; exit 1; }
-      tail -20 upgrade.log
+        2>&1 | tee upgrade.log
     - |
       FINAL_VERSION=$(docker exec gitlab dpkg -l | grep "gitlab-${GITLAB_EDITION}" | awk '{print $3}')
       echo "Final version: $FINAL_VERSION"
