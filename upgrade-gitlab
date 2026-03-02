@@ -34,6 +34,9 @@ _handle_signal() {
     if [ -n "$PULL_PID" ]; then
         kill "$PULL_PID" 2>/dev/null
     fi
+    if [ -n "${_size_poller_pid:-}" ]; then
+        kill "$_size_poller_pid" 2>/dev/null
+    fi
     exit 130
 }
 trap _handle_signal SIGINT SIGTERM SIGTSTP SIGHUP
@@ -673,6 +676,151 @@ fi
 
 start_time=$SECONDS
 
+# --- Backup progress helpers ---
+_backup_stats_available=0
+_total_lfs_size=0
+_total_artifacts_size=0
+_total_uploads_size=0
+_total_project_count=0
+_size_poller_pid=
+_size_poller_file=
+
+_query_backup_stats() {
+    local raw
+    raw=$(docker exec "$CONTAINER_NAME" gitlab-psql -tAc \
+        "SELECT COALESCE(SUM(repository_size),0)||'|'||COALESCE(SUM(lfs_objects_size),0)||'|'||COALESCE(SUM(build_artifacts_size),0)||'|'||COALESCE(SUM(uploads_size),0)||'|'||COUNT(*) FROM project_statistics;" 2>/dev/null) || {
+        _backup_stats_available=0
+        return
+    }
+    if [ -z "$raw" ] || ! echo "$raw" | grep -qE '^[0-9]+\|'; then
+        _backup_stats_available=0
+        return
+    fi
+    IFS='|' read -r _ _total_lfs_size _total_artifacts_size _total_uploads_size _total_project_count <<< "$raw"
+    _backup_stats_available=1
+}
+
+# _draw_backup_progress <label> <percentage> <tick>
+# Renders: [label] [###############·····························] 52.0%
+_draw_backup_progress() {
+    local label=$1
+    local pct=$2
+    local tick=$3
+    local cols=${COLUMNS:-$(tput cols 2>/dev/null || stty size 2>/dev/null | awk '{print $2}' || echo 80)}
+    local reset='\033[0m'
+
+    # Cap percentage at 100
+    if [ "$pct" -gt 100 ]; then
+        pct=100
+    fi
+
+    local suffix
+    suffix=$(printf " %d%%" "$pct")
+    # overhead: "[" label "]" " [" bar "]" suffix
+    local overhead=$(( ${#label} + 5 + ${#suffix} ))
+    local bar_length=$(( cols - overhead ))
+    if [ "$bar_length" -lt 5 ]; then
+        bar_length=5
+    fi
+
+    local filled=$(( pct * bar_length / 100 ))
+    local empty=$(( bar_length - filled ))
+
+    # Edge blink: on odd ticks, shift one character between filled and empty
+    if [ "$tick" -gt 0 ] && (( tick % 2 == 1 )) && [ "$filled" -gt 0 ] && [ "$empty" -gt 0 ]; then
+        filled=$(( filled - 1 ))
+        empty=$(( empty + 1 ))
+    fi
+
+    local bar_filled bar_empty
+    bar_filled=$(printf '%*s' "$filled" '' | tr ' ' '#')
+    # shellcheck disable=SC1003
+    bar_empty=$(printf '%*s' "$empty" '' | sed 's/ /·/g')
+
+    local bg_color='\033[42;30m'
+    if [ "${_trap_active:-0}" -eq 1 ]; then
+        bg_color='\033[43;30m'
+    fi
+
+    printf '\r\033[K'"${bg_color}"'[%s]'"${reset}"' [%s%s]%s' "$label" "$bar_filled" "$bar_empty" "$suffix" > "$_tty"
+}
+
+# _draw_bouncing_frame <label> <tick>
+# Draws a single bouncing bar frame based on tick count (no persistent pos/direction state)
+_draw_bouncing_frame() {
+    local label=$1
+    local tick=$2
+    local cols=${COLUMNS:-$(tput cols 2>/dev/null || stty size 2>/dev/null | awk '{print $2}' || echo 80)}
+    local bounce='<===>'
+    local bounce_len=${#bounce}
+    local bar_width=$(( cols - ${#label} - 5 ))
+    if [ "$bar_width" -lt 10 ]; then
+        bar_width=10
+    fi
+    local reset='\033[0m'
+
+    # Triangle wave position from tick
+    local cycle=$(( 2 * (bar_width - bounce_len) ))
+    if [ "$cycle" -le 0 ]; then cycle=1; fi
+    local phase=$(( tick % cycle ))
+    local pos
+    if [ "$phase" -lt $(( bar_width - bounce_len )) ]; then
+        pos=$phase
+    else
+        pos=$(( cycle - phase ))
+    fi
+
+    local bg_color='\033[42;30m'
+    if [ "${_trap_active:-0}" -eq 1 ]; then
+        bg_color='\033[43;30m'
+    fi
+
+    local padding_left padding_right bar_line
+    padding_left=$(printf '%*s' "$pos" '')
+    padding_right=$(printf '%*s' "$((bar_width - pos - bounce_len))" '')
+    bar_line=$(printf "${bg_color}[%s]${reset} [%s%s%s]" "$label" "$padding_left" "$bounce" "$padding_right")
+    printf '\r\033[K%s' "$bar_line" > "$_tty"
+}
+
+_start_size_poller() {
+    _size_poller_file=$(mktemp)
+    docker exec "$CONTAINER_NAME" sh -c '
+        while true; do
+            stat -c "%s %n" /var/opt/gitlab/backups/*.tar.gz 2>/dev/null
+            echo ---
+            sleep 0.5
+        done
+    ' >> "$_size_poller_file" 2>/dev/null &
+    _size_poller_pid=$!
+}
+
+_stop_size_poller() {
+    if [ -n "${_size_poller_pid:-}" ]; then
+        kill "$_size_poller_pid" 2>/dev/null
+        wait "$_size_poller_pid" 2>/dev/null
+        _size_poller_pid=
+    fi
+    if [ -n "${_size_poller_file:-}" ]; then
+        rm -f "$_size_poller_file"
+        _size_poller_file=
+    fi
+}
+
+# _get_current_tar_size <filename>
+# Prints the latest size (bytes) of the given tar.gz from the poller output
+_get_current_tar_size() {
+    local filename=$1
+    if [ -z "${_size_poller_file:-}" ] || [ ! -f "$_size_poller_file" ]; then
+        echo 0
+        return
+    fi
+    local size
+    size=$(grep "$filename" "$_size_poller_file" | tail -1 | awk '{print $1}')
+    # Ensure integer (strip non-digits)
+    size="${size//[!0-9]/}"
+    echo "${size:-0}"
+}
+
 draw_progress() {
     local current=$1
     local total=$2
@@ -805,6 +953,121 @@ run_with_bouncing_bar() {
     fi
 
     # 바운싱 바 지우기 (tty)
+    printf '\r\033[K' > "$_tty"
+
+    # 종료 코드 수집
+    wait "$cmd_pid"
+    local rc=$?
+    rm -f "$tmpfile"
+    return $rc
+}
+
+# run_with_progress_bar <label> <command...>
+# backup 전용: stage별 진행률 바를 표시하며 명령 실행
+run_with_progress_bar() {
+    local label=$1
+    shift
+    local cmd=("$@")
+    local tmpfile
+    tmpfile=$(mktemp)
+    local tick=0
+    local last_line_count=0
+    local current_stage=""
+    local repo_completed=0
+
+    _start_size_poller
+
+    # 명령을 백그라운드로 실행, 출력을 임시 파일에 기록
+    "${cmd[@]}" > "$tmpfile" 2>&1 &
+    local cmd_pid=$!
+
+    while kill -0 "$cmd_pid" 2>/dev/null; do
+        # 새 출력 확인 및 표시
+        local current_lines
+        current_lines=$(wc -l < "$tmpfile")
+        if [ "$current_lines" -gt "$last_line_count" ]; then
+            printf '\r\033[K' > "$_tty"
+            # \r 제거 후 출력
+            sed -n "$((last_line_count + 1)),${current_lines}p" "$tmpfile" | tr -d '\r'
+            last_line_count=$current_lines
+        fi
+
+        # 스테이지 감지
+        local detected_stage
+        detected_stage=$(sed -n 's/.*-- \(.*\) \.\.\..*/\1/p' "$tmpfile" | tail -1)
+        if [ -n "$detected_stage" ]; then
+            current_stage="$detected_stage"
+        fi
+
+        # 스테이지별 진행률 계산
+        local pct=-1
+        local display_label="Backup"
+        case "$current_stage" in
+            "Dumping repositories"*)
+                display_label="Backup: Dumping repositories"
+                if [ "$_total_project_count" -gt 0 ]; then
+                    repo_completed=$(grep -c '"completed create"' "$tmpfile" 2>/dev/null) || repo_completed=0
+                    # .wiki 제외
+                    local wiki_count
+                    wiki_count=$(grep '"completed create"' "$tmpfile" 2>/dev/null | grep -c '\.wiki"') || wiki_count=0
+                    repo_completed=$(( repo_completed - wiki_count ))
+                    if [ "$repo_completed" -lt 0 ]; then repo_completed=0; fi
+                    pct=$(( repo_completed * 100 / _total_project_count ))
+                fi
+                ;;
+            "Dumping uploads"*)
+                display_label="Backup: Dumping uploads"
+                if [ "$_total_uploads_size" -gt 0 ]; then
+                    local cur_size
+                    cur_size=$(_get_current_tar_size "uploads.tar.gz")
+                    pct=$(( cur_size * 100 / _total_uploads_size ))
+                fi
+                ;;
+            "Dumping builds"*|"Dumping artifacts"*)
+                display_label="Backup: Dumping artifacts"
+                if [ "$_total_artifacts_size" -gt 0 ]; then
+                    local cur_size
+                    cur_size=$(_get_current_tar_size "artifacts.tar.gz")
+                    pct=$(( cur_size * 100 / _total_artifacts_size ))
+                fi
+                ;;
+            "Dumping lfs objects"*)
+                display_label="Backup: Dumping lfs objects"
+                if [ "$_total_lfs_size" -gt 0 ]; then
+                    local cur_size
+                    cur_size=$(_get_current_tar_size "lfs.tar.gz")
+                    pct=$(( cur_size * 100 / _total_lfs_size ))
+                fi
+                ;;
+            *)
+                if [ -n "$current_stage" ]; then
+                    display_label="Backup: $current_stage"
+                fi
+                ;;
+        esac
+
+        if [ "$pct" -ge 0 ]; then
+            if [ "$pct" -gt 100 ]; then pct=100; fi
+            _draw_backup_progress "$display_label" "$pct" "$tick"
+        else
+            _draw_bouncing_frame "$display_label" "$tick"
+        fi
+
+        tick=$(( tick + 1 ))
+        sleep 0.2
+    done
+
+    _stop_size_poller
+
+    # 남은 출력 표시
+    local final_lines
+    final_lines=$(wc -l < "$tmpfile")
+    if [ "$final_lines" -gt "$last_line_count" ]; then
+        printf '\r\033[K' > "$_tty"
+        sed -n "$((last_line_count + 1)),${final_lines}p" "$tmpfile" | tr -d '\r'
+    fi
+
+    # 바 지우기
     printf '\r\033[K' > "$_tty"
 
     # 종료 코드 수집
@@ -1437,17 +1700,34 @@ echo "Creating backups for $CURRENT_VERSION. Please wait until backup process is
 if [ $skip_lfs -eq 1 ]; then
     echo "Note: LFS objects will be skipped during backup (--skip-lfs)."
 fi
+_query_backup_stats
 if docker exec "$CONTAINER_NAME" which gitlab-backup &>/dev/null; then
-    if [ $skip_lfs -eq 1 ]; then
-        run_with_bouncing_bar "Backup" docker exec -e SKIP=lfs "$CONTAINER_NAME" gitlab-backup create
+    if [ "$_backup_stats_available" -eq 1 ]; then
+        if [ $skip_lfs -eq 1 ]; then
+            run_with_progress_bar "Backup" docker exec -t -e TERM=dumb -e SKIP=lfs "$CONTAINER_NAME" gitlab-backup create
+        else
+            run_with_progress_bar "Backup" docker exec -t -e TERM=dumb "$CONTAINER_NAME" gitlab-backup create
+        fi
     else
-        run_with_bouncing_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-backup create
+        if [ $skip_lfs -eq 1 ]; then
+            run_with_bouncing_bar "Backup" docker exec -e SKIP=lfs "$CONTAINER_NAME" gitlab-backup create
+        else
+            run_with_bouncing_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-backup create
+        fi
     fi
 else
-    if [ $skip_lfs -eq 1 ]; then
-        run_with_bouncing_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-rake gitlab:backup:create SKIP=lfs
+    if [ "$_backup_stats_available" -eq 1 ]; then
+        if [ $skip_lfs -eq 1 ]; then
+            run_with_progress_bar "Backup" docker exec -t -e TERM=dumb "$CONTAINER_NAME" gitlab-rake gitlab:backup:create SKIP=lfs
+        else
+            run_with_progress_bar "Backup" docker exec -t -e TERM=dumb "$CONTAINER_NAME" gitlab-rake gitlab:backup:create
+        fi
     else
-        run_with_bouncing_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-rake gitlab:backup:create
+        if [ $skip_lfs -eq 1 ]; then
+            run_with_bouncing_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-rake gitlab:backup:create SKIP=lfs
+        else
+            run_with_bouncing_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-rake gitlab:backup:create
+        fi
     fi
 fi
 BACKUP_DIR=$(docker exec "$CONTAINER_NAME" grep "'backup_path'" /etc/gitlab/gitlab.rb | awk -F"=" '{ print $2 }' | sed 's/\"//g' | sed 's/^ //')

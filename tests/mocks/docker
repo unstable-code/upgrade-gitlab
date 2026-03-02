@@ -90,10 +90,27 @@ case "$args" in
             echo "  2 | runner-2    | 2024-01-01   | t"
         fi
         ;;
+    *"exec"*"gitlab-psql"*"project_statistics"*)
+        if [ "${MOCK_PSQL_STATS_FAIL:-0}" -eq 1 ]; then exit 1; fi
+        echo "1048576|${MOCK_LFS_SIZE:-524288}|262144|131072|${MOCK_PROJECT_COUNT:-3}"
+        ;;
     *"exec"*"gitlab-psql"*)
         exit 0
         ;;
     *"exec"*"which"*)
+        exit 0
+        ;;
+    *"exec"*"-t"*"gitlab-backup"*)
+        # -t flag backup (progress bar path)
+        echo "2026-01-01 00:00:00 UTC -- Dumping database ... done"
+        echo "2026-01-01 00:00:00 UTC -- Dumping repositories ..."
+        for i in $(seq 1 "${MOCK_PROJECT_COUNT:-3}"); do
+            echo "{\"command.name\":\"create\",\"gl_project_path\":\"root/project-${i}\",\"msg\":\"completed create\"}"
+        done
+        echo "2026-01-01 00:00:00 UTC -- Dumping repositories ... done"
+        echo "2026-01-01 00:00:00 UTC -- Dumping lfs objects ... done"
+        echo "2026-01-01 00:00:00 UTC -- Dumping uploads ... done"
+        echo "2026-01-01 00:00:00 UTC -- Dumping builds ... done"
         exit 0
         ;;
     *"exec"*"gitlab-backup"*)
@@ -115,6 +132,11 @@ case "$args" in
         echo "  up  20240101  TestMigration"
         ;;
     *"exec"*"gitlab-rake"*)
+        exit 0
+        ;;
+    *"exec"*"sh -c"*"stat"*"tar.gz"*)
+        echo "0 /var/opt/gitlab/backups/dummy.tar.gz"
+        echo "---"
         exit 0
         ;;
     *"exec"*"sh -c"*)

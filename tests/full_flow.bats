@@ -106,3 +106,27 @@ teardown() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"Resumed previously paused runners"* ]]
 }
+
+# ---------- Test 11: Backup with progress bar ----------
+@test "full-flow: backup uses progress bar when stats available" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_PROJECT_COUNT=5
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Creating backups"* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+    # Verify repositories stage output is present
+    [[ "$output" == *"Dumping repositories"* ]]
+}
+
+# ---------- Test 12: Backup fallback on psql failure ----------
+@test "full-flow: backup falls back to bouncing bar when psql fails" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_PSQL_STATS_FAIL=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Creating backups"* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+}
