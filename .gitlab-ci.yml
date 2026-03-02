@@ -50,6 +50,7 @@ integration-test:
   stage: test
   image: kcov/kcov:latest-alpine
   variables:
+    DOCKER_HOST: unix:///var/run/docker.sock
     START_VERSION: "17.10.0"
     GITLAB_EDITION: "ce"
   before_script:
