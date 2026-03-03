@@ -1635,8 +1635,8 @@ if [ $dry_run -eq 1 ]; then
     exit 0
 fi
 
-if [ -z "$TARGET_URL" ]; then
-    if [ $auto_yes -eq 1 ] && [ "${CI:-}" != "true" ]; then
+if [ -z "$TARGET_URL" ] && [ "${CI:-}" != "true" ]; then
+    if [ $auto_yes -eq 1 ]; then
         echo "Error: TARGET_URL is required for unattended mode (-y). Use --target-url or TARGET_URL env." >&2
         exit 1
     fi
