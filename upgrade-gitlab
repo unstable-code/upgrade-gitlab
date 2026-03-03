@@ -603,9 +603,16 @@ wait_for_http_ready() {
     local label=$1
     echo "waiting until $label server boots..."
     # shellcheck disable=SC2329
-    _http_ready_check() {
-        [ "$(curl -sf -o /dev/null "$TARGET_URL/users/sign_in" -w "%{http_code}" 2>/dev/null)" = '200' ]
-    }
+    if [ "${CI:-}" = "true" ]; then
+        # CI/DinD: 컨테이너 내부에서 curl (네트워크 격리 및 IP 변경 문제 회피)
+        _http_ready_check() {
+            [ "$(docker exec "$CONTAINER_NAME" curl -sf -o /dev/null "http://localhost/users/sign_in" -w "%{http_code}" 2>/dev/null)" = '200' ]
+        }
+    else
+        _http_ready_check() {
+            [ "$(curl -sf -o /dev/null "$TARGET_URL/users/sign_in" -w "%{http_code}" 2>/dev/null)" = '200' ]
+        }
+    fi
     poll_with_bouncing_bar "HTTP Ready" _http_ready_check
     unset -f _http_ready_check
     echo 'done'
@@ -1629,7 +1636,7 @@ if [ $dry_run -eq 1 ]; then
 fi
 
 if [ -z "$TARGET_URL" ]; then
-    if [ $auto_yes -eq 1 ]; then
+    if [ $auto_yes -eq 1 ] && [ "${CI:-}" != "true" ]; then
         echo "Error: TARGET_URL is required for unattended mode (-y). Use --target-url or TARGET_URL env." >&2
         exit 1
     fi

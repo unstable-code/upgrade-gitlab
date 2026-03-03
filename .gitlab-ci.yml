@@ -74,7 +74,6 @@ integration-test:
       echo "Latest: $LATEST / Starting from N-2: $START_TAG"
       docker run -d --name gitlab \
         --hostname gitlab.test \
-        -p 80:80 \
         -v gitlab-config:/etc/gitlab \
         -v gitlab-logs:/var/log/gitlab \
         -v gitlab-data:/var/opt/gitlab \
@@ -90,7 +89,7 @@ integration-test:
     - |
       set -o pipefail
       kcov --include-pattern=/upgrade-gitlab/upgrade-gitlab coverage_output \
-        ./upgrade-gitlab -y --no-step-limit --target-url=http://localhost \
+        ./upgrade-gitlab -y --no-step-limit \
         2>&1 | tee upgrade.log
     - |
       FINAL_VERSION=$(docker exec gitlab dpkg -l | grep "gitlab-${GITLAB_EDITION}" | awk '{print $3}')

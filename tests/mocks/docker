@@ -134,6 +134,10 @@ case "$args" in
     *"exec"*"gitlab-rake"*)
         exit 0
         ;;
+    *"exec"*"curl"*)
+        echo "200"
+        exit 0
+        ;;
     *"exec"*"sh -c"*"stat"*"tar.gz"*)
         echo "0 /var/opt/gitlab/backups/dummy.tar.gz"
         echo "---"
