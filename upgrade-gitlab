@@ -1118,9 +1118,12 @@ poll_with_bouncing_bar() {
     local last_line_count=0
     local tick=0
 
-    # docker logs --follow --tail 0: 새로운 로그만 스트리밍
-    docker logs --follow --tail 0 "$CONTAINER_NAME" > "$tmpfile" 2>&1 &
-    local logs_pid=$!
+    # docker logs --follow --tail 0: 새로운 로그만 스트리밍 (CI/DinD에서는 TCP hang 방지를 위해 생략)
+    local logs_pid=
+    if [ "${CI:-}" != "true" ]; then
+        docker logs --follow --tail 0 "$CONTAINER_NAME" > "$tmpfile" 2>&1 &
+        logs_pid=$!
+    fi
 
     while ! "${cond[@]}" 2>/dev/null; do
         # 새 로그 출력 확인 및 표시
@@ -1171,8 +1174,10 @@ poll_with_bouncing_bar() {
     done
 
     # docker logs 프로세스 종료
-    kill "$logs_pid" 2>/dev/null
-    wait "$logs_pid" 2>/dev/null
+    if [ -n "$logs_pid" ]; then
+        kill "$logs_pid" 2>/dev/null
+        wait "$logs_pid" 2>/dev/null
+    fi
 
     # 남은 로그 표시
     local final_lines
@@ -1783,13 +1788,17 @@ if [ "$DETECTED_EDITION" != "$GITLAB_EDITION" ]; then
 
     if docker ps --format "{{.Names}}" | grep -q "^$CONTAINER_NAME$"; then
         echo "stopping $CURRENT_VERSION container..."
-        run_with_bouncing_bar "Stopping" bash -c "
-            docker logs --follow --tail 0 \"$CONTAINER_NAME\" &
-            logs_pid=\$!
-            docker stop \"$CONTAINER_NAME\" 2>&1
-            kill \$logs_pid 2>/dev/null
-            wait \$logs_pid 2>/dev/null
-        "
+        if [ "${CI:-}" = "true" ]; then
+            run_with_bouncing_bar "Stopping" docker stop "$CONTAINER_NAME"
+        else
+            run_with_bouncing_bar "Stopping" bash -c "
+                docker logs --follow --tail 0 \"$CONTAINER_NAME\" &
+                logs_pid=\$!
+                docker stop \"$CONTAINER_NAME\" 2>&1
+                kill \$logs_pid 2>/dev/null
+                wait \$logs_pid 2>/dev/null
+            "
+        fi
         echo 'done'
     fi
     echo -n "removing $CURRENT_VERSION container..."
@@ -1847,13 +1856,17 @@ for ver in "${UPGRADE_POINTS_ARRAY[@]}"; do
 
     if docker ps --format "{{.Names}}" | grep -q "^$CONTAINER_NAME$"; then
         echo "stopping $CNT_VERSION container..."
-        run_with_bouncing_bar "Stopping" bash -c "
-            docker logs --follow --tail 0 \"$CONTAINER_NAME\" &
-            logs_pid=\$!
-            docker stop \"$CONTAINER_NAME\" 2>&1
-            kill \$logs_pid 2>/dev/null
-            wait \$logs_pid 2>/dev/null
-        "
+        if [ "${CI:-}" = "true" ]; then
+            run_with_bouncing_bar "Stopping" docker stop "$CONTAINER_NAME"
+        else
+            run_with_bouncing_bar "Stopping" bash -c "
+                docker logs --follow --tail 0 \"$CONTAINER_NAME\" &
+                logs_pid=\$!
+                docker stop \"$CONTAINER_NAME\" 2>&1
+                kill \$logs_pid 2>/dev/null
+                wait \$logs_pid 2>/dev/null
+            "
+        fi
         echo 'done'
     fi
     echo -n "removing $CNT_VERSION container..."
