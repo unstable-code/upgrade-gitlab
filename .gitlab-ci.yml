@@ -95,14 +95,14 @@ integration-test:
       FINAL_VERSION=$(docker exec gitlab dpkg -l | grep "gitlab-${GITLAB_EDITION}" | awk '{print $3}')
       echo "Final version: $FINAL_VERSION"
     - |
-      coverage_pct=$(jq -r '.percent_covered' coverage_output/bash/coverage.json 2>/dev/null || echo "0.0")
+      coverage_pct=$(jq -r '.percent_covered' coverage_output/upgrade-gitlab/coverage.json 2>/dev/null || echo "0.0")
       echo "Coverage:${coverage_pct}%"
   coverage: '/Coverage:(\d+[\.,]\d+)%/'
   artifacts:
     reports:
       coverage_report:
         coverage_format: cobertura
-        path: coverage_output/bash/cobertura.xml
+        path: coverage_output/upgrade-gitlab/cobertura.xml
     paths:
       - coverage_output/
     when: always

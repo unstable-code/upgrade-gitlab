@@ -606,11 +606,11 @@ wait_for_http_ready() {
     if [ "${CI:-}" = "true" ]; then
         # CI/DinD: 컨테이너 내부에서 curl (네트워크 격리 및 IP 변경 문제 회피)
         _http_ready_check() {
-            [ "$(docker exec "$CONTAINER_NAME" curl -sf -o /dev/null "http://localhost/users/sign_in" -w "%{http_code}" 2>/dev/null)" = '200' ]
+            [ "$(docker exec "$CONTAINER_NAME" curl -sf -m 3 -o /dev/null "http://localhost/users/sign_in" -w "%{http_code}" 2>/dev/null)" = '200' ]
         }
     else
         _http_ready_check() {
-            [ "$(curl -sf -o /dev/null "$TARGET_URL/users/sign_in" -w "%{http_code}" 2>/dev/null)" = '200' ]
+            [ "$(curl -sf -m 3 -o /dev/null "$TARGET_URL/users/sign_in" -w "%{http_code}" 2>/dev/null)" = '200' ]
         }
     fi
     poll_with_bouncing_bar "HTTP Ready" _http_ready_check
