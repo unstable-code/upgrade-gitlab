@@ -74,6 +74,7 @@ teardown() {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     unset TARGET_URL
+    unset CI
     run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 1 ]
     [[ "$output" == *"TARGET_URL is required"* ]]
