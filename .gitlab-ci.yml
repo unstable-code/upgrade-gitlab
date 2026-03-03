@@ -89,7 +89,7 @@ integration-test:
     - |
       set -o pipefail
       kcov --include-pattern=/upgrade-gitlab/upgrade-gitlab coverage_output \
-        ./upgrade-gitlab -y --no-step-limit \
+        ./upgrade-gitlab -y --no-step-limit --edition=ee \
         2>&1 | tee upgrade.log
     - |
       FINAL_VERSION=$(docker exec gitlab dpkg -l | grep "gitlab-${GITLAB_EDITION}" | awk '{print $3}')
