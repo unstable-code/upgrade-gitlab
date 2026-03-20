@@ -1215,16 +1215,6 @@ _resolve_n1() {
     fi
 }
 
-# --- Docker Hub에서 특정 major.minor의 최신 패치 조회 ---
-# stdout: 태그 (예: 17.10.2-ce.0), 없으면 빈 문자열
-_resolve_patch_from_hub() {
-    local major=$1 minor=$2
-    local page_url response
-    page_url="https://hub.docker.com/v2/repositories/${GITLAB_IMAGE}/tags/?name=${major}.${minor}.&page_size=100"
-    response=$(curl -sf "$page_url")
-    [ -z "$response" ] && return
-    echo "$response" | jq -r '.results[].name' | grep -E "^${major}\.${minor}\.[0-9]+" | sort -V | tail -1
-}
 
 # --- EOS (End-of-Support) 체크 ---
 # GitLab 공개 API로 현재 지원 중인 3개 마이너 트랙 조회
@@ -1267,8 +1257,9 @@ _fetch_upgrade_path() {
     local -a waypoints
     mapfile -t waypoints < <(echo "$path_json" | jq -r '.all[]' | awk -F. '{print $1"."$2}' | sort -Vu)
 
-    # 2. Docker Hub 태그 일괄 조회
-    local cur_major max_waypoint_major max_major all_docker_tags=""
+    # 2. Docker Hub 태그 일괄 조회 (partial version resolve에서도 재활용)
+    local cur_major max_waypoint_major max_major
+    __all_docker_tags=""
     cur_major=${CURRENT_VERSION%%.*}
     max_waypoint_major=$(printf '%s\n' "${waypoints[@]}" | awk -F. '{print $1}' | sort -n | tail -1)
     max_major=$(( max_waypoint_major > cur_major ? max_waypoint_major + 1 : cur_major + 1 ))
@@ -1281,20 +1272,20 @@ _fetch_upgrade_path() {
             response=$(curl -sf "$page_url")
             [ -z "$response" ] && break
             page_tags=$(echo "$response" | jq -r '.results[].name' | grep -E "^${maj}\.")
-            all_docker_tags="${all_docker_tags}${page_tags}"$'\n'
+            _all_docker_tags="${_all_docker_tags}${page_tags}"$'\n'
             next=$(echo "$response" | jq -r '.next // empty')
             page_url="$next"
         done
     done
-    all_docker_tags=$(echo "$all_docker_tags" | sed '/^$/d' | sort -Vu)
+    _all_docker_tags=$(echo "$_all_docker_tags" | sed '/^$/d' | sort -Vu)
 
-    if [ -z "$all_docker_tags" ]; then
+    if [ -z "$_all_docker_tags" ]; then
         echo "FATAL ERROR: No Docker Hub tags found for ${GITLAB_IMAGE}" >&2
         exit 1
     fi
 
     # 3. 최신 버전 결정
-    LATEST_VERSION_TAG=$(echo "$all_docker_tags" | sort -V | tail -1)
+    LATEST_VERSION_TAG=$(echo "$_all_docker_tags" | sort -V | tail -1)
 
     # 4. N-1 전략
     if [ $skip_latest -eq 1 ]; then
@@ -1302,7 +1293,7 @@ _fetch_upgrade_path() {
             # major-scoped N-1
             local scoped_major=$target_version_tag
             local scoped_candidates
-            scoped_candidates=$(echo "$all_docker_tags" | grep "^${scoped_major}\.")
+            scoped_candidates=$(echo "$_all_docker_tags" | grep "^${scoped_major}\.")
             local latest_in_major
             latest_in_major=$(echo "$scoped_candidates" | sort -V | tail -1)
 
@@ -1310,7 +1301,7 @@ _fetch_upgrade_path() {
                 echo "Warning: No versions found for major ${scoped_major} — skipping N-1" >&2
             else
                 local n1_tag
-                n1_tag=$(_resolve_n1 "$latest_in_major" "$all_docker_tags")
+                n1_tag=$(_resolve_n1 "$latest_in_major" "$_all_docker_tags")
 
                 if [ -n "$n1_tag" ]; then
                     target_version_tag="$n1_tag"
@@ -1326,7 +1317,7 @@ _fetch_upgrade_path() {
         elif [ -z "$target_version_tag" ]; then
             # 전체 범위 N-1
             local n1_tag
-            n1_tag=$(_resolve_n1 "$LATEST_VERSION_TAG" "$all_docker_tags")
+            n1_tag=$(_resolve_n1 "$LATEST_VERSION_TAG" "$_all_docker_tags")
 
             # N-1 대상이 현재 태그에 없으면 해당 메이저 추가 조회
             if [ -z "$n1_tag" ]; then
@@ -1359,7 +1350,7 @@ _fetch_upgrade_path() {
     for wp in "${waypoints[@]}"; do
         wp_major=${wp%%.*}
         wp_minor=${wp#*.}
-        resolved=$(echo "$all_docker_tags" | grep -E "^${wp_major}\.${wp_minor}\.[0-9]+" | sort -V | tail -1)
+        resolved=$(echo "$_all_docker_tags" | grep -E "^${wp_major}\.${wp_minor}\.[0-9]+" | sort -V | tail -1)
         [ -n "$resolved" ] && ALL_TAGS+=("$resolved")
     done
 
@@ -1381,11 +1372,11 @@ _fetch_upgrade_path
 if [ "$_partial_version" -eq 1 ]; then
     resolved=$(printf '%s\n' "${ALL_TAGS[@]}" | grep "^${target_version_tag}\." | sort -V | tail -1)
 
-    # ALL_TAGS에 없으면 Docker Hub에서 조회 (path.json은 필수 경유 버전만 포함)
+    # ALL_TAGS에 없으면 이미 조회한 Docker Hub 태그에서 검색
     if [ -z "$resolved" ] && [[ "$target_version_tag" =~ ^[0-9]+\.[0-9]+$ ]]; then
         partial_major=${target_version_tag%%.*}
         partial_minor=${target_version_tag#*.}
-        resolved=$(_resolve_patch_from_hub "$partial_major" "$partial_minor")
+        resolved=$(echo "$_all_docker_tags" | grep -E "^${partial_major}\.${partial_minor}\.[0-9]+" | sort -V | tail -1)
     fi
 
     if [ -z "$resolved" ]; then
