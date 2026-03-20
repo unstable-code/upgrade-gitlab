@@ -3,12 +3,12 @@
 [![pipeline status](https://gitlab.com/unstable-code/upgrade-gitlab/badges/master/pipeline.svg)](https://gitlab.com/unstable-code/upgrade-gitlab/-/commits/master)
 [![coverage report](https://gitlab.com/unstable-code/upgrade-gitlab/badges/master/coverage.svg?job=integration-test)](https://gitlab.com/unstable-code/upgrade-gitlab/-/commits/master)
 
-An automated upgrade script for Docker-based GitLab instances. Supports both CE and EE editions with safe, step-by-step version upgrades following the [official upgrade path](https://gitlab.com/gitlab-org/gitlab/-/blob/master/config/upgrade_path.yml).
+An automated upgrade script for Docker-based GitLab instances. Supports both CE and EE editions with safe, step-by-step version upgrades following the [official upgrade path](https://gitlab-com.gitlab.io/support/toolbox/upgrade-path/).
 
 ## Features
 
 - **CE/EE auto-detection** — Automatically detects the running edition from the container image. Supports CE-to-EE migration at the same version before proceeding with upgrades.
-- **Safe upgrade path** — By default, uses the pre-computed `path.json` from the [upgrade-path](https://gitlab.com/gitlab-com/support/toolbox/upgrade-path) project (fast). Automatically falls back to computing the path live from `upgrade_path.yml` + Docker Hub API when the upstream CI is unhealthy. Override with `--source=cached|live`.
+- **Safe upgrade path** — Uses `path.json` from the [upgrade-path](https://gitlab.com/gitlab-com/support/toolbox/upgrade-path) project for required waypoints, with Docker Hub API for patch version resolution.
 - **Background migration tracking** — Waits for batched background migrations to complete between each version hop, with per-migration progress display.
 - **Migration status verification** — Checks for `down` state migrations after each upgrade step.
 - **Disk space pre-check** — Validates that data and backup volumes have at least 1.5x free space before starting.
@@ -52,7 +52,6 @@ EOS (end-of-support) versions are checked via GitLab releases API but not exhaus
 | `--skip-latest`, `--n-1` | Target the latest patch of the previous minor version (N-1 strategy). Can combine with major-only `--version` (e.g. `--version=18 --skip-latest` targets N-1 within major 18). |
 | `--dry-run` | Compute and display upgrade path without executing. Implies `-y`. |
 | `--skip-lfs` | Skip LFS objects during backup |
-| `--source=cached\|live` | Upgrade path data source. `cached` = path.json (fast), `live` = upgrade_path.yml + Docker Hub (always fresh). Auto-detected if omitted. |
 | `--no-step-limit` | Disable the 3-step safety limit for `-y` mode. Requires `CI=true`. |
 | `--target-url=URL` | GitLab server URL for connection testing |
 | `--discord-url=URL` | Discord webhook URL for notifications |

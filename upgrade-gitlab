@@ -14,7 +14,6 @@ auto_yes=0
 dry_run=0
 no_step_limit=0
 skip_lfs=0
-upgrade_source=""   # "" = auto, "cached" = path.json, "live" = yml+DockerHub
 _interrupted=0
 _trap_active=0
 _pull_pid=
@@ -91,7 +90,7 @@ pull_with_retry() {
 }
 
 if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
-    echo "Usage: $0 [-y] [--edition=ce|ee] [--target-url=http] [--discord-url=http] [--version=0.0.0] [--skip-latest] [--skip-lfs] [--source=cached|live] [--no-step-limit] [--dry-run]"
+    echo "Usage: $0 [-y] [--edition=ce|ee] [--target-url=http] [--discord-url=http] [--version=0.0.0] [--skip-latest] [--skip-lfs] [--no-step-limit] [--dry-run]"
 
     echo -e '\n\e[0;1mOPTIONS\e[m'
     echo -e "-y, --yes\t\tAuto-confirm prompts for unattended/cron usage. Aborts on safety warnings and if upgrade path >= 3 steps."
@@ -103,7 +102,6 @@ if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
     echo -e "--no-step-limit\t\tDisable the 3-step safety limit for -y mode. Requires CI=true."
     echo -e "--target-url=http\tPerform a simple connection test for your GitLab server."
     echo -e "--skip-lfs\t\tSkip LFS objects during backup (passes SKIP=lfs to gitlab-backup)."
-    echo -e "--source=cached|live\tUpgrade path data source. cached=path.json, live=upgrade_path.yml+Docker Hub."
     echo -e "--discord-url=http\tNotify via Discord webhook."
 
     echo -e '\n\e[0;1mENV VALUES\e[m'
@@ -136,11 +134,8 @@ else
             elif [ "${params[$i]}" == "--skip-lfs" ]; then
                 skip_lfs=1
             elif [[ "${params[$i]}" == "--source"* ]]; then
-                if [ "$temp" != "cached" ] && [ "$temp" != "live" ]; then
-                    echo "Error: --source must be 'cached' or 'live'" >&2
-                    exit 1
-                fi
-                upgrade_source=$temp
+                echo "Error: --source flag has been removed. Upgrade path now uses path.json + Docker Hub automatically." >&2
+                exit 1
             elif [[ "${params[$i]}" == "--edition"* ]]; then
                 if [ "$temp" != "ce" ] && [ "$temp" != "ee" ]; then
                     echo "Error: --edition must be 'ce' or 'ee'" >&2
@@ -1199,62 +1194,8 @@ poll_with_bouncing_bar() {
 }
 
 # --- 업그레이드 경로 데이터 소스 결정 ---
-_UPGRADE_PATH_PROJECT="29943108"
 _GITLAB_PROJECT_ID="278964"  # gitlab-org/gitlab
 _TAGS_URL="https://gitlab-com.gitlab.io/support/toolbox/upgrade-path/path.json"
-UPGRADE_STOPS_URL="https://gitlab.com/gitlab-org/gitlab/-/raw/master/config/upgrade_path.yml"
-
-
-_resolve_upgrade_source() {
-    # --source 명시 시 바로 반환
-    if [ "$upgrade_source" = "cached" ] || [ "$upgrade_source" = "live" ]; then
-        echo "$upgrade_source"
-        return
-    fi
-
-    # 스케줄 파이프라인 상태 확인 (단일 jq 호출로 status + created_at 추출)
-    local pipeline_json pipeline_status created_at
-    pipeline_json=$(curl -sf "https://gitlab.com/api/v4/projects/${_UPGRADE_PATH_PROJECT}/pipelines?source=schedule&per_page=1")
-    read -r pipeline_status created_at < <(echo "$pipeline_json" | jq -r '.[0] | [.status, .created_at] | map(. // "") | join(" ")' 2>/dev/null)
-
-    if [ -z "$pipeline_status" ]; then
-        echo "Warning: Could not check upgrade-path CI — using live source" >&2
-        echo "live"
-        return
-    fi
-
-    if [ "$pipeline_status" != "success" ]; then
-        echo "Warning: upgrade-path CI status: $pipeline_status — using live source" >&2
-        echo "live"
-        return
-    fi
-
-    # 마지막 파이프라인 경과 시간 확인 (타임존 무관)
-    local pipeline_epoch now_epoch elapsed_hours
-    pipeline_epoch=$(date -d "$created_at" +%s 2>/dev/null)
-    now_epoch=$(date +%s)
-
-    if [ -z "$pipeline_epoch" ]; then
-        echo "cached"
-        return
-    fi
-
-    elapsed_hours=$(( (now_epoch - pipeline_epoch) / 3600 ))
-
-    # 24시간 이내면 cached, 초과면 프롬프트
-    if [ "$elapsed_hours" -gt 24 ]; then
-        if [ $auto_yes -eq 1 ]; then
-            echo "Note: Last path.json update was ${elapsed_hours}h ago — latest release may not be reflected" >&2
-            echo "cached"
-            return
-        fi
-        # 빈 문자열 = 프롬프트 필요
-        echo ""
-        return
-    fi
-
-    echo "cached"
-}
 
 # --- N-1 버전 결정 (공통 헬퍼) ---
 # 인자: 최신버전, 후보목록(줄바꿈 구분)
@@ -1312,114 +1253,25 @@ _check_eos() {
     fi
 }
 
-# --- cached 경로: path.json ---
-_fetch_cached() {
+# --- 통합 경로: path.json (경유 버전) + Docker Hub (패치 해석) ---
+_fetch_upgrade_path() {
+    # 1. path.json → 필수 경유 버전 (major.minor)
     local path_json
     path_json=$(curl -sf "$_TAGS_URL")
     if [ -z "$path_json" ]; then
-        if [ "$upgrade_source" = "cached" ]; then
-            echo "FATAL ERROR: Failed to fetch path.json from $_TAGS_URL" >&2
-            exit 1
-        fi
-        echo "Warning: Failed to fetch path.json — falling back to live source" >&2
-        _fetch_live
-        return
-    fi
-
-    echo "Using cached upgrade path (path.json)"
-
-    # 단일 jq 호출: 정렬된 전체 목록 + 최신 버전을 한번에 추출
-    local bare_all bare_latest
-    bare_all=$(echo "$path_json" | jq -r '.all | unique | sort_by(split(".") | map(tonumber? // 0)) | .[]')
-    bare_latest=$(echo "$bare_all" | tail -1)
-    LATEST_VERSION_TAG="${bare_latest}${TAG_SUFFIX}"
-
-    if [ $skip_latest -eq 1 ]; then
-        if [[ "$target_version_tag" =~ ^[0-9]+$ ]]; then
-            # major-scoped N-1: 해당 major 내에서 산술 N-1
-            local scoped_major=$target_version_tag
-            local scoped_candidates
-            scoped_candidates=$(echo "$bare_all" | grep "^${scoped_major}\.")
-            local latest_in_major
-            latest_in_major=$(echo "$scoped_candidates" | sort -V | tail -1)
-
-            if [ -z "$latest_in_major" ]; then
-                echo "Warning: No versions found for major ${scoped_major} — skipping N-1" >&2
-            else
-                local n1_bare
-                n1_bare=$(_resolve_n1 "$latest_in_major" "$bare_all")
-
-                # path.json은 sparse 데이터 → N-1 minor가 없을 수 있음 → Docker Hub 폴백
-                if [ -z "$n1_bare" ]; then
-                    local n1_minor
-                    n1_minor=$(( $(echo "$latest_in_major" | awk -F'[.-]' '{print $2}') - 1 ))
-                    if [ "$n1_minor" -ge 0 ]; then
-                        local hub_tag
-                        hub_tag=$(_resolve_patch_from_hub "$scoped_major" "$n1_minor")
-                        if [ -n "$hub_tag" ]; then
-                            n1_bare="${hub_tag%"$TAG_SUFFIX"}"
-                        fi
-                    fi
-                fi
-
-                if [ -n "$n1_bare" ]; then
-                    target_version_tag="${n1_bare}${TAG_SUFFIX}"
-                    _partial_version=0
-                    echo "Skip-latest (N-1) mode: targeting $target_version_tag"
-                else
-                    # N-1 불가 → latest within major 사용
-                    target_version_tag="${latest_in_major}${TAG_SUFFIX}"
-                    _partial_version=0
-                    echo "Warning: Could not determine N-1 for ${scoped_major}.x — using latest ${target_version_tag}" >&2
-                fi
-            fi
-        elif [ -z "$target_version_tag" ]; then
-            # 기존 전체 범위 N-1
-            local n1_bare
-            n1_bare=$(_resolve_n1 "$bare_latest" "$bare_all")
-            if [ -n "$n1_bare" ]; then
-                target_version_tag="${n1_bare}${TAG_SUFFIX}"
-                echo "Skip-latest (N-1) mode: targeting $target_version_tag"
-            else
-                echo "Warning: Could not determine N-1 version, using latest" >&2
-            fi
-        fi
-    fi
-
-    # ALL_TAGS: 전체 태그 목록 (에디션 suffix 추가, jq에서 직접 append)
-    ALL_TAGS=()
-    local suffix="${TAG_SUFFIX}"
-    mapfile -t ALL_TAGS < <(echo "$bare_all" | sed "/^$/d;s/$/${suffix}/")
-
-    # target이 필수 경유 버전이 아닌 경우 (N-1 등) ALL_TAGS에 추가
-    # _partial_version=1이면 아직 resolve 전이므로 여기서 추가하지 않음
-    if [ "$_partial_version" -eq 0 ] && [ -n "$target_version_tag" ] && [[ " ${ALL_TAGS[*]} " != *" $target_version_tag "* ]]; then
-        ALL_TAGS+=("$target_version_tag")
-        mapfile -t ALL_TAGS < <(printf '%s\n' "${ALL_TAGS[@]}" | sort -Vu)
-    fi
-}
-
-# --- live 경로: upgrade_path.yml + Docker Hub ---
-_fetch_live() {
-    echo "Using live upgrade path (upgrade_path.yml + Docker Hub)"
-
-    local upgrade_stops_yml
-    upgrade_stops_yml=$(curl -sf "$UPGRADE_STOPS_URL")
-    if [ -z "$upgrade_stops_yml" ]; then
-        echo "FATAL ERROR: Failed to fetch upgrade path data from $UPGRADE_STOPS_URL" >&2
-        echo "Please check your network connectivity and try again." >&2
+        echo "FATAL ERROR: Failed to fetch path.json from $_TAGS_URL" >&2
         exit 1
     fi
 
-    # YAML 파싱: "8.11" "8.12" ... "18.8" "18.11"
-    local -a required_stops
-    mapfile -t required_stops < <(echo "$upgrade_stops_yml" | awk '/major:/{m=$NF} /minor:/{print m"."$NF}')
+    # path.json .all[] → unique major.minor 경유 버전 추출
+    local -a waypoints
+    mapfile -t waypoints < <(echo "$path_json" | jq -r '.all[]' | awk -F. '{print $1"."$2}' | sort -Vu)
 
-    # Docker Hub 태그 일괄 조회
-    local cur_major max_stop_major max_major all_docker_tags=""
+    # 2. Docker Hub 태그 일괄 조회
+    local cur_major max_waypoint_major max_major all_docker_tags=""
     cur_major=${CURRENT_VERSION%%.*}
-    max_stop_major=$(printf '%s\n' "${required_stops[@]}" | awk -F. '{print $1}' | sort -n | tail -1)
-    max_major=$(( max_stop_major > cur_major ? max_stop_major + 1 : cur_major + 1 ))
+    max_waypoint_major=$(printf '%s\n' "${waypoints[@]}" | awk -F. '{print $1}' | sort -n | tail -1)
+    max_major=$(( max_waypoint_major > cur_major ? max_waypoint_major + 1 : cur_major + 1 ))
 
     echo "Fetching Docker Hub tags for ${GITLAB_IMAGE} (major ${cur_major}-${max_major})..."
     local maj page_url response page_tags next
@@ -1441,13 +1293,13 @@ _fetch_live() {
         exit 1
     fi
 
-    # 최신 버전 결정
+    # 3. 최신 버전 결정
     LATEST_VERSION_TAG=$(echo "$all_docker_tags" | sort -V | tail -1)
 
-    # N-1 전략
+    # 4. N-1 전략
     if [ $skip_latest -eq 1 ]; then
         if [[ "$target_version_tag" =~ ^[0-9]+$ ]]; then
-            # major-scoped N-1: Docker Hub 데이터는 dense → _resolve_n1 직접 사용
+            # major-scoped N-1
             local scoped_major=$target_version_tag
             local scoped_candidates
             scoped_candidates=$(echo "$all_docker_tags" | grep "^${scoped_major}\.")
@@ -1472,7 +1324,7 @@ _fetch_live() {
                 fi
             fi
         elif [ -z "$target_version_tag" ]; then
-            # 기존 전체 범위 N-1
+            # 전체 범위 N-1
             local n1_tag
             n1_tag=$(_resolve_n1 "$LATEST_VERSION_TAG" "$all_docker_tags")
 
@@ -1501,13 +1353,13 @@ _fetch_live() {
         fi
     fi
 
-    # ALL_TAGS 구성
+    # 5. ALL_TAGS 구성: 각 경유 버전의 최신 패치를 Docker Hub에서 해석
     ALL_TAGS=()
-    local stop stop_major stop_minor resolved
-    for stop in "${required_stops[@]}"; do
-        stop_major=${stop%%.*}
-        stop_minor=${stop#*.}
-        resolved=$(echo "$all_docker_tags" | grep -E "^${stop_major}\.${stop_minor}\.[0-9]+" | sort -V | tail -1)
+    local wp wp_major wp_minor resolved
+    for wp in "${waypoints[@]}"; do
+        wp_major=${wp%%.*}
+        wp_minor=${wp#*.}
+        resolved=$(echo "$all_docker_tags" | grep -E "^${wp_major}\.${wp_minor}\.[0-9]+" | sort -V | tail -1)
         [ -n "$resolved" ] && ALL_TAGS+=("$resolved")
     done
 
@@ -1523,32 +1375,7 @@ _fetch_live() {
 }
 
 echo "Processing GitLab-${GITLAB_EDITION^^} upgrade path..."
-
-# 소스 결정
-_resolved_source=$(_resolve_upgrade_source)
-
-# 프롬프트 필요 (auto + stale + interactive)
-if [ -z "$_resolved_source" ]; then
-    echo ""
-    echo "Note: Last path.json update was more than 24 hours ago."
-    echo "      Latest release may not be reflected in path.json."
-    echo ""
-    echo "Select upgrade path source:"
-    echo "  1) cached  — Use path.json (fast, may be stale)"
-    echo "  2) live    — Compute from upgrade_path.yml + Docker Hub (slower, always fresh)"
-    printf "Choice [1/2]: "
-    read -r _source_choice < "$_tty"
-    case "$_source_choice" in
-        1) _resolved_source="cached" ;;
-        *) _resolved_source="live" ;;
-    esac
-fi
-
-if [ "$_resolved_source" = "cached" ]; then
-    _fetch_cached
-else
-    _fetch_live
-fi
+_fetch_upgrade_path
 
 # partial version resolve
 if [ "$_partial_version" -eq 1 ]; then
@@ -1609,7 +1436,7 @@ if [ -n "$target_version_tag" ]; then
 fi
 
 # 2. 업그레이드 경로 구성
-# cached(path.json) 또는 live(upgrade_path.yml+Docker Hub) 기반 필수 경유 버전
+# path.json 기반 필수 경유 버전 (패치는 Docker Hub에서 해석)
 UPGRADE_POINTS_ARRAY=("${UPDATABLE_TAGS[@]}")
 
 # CE → EE 전환 시 같은 버전의 EE 태그를 라우팅 포인트 맨 앞에 추가
