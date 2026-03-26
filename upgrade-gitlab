@@ -666,6 +666,8 @@ print_stacktrace_errors() {
     fi
 }
 
+_prev_exit=$(docker inspect --format='{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null || echo 0)
+
 if ! docker ps --format "{{.Names}}" | grep -q "^$CONTAINER_NAME$"; then
     docker start "$CONTAINER_NAME" &> /dev/null
     wait_for_healthy "GitLab server"
@@ -1476,10 +1478,20 @@ if [ $auto_yes -eq 1 ] && [ $no_step_limit -eq 0 ] && [ ${#UPGRADE_POINTS_ARRAY[
 fi
 
 if [ ${#UPGRADE_POINTS_ARRAY[@]} -eq 0 ]; then
-    echo "Requirements already satisfied: v$CURRENT_VERSION"
-
-    if ! curl -sf -o /dev/null "$TARGET_URL/users/sign_in"; then
-        echo "NOTE: If your GitLab server does not work properly, please edit $(docker inspect "$CONTAINER_NAME" --format='{{range .Mounts}}{{.Source}}:{{.Destination}} {{end}}' | tr ' ' '\n' | grep /etc/gitlab | awk -F ':' '{ print $1 }')/gitlab.rb file or 'docker exec -it $CONTAINER_NAME /bin/bash && vi /etc/gitlab/gitlab.rb'"
+    if [ "${_prev_exit:-0}" -ne 0 ]; then
+        echo "Resuming post-upgrade checks for $CURRENT_VERSION..."
+        wait_for_http_ready "Recovery"
+        wait_for_healthy "Recovery"
+        wait_for_background_migrations
+        check_migration_status
+        check_gitlab_server_healthy 1
+        check_secrets_integrity "post-upgrade"
+        echo "WARNING: Previous run exited abnormally (exit code: $_prev_exit)"
+    else
+        echo "Requirements already satisfied: v$CURRENT_VERSION"
+        if ! curl -sf -o /dev/null "$TARGET_URL/users/sign_in"; then
+            echo "NOTE: If your GitLab server does not work properly, please edit $(docker inspect "$CONTAINER_NAME" --format='{{range .Mounts}}{{.Source}}:{{.Destination}} {{end}}' | tr ' ' '\n' | grep /etc/gitlab | awk -F ':' '{ print $1 }')/gitlab.rb file or 'docker exec -it $CONTAINER_NAME /bin/bash && vi /etc/gitlab/gitlab.rb'"
+        fi
     fi
     exit 0
 fi
