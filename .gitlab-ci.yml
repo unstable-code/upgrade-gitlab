@@ -95,6 +95,90 @@ integration-test:
       FINAL_VERSION=$(docker exec gitlab dpkg -l | grep -E "gitlab-(ce|ee)" | awk '{print $3}')
       echo "Final version: $FINAL_VERSION"
     - |
+      # Stuck migration injection tests (real-PG integration verification).
+      # Runs after successful upgrade and uses the recovery path
+      # (_prev_exit != 0, triggered by docker kill) so wait_for_background_migrations
+      # is exercised without re-doing backup.
+      set -e
+      echo "=== Stuck migration injection tests ==="
+
+      docker kill gitlab
+      docker start gitlab
+      timeout 600 bash -c 'until [ "$(docker inspect --format="{{.State.Health.Status}}" gitlab 2>/dev/null)" = "healthy" ]; do sleep 15; done'
+      echo "GitLab is healthy after kill/start."
+
+      VICTIM_ID=$(docker exec gitlab gitlab-psql -tAc \
+        "SELECT id FROM batched_background_migrations WHERE status=3 ORDER BY id LIMIT 1" \
+        | tr -d '[:space:]')
+      if [ -z "$VICTIM_ID" ]; then
+        echo "SKIP: no finished batched_background_migrations to impersonate stuck"
+      else
+        echo "Victim migration id: $VICTIM_ID"
+
+        _inject() {
+          docker exec gitlab gitlab-psql -c \
+            "UPDATE batched_background_migrations SET status=$1, updated_at=NOW() - INTERVAL '14 days' WHERE id=$VICTIM_ID;" > /dev/null
+        }
+        _restore() {
+          docker exec gitlab gitlab-psql -c \
+            "UPDATE batched_background_migrations SET status=3, updated_at=NOW() WHERE id=$VICTIM_ID;" > /dev/null || true
+        }
+        trap _restore EXIT
+
+        # Test A: status=4 should cause FATAL exit 1
+        _inject 4
+        set +e
+        ./upgrade-gitlab -y --edition=ee > stuck_a.log 2>&1
+        rc=$?
+        set -e
+        _restore
+        if [ "$rc" -ne 1 ] || ! grep -q "FATAL ERROR" stuck_a.log || ! grep -q "failed(4)" stuck_a.log; then
+          echo "FAIL: status=4 test (rc=$rc)"
+          cat stuck_a.log
+          exit 1
+        fi
+        echo "PASS: status=4 triggers FATAL"
+
+        # Test B: status=5 without flag should cause FATAL exit 1 in -y mode
+        _inject 5
+        set +e
+        ./upgrade-gitlab -y --edition=ee > stuck_b.log 2>&1
+        rc=$?
+        set -e
+        _restore
+        if [ "$rc" -ne 1 ] || ! grep -q "FATAL ERROR" stuck_b.log || ! grep -q "finalizing(5)" stuck_b.log; then
+          echo "FAIL: status=5 test (rc=$rc)"
+          cat stuck_b.log
+          exit 1
+        fi
+        echo "PASS: status=5 triggers FATAL"
+
+        # Test C: --reset-stuck-finalizing should change status from 5
+        # (upgrade-gitlab continues polling afterwards — capped by timeout)
+        _inject 5
+        set +e
+        timeout 90 ./upgrade-gitlab -y --reset-stuck-finalizing --edition=ee > stuck_c.log 2>&1
+        set -e
+        actual=$(docker exec gitlab gitlab-psql -tAc \
+          "SELECT status FROM batched_background_migrations WHERE id=$VICTIM_ID" \
+          | tr -d '[:space:]')
+        _restore
+        if [ "$actual" = "5" ]; then
+          echo "FAIL: reset did not happen (status still 5)"
+          cat stuck_c.log
+          exit 1
+        fi
+        if ! grep -q "Auto-resetting stuck finalizing" stuck_c.log; then
+          echo "FAIL: missing Auto-resetting log"
+          cat stuck_c.log
+          exit 1
+        fi
+        echo "PASS: --reset-stuck-finalizing changed status from 5 to $actual"
+
+        trap - EXIT
+      fi
+      echo "=== Stuck injection tests done ==="
+    - |
       coverage_pct=$(jq -r '.percent_covered' coverage_output/upgrade-gitlab/coverage.json 2>/dev/null || echo "0.0")
       echo "Coverage:${coverage_pct}%"
   coverage: '/Coverage:(\d+[\.,]\d+)%/'
