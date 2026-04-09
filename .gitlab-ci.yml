@@ -96,16 +96,20 @@ integration-test:
       echo "Final version: $FINAL_VERSION"
     - |
       # Stuck migration injection tests (real-PG integration verification).
-      # Runs after successful upgrade and uses the recovery path
-      # (_prev_exit != 0, triggered by docker kill) so wait_for_background_migrations
-      # is exercised without re-doing backup.
+      # Triggers upgrade-gitlab's recovery path by docker-killing the container
+      # BEFORE each run. upgrade-gitlab reads _prev_exit from docker inspect at
+      # a moment when the container is still stopped (so ExitCode != 0), then
+      # auto-starts it and runs wait_for_background_migrations in recovery mode.
       set -e
       echo "=== Stuck migration injection tests ==="
 
-      docker kill gitlab
-      docker start gitlab
-      timeout 600 bash -c 'until [ "$(docker inspect --format="{{.State.Health.Status}}" gitlab 2>/dev/null)" = "healthy" ]; do sleep 15; done'
-      echo "GitLab is healthy after kill/start."
+      FATAL_MARK="FATAL ERROR! MANUAL INTERVENTION REQUIRED"
+
+      # Make sure container is running for the initial query / injection.
+      if [ "$(docker inspect --format='{{.State.Running}}' gitlab 2>/dev/null)" != "true" ]; then
+        docker start gitlab
+        timeout 600 bash -c 'until [ "$(docker inspect --format="{{.State.Health.Status}}" gitlab 2>/dev/null)" = "healthy" ]; do sleep 15; done'
+      fi
 
       VICTIM_ID=$(docker exec gitlab gitlab-psql -tAc \
         "SELECT id FROM batched_background_migrations WHERE status=3 ORDER BY id LIMIT 1" \
@@ -115,11 +119,23 @@ integration-test:
       else
         echo "Victim migration id: $VICTIM_ID"
 
+        _ensure_running() {
+          if [ "$(docker inspect --format='{{.State.Running}}' gitlab 2>/dev/null)" != "true" ]; then
+            docker start gitlab > /dev/null 2>&1 || true
+          fi
+          timeout 600 bash -c 'until [ "$(docker inspect --format="{{.State.Health.Status}}" gitlab 2>/dev/null)" = "healthy" ]; do sleep 15; done'
+        }
+
         _inject() {
+          _ensure_running
           docker exec gitlab gitlab-psql -c \
             "UPDATE batched_background_migrations SET status=$1, updated_at=NOW() - INTERVAL '14 days' WHERE id=$VICTIM_ID;" > /dev/null
+          # Kill so that upgrade-gitlab sees _prev_exit != 0 on the next run.
+          docker kill gitlab > /dev/null
+          until [ "$(docker inspect --format='{{.State.Status}}' gitlab 2>/dev/null)" = "exited" ]; do sleep 1; done
         }
         _restore() {
+          _ensure_running
           docker exec gitlab gitlab-psql -c \
             "UPDATE batched_background_migrations SET status=3, updated_at=NOW() WHERE id=$VICTIM_ID;" > /dev/null || true
         }
@@ -132,7 +148,7 @@ integration-test:
         rc=$?
         set -e
         _restore
-        if [ "$rc" -ne 1 ] || ! grep -q "FATAL ERROR" stuck_a.log || ! grep -q "failed(4)" stuck_a.log; then
+        if [ "$rc" -ne 1 ] || ! grep -qF "$FATAL_MARK" stuck_a.log || ! grep -q "failed(4)" stuck_a.log; then
           echo "FAIL: status=4 test (rc=$rc)"
           cat stuck_a.log
           exit 1
@@ -146,7 +162,7 @@ integration-test:
         rc=$?
         set -e
         _restore
-        if [ "$rc" -ne 1 ] || ! grep -q "FATAL ERROR" stuck_b.log || ! grep -q "finalizing(5)" stuck_b.log; then
+        if [ "$rc" -ne 1 ] || ! grep -qF "$FATAL_MARK" stuck_b.log || ! grep -q "finalizing(5)" stuck_b.log; then
           echo "FAIL: status=5 test (rc=$rc)"
           cat stuck_b.log
           exit 1
@@ -154,11 +170,12 @@ integration-test:
         echo "PASS: status=5 triggers FATAL"
 
         # Test C: --reset-stuck-finalizing should change status from 5
-        # (upgrade-gitlab continues polling afterwards — capped by timeout)
+        # upgrade-gitlab continues into wait_for loop afterwards; timeout caps it.
         _inject 5
         set +e
-        timeout 90 ./upgrade-gitlab -y --reset-stuck-finalizing --edition=ee > stuck_c.log 2>&1
+        timeout 900 ./upgrade-gitlab -y --reset-stuck-finalizing --edition=ee > stuck_c.log 2>&1
         set -e
+        _ensure_running
         actual=$(docker exec gitlab gitlab-psql -tAc \
           "SELECT status FROM batched_background_migrations WHERE id=$VICTIM_ID" \
           | tr -d '[:space:]')
