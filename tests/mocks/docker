@@ -62,6 +62,25 @@ case "$args" in
     *"exec"*"gitlab-psql"*"information_schema"*)
         echo "t"
         ;;
+    # Stuck migration detection query (uses INTERVAL clause).
+    # Must come BEFORE the generic "job_class_name" pattern.
+    *"exec"*"gitlab-psql"*"INTERVAL"*)
+        if [ -n "${MOCK_STUCK_MIGRATIONS:-}" ]; then
+            # Optional state-based "resolve after N polls" for interactive wait simulation.
+            if [ -n "$MOCK_STATE_DIR" ] && [ -n "${MOCK_STUCK_RESOLVE_AFTER:-}" ]; then
+                _count=0
+                if [ -f "$MOCK_STATE_DIR/stuck_call_count" ]; then
+                    _count=$(cat "$MOCK_STATE_DIR/stuck_call_count")
+                fi
+                _count=$((_count + 1))
+                echo "$_count" > "$MOCK_STATE_DIR/stuck_call_count"
+                if [ "$_count" -gt "${MOCK_STUCK_RESOLVE_AFTER}" ]; then
+                    exit 0
+                fi
+            fi
+            printf '%s\n' "$MOCK_STUCK_MIGRATIONS"
+        fi
+        ;;
     *"exec"*"gitlab-psql"*"job_class_name"*)
         echo ""
         ;;

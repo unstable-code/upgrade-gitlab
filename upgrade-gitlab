@@ -14,6 +14,7 @@ auto_yes=0
 dry_run=0
 no_step_limit=0
 skip_lfs=0
+reset_stuck_finalizing=0
 _interrupted=0
 _trap_active=0
 _pull_pid=
@@ -90,7 +91,7 @@ pull_with_retry() {
 }
 
 if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
-    echo "Usage: $0 [-y] [--edition=ce|ee] [--target-url=http] [--discord-url=http] [--version=0.0.0] [--skip-latest] [--skip-lfs] [--no-step-limit] [--dry-run]"
+    echo "Usage: $0 [-y] [--edition=ce|ee] [--target-url=http] [--discord-url=http] [--version=0.0.0] [--skip-latest] [--skip-lfs] [--no-step-limit] [--dry-run] [--reset-stuck-finalizing]"
 
     echo -e '\n\e[0;1mOPTIONS\e[m'
     echo -e "-y, --yes\t\tAuto-confirm prompts for unattended/cron usage. Aborts on safety warnings and if upgrade path >= 3 steps."
@@ -102,6 +103,7 @@ if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
     echo -e "--no-step-limit\t\tDisable the 3-step safety limit for -y mode. Requires CI=true."
     echo -e "--target-url=http\tPerform a simple connection test for your GitLab server."
     echo -e "--skip-lfs\t\tSkip LFS objects during backup (passes SKIP=lfs to gitlab-backup)."
+    echo -e "--reset-stuck-finalizing\tReset batched_background_migrations rows stuck in status=finalizing(5) for >7 days back to active(1) so GitLab can re-finalize them. Does NOT execute the finalize rake task itself."
     echo -e "--discord-url=http\tNotify via Discord webhook."
 
     echo -e '\n\e[0;1mENV VALUES\e[m'
@@ -133,6 +135,8 @@ else
                 skip_latest=1
             elif [ "${params[$i]}" == "--skip-lfs" ]; then
                 skip_lfs=1
+            elif [ "${params[$i]}" == "--reset-stuck-finalizing" ]; then
+                reset_stuck_finalizing=1
             elif [[ "${params[$i]}" == "--source"* ]]; then
                 echo "Error: --source flag has been removed. Upgrade path now uses path.json + Docker Hub automatically." >&2
                 exit 1
@@ -474,6 +478,227 @@ check_secrets_integrity() {
     return 0
 }
 
+_STUCK_THRESHOLD_DAYS=7
+
+# 사람이 봐야 하는 치명적 상황을 강조하는 공통 배너 (status=4, -y에서의 status=5 stale)
+_print_fatal_banner() {
+    local title=$1
+    local r='\e[0;1;31m' z='\e[m'
+    {
+        echo ''
+        echo -e "${r}════════════════════════════════════════════════════════════════════${z}"
+        echo -e "${r}  FATAL ERROR! MANUAL INTERVENTION REQUIRED${z}"
+        echo -e "${r}  ${title}${z}"
+        echo -e "${r}════════════════════════════════════════════════════════════════════${z}"
+    } >&2
+}
+
+# stale 마이그레이션 한 행에 대한 사람용 정보/복구 가이드 출력
+# args: id job_class table_name column_name job_arguments status age_sec
+_print_stuck_row_info() {
+    local id=$1 job=$2 tbl=$3 col=$4 jargs=$5 st=$6 age=$7
+    local days=$((age / 86400))
+    local hours=$(( (age % 86400) / 3600 ))
+    local st_name='unknown'
+    case "$st" in
+        0) st_name='paused(0)' ;;
+        1) st_name='active(1)' ;;
+        2) st_name='aborted(2)' ;;
+        4) st_name='failed(4)' ;;
+        5) st_name='finalizing(5)' ;;
+    esac
+    {
+        echo "  id=$id  job=$job"
+        echo "  table=$tbl  column=$col  job_arguments=$jargs"
+        echo "  status=$st_name  age=${days}d ${hours}h (>${_STUCK_THRESHOLD_DAYS}d threshold)"
+    } >&2
+}
+
+# 수동 복구 가이드 (status=5 zombie 케이스)
+_print_stuck_finalizing_guide() {
+    local id=$1 job=$2 tbl=$3 col=$4 jargs=$5
+    {
+        echo ''
+        echo "  The finalize process likely died without cleanup"
+        echo "  (SIGKILL/OOM/host reboot during a previous reconfigure)."
+        echo ''
+        echo "  Manual recovery in another terminal:"
+        echo "    1) Verify no Sidekiq worker is processing it:"
+        echo "         docker exec $CONTAINER_NAME gitlab-rails runner \\"
+        echo "           'puts Sidekiq::Workers.new.to_a.select { |_,_,w| w[\"payload\"][\"class\"] =~ /BackgroundMigration/ }.inspect'"
+        echo "    2) Reset finalizing(5) -> active(1):"
+        echo "         docker exec $CONTAINER_NAME gitlab-psql -c \\"
+        echo "           \"UPDATE batched_background_migrations SET status=1 WHERE id=$id AND status=5;\""
+        echo "    3) Manually finalize:"
+        echo "         docker exec $CONTAINER_NAME gitlab-rake \\"
+        echo "           \"gitlab:background_migrations:finalize[$job,$tbl,$col,'$jargs']\""
+        echo ''
+        echo "  Or re-run upgrade-gitlab with --reset-stuck-finalizing to auto-reset"
+        echo "  status=5 rows. (Does NOT execute finalize itself; GitLab re-triggers"
+        echo "  it on the next post-deploy migration.)"
+        echo ''
+    } >&2
+}
+
+# 수동 복구 가이드 (status=4 fatal 케이스)
+_print_stuck_failed_guide() {
+    local id=$1
+    {
+        echo ''
+        echo "  The migration is in failed(4) state. This usually means individual"
+        echo "  batch jobs hit hard errors and exhausted their retry budget."
+        echo "  Auto-recovery is unsafe — investigate before proceeding."
+        echo ''
+        echo "  Manual investigation in another terminal:"
+        echo "    1) Inspect failed jobs:"
+        echo "         docker exec $CONTAINER_NAME gitlab-psql -c \\"
+        echo "           \"SELECT id, attempts, exception_class, exception_message, min_value, max_value"
+        echo "              FROM batched_background_migration_jobs"
+        echo "             WHERE batched_background_migration_id=$id AND status=2 ORDER BY id;\""
+        echo "    2) After fixing the root cause, split-and-retry failed jobs:"
+        echo "         docker exec $CONTAINER_NAME gitlab-rails runner \\"
+        echo "           'Gitlab::Database::BackgroundMigration::BatchedMigration.find($id).batched_jobs.failed.each(&:split_and_retry!)'"
+        echo "    3) Re-run upgrade-gitlab once status returns to active(1) and progresses."
+        echo ''
+    } >&2
+}
+
+# stale 행을 한 번 조회. 결과는 stdout으로 (id|job|table|col|jargs|status|age_sec) 라인.
+_query_stuck_migrations() {
+    docker exec "$CONTAINER_NAME" gitlab-psql -tAc "
+        SELECT id || '|' ||
+               COALESCE(job_class_name, '') || '|' ||
+               COALESCE(table_name, '') || '|' ||
+               COALESCE(column_name, '') || '|' ||
+               COALESCE(job_arguments::text, '[]') || '|' ||
+               status || '|' ||
+               EXTRACT(EPOCH FROM (NOW() - updated_at))::bigint
+        FROM batched_background_migrations
+        WHERE status NOT IN (3, 6)
+          AND updated_at < NOW() - INTERVAL '${_STUCK_THRESHOLD_DAYS} days'
+        ORDER BY id;
+    " 2>/dev/null
+}
+
+# stale 마이그레이션 검사 + 처리.
+# 반환:
+#   0 = 진행 가능 (stale 없음 / auto-reset 완료 / 인터랙티브 대기 후 해소)
+#   exit 1 = 치명적 (status=4 또는 -y에서의 status=5)
+_check_stuck_migrations() {
+    local rows
+    rows=$(_query_stuck_migrations)
+    if [ -z "$rows" ]; then
+        return 0
+    fi
+
+    local has_failed=0 has_finalizing=0
+    local fatal_failed_lines='' fatal_finalizing_lines=''
+    local id job tbl col jargs st age
+
+    while IFS='|' read -r id job tbl col jargs st age; do
+        [ -z "$id" ] && continue
+        case "$st" in
+            4)
+                has_failed=1
+                fatal_failed_lines+="$id|$job|$tbl|$col|$jargs|$st|$age"$'\n'
+                ;;
+            5)
+                has_finalizing=1
+                fatal_finalizing_lines+="$id|$job|$tbl|$col|$jargs|$st|$age"$'\n'
+                ;;
+            *)
+                # 진행 중일 가능성이 있어 경고만 출력 (false positive 방지)
+                {
+                    echo ''
+                    echo "[warning] batched_background_migration appears stale but is not finalized:"
+                    _print_stuck_row_info "$id" "$job" "$tbl" "$col" "$jargs" "$st" "$age"
+                    echo "  This may be a legitimately slow active migration. No action taken."
+                } >&2
+                ;;
+        esac
+    done <<< "$rows"
+
+    # 1) status=4 (failed) — 항상 FATAL
+    if [ "$has_failed" -eq 1 ]; then
+        _print_fatal_banner "Background migration in failed(4) state"
+        while IFS='|' read -r id job tbl col jargs st age; do
+            [ -z "$id" ] && continue
+            _print_stuck_row_info "$id" "$job" "$tbl" "$col" "$jargs" "$st" "$age"
+            _print_stuck_failed_guide "$id"
+        done <<< "$fatal_failed_lines"
+        send_discord_webhook "ERR" "Background migration failed" "Stuck in failed(4) state — manual intervention required"
+        exit 1
+    fi
+
+    # 2) status=5 (finalizing) — 옵션/모드에 따라 분기
+    if [ "$has_finalizing" -eq 1 ]; then
+        if [ "$reset_stuck_finalizing" -eq 1 ]; then
+            echo '' >&2
+            echo "Auto-resetting stuck finalizing(5) rows -> active(1) (--reset-stuck-finalizing):" >&2
+            while IFS='|' read -r id job tbl col jargs st age; do
+                [ -z "$id" ] && continue
+                _print_stuck_row_info "$id" "$job" "$tbl" "$col" "$jargs" "$st" "$age"
+                if docker exec "$CONTAINER_NAME" gitlab-psql -c \
+                    "UPDATE batched_background_migrations SET status=1 WHERE id=$id AND status=5;" >/dev/null 2>&1; then
+                    echo "  -> reset to active(1). GitLab will re-trigger finalize on the next post-deploy migration." >&2
+                else
+                    echo "  -> reset FAILED. Manual intervention required." >&2
+                    exit 1
+                fi
+            done <<< "$fatal_finalizing_lines"
+            send_discord_webhook "WARN" "Auto-reset stuck finalizing migrations" "Reset to active(1); GitLab will re-finalize."
+            return 0
+        fi
+
+        if [ "$auto_yes" -eq 1 ]; then
+            # 비인터랙티브: FATAL exit
+            _print_fatal_banner "Background migration stuck in finalizing(5) state"
+            while IFS='|' read -r id job tbl col jargs st age; do
+                [ -z "$id" ] && continue
+                _print_stuck_row_info "$id" "$job" "$tbl" "$col" "$jargs" "$st" "$age"
+                _print_stuck_finalizing_guide "$id" "$job" "$tbl" "$col" "$jargs"
+            done <<< "$fatal_finalizing_lines"
+            send_discord_webhook "ERR" "Background migration stuck (finalizing)" "Stuck in finalizing(5) — manual intervention required"
+            exit 1
+        fi
+
+        # 인터랙티브: 가이드 출력 후 다른 터미널에서 해결될 때까지 폴링 대기
+        echo '' >&2
+        echo "[!] Stuck batched_background_migration detected (finalizing(5))" >&2
+        while IFS='|' read -r id job tbl col jargs st age; do
+            [ -z "$id" ] && continue
+            _print_stuck_row_info "$id" "$job" "$tbl" "$col" "$jargs" "$st" "$age"
+            _print_stuck_finalizing_guide "$id" "$job" "$tbl" "$col" "$jargs"
+        done <<< "$fatal_finalizing_lines"
+        send_discord_webhook "WARN" "Background migration stuck (finalizing)" "Waiting for manual recovery in another terminal..."
+        echo "Waiting for manual recovery in another terminal. Polling every 30s. (Ctrl+C to abort.)" >&2
+
+        local poll_spinner='/-\|' poll_idx=0
+        while true; do
+            for ((s=0; s<30; s++)); do
+                if [ -e /dev/tty ]; then
+                    printf '\r  waiting... %s' "${poll_spinner:poll_idx++%${#poll_spinner}:1}" >&2
+                fi
+                sleep 1
+            done
+            local recheck
+            recheck=$(_query_stuck_migrations)
+            # finalizing(5) 행이 사라졌는지 확인 (다른 stale은 다음 iteration에서 다시 분기)
+            if ! echo "$recheck" | grep -q '|5|'; then
+                if [ -e /dev/tty ]; then
+                    printf '\r\033[K' >&2
+                fi
+                echo "Stuck finalizing rows resolved. Resuming." >&2
+                send_discord_webhook "NOTE" "Stuck migration resolved" "Resuming upgrade flow."
+                return 0
+            fi
+        done
+    fi
+
+    # status=0/1/2 stale만 있는 경우는 경고만 하고 진행
+    return 0
+}
+
 wait_for_background_migrations() {
     # batched_background_migrations 테이블은 GitLab 13.10 이상에서만 존재
     local table_exists
@@ -484,6 +709,9 @@ wait_for_background_migrations() {
         echo "Skipping background migration check: table not available in this version"
         return 0
     fi
+
+    # stuck 감지: status=4(failed), status=5(finalizing) zombie, 기타 stale
+    _check_stuck_migrations
 
     echo "Waiting for background migrations to complete..."
     local spinner='/-\|'

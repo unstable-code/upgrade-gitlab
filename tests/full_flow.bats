@@ -131,3 +131,68 @@ teardown() {
     [[ "$output" == *"Creating backups"* ]]
     [[ "$output" == *"Successfully updated"* ]]
 }
+
+# ---------- Test 13: Stuck failed(4) migration is fatal ----------
+@test "full-flow: status=4 (failed) migration triggers FATAL exit" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    # id|job|table|column|jargs|status|age_sec  (1209600 sec = 14 days)
+    export MOCK_STUCK_MIGRATIONS="42|FailingMigration|some_table|id|[]|4|1209600"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"FATAL ERROR! MANUAL INTERVENTION REQUIRED"* ]]
+    [[ "$output" == *"failed(4)"* ]]
+    [[ "$output" == *"id=42"* ]]
+    [[ "$output" == *"FailingMigration"* ]]
+    [[ "$output" == *"split_and_retry"* ]]
+}
+
+# ---------- Test 14: Stuck finalizing(5) in -y mode is fatal ----------
+@test "full-flow: status=5 (finalizing) stuck triggers FATAL exit in -y mode" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_STUCK_MIGRATIONS="12|BackfillShardingKeyAndCleanLabelLinksTable|label_links|id|[]|5|1209600"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"FATAL ERROR! MANUAL INTERVENTION REQUIRED"* ]]
+    [[ "$output" == *"finalizing(5)"* ]]
+    [[ "$output" == *"id=12"* ]]
+    [[ "$output" == *"--reset-stuck-finalizing"* ]]
+}
+
+# ---------- Test 15: --reset-stuck-finalizing auto-resets and proceeds ----------
+@test "full-flow: --reset-stuck-finalizing auto-resets status=5 and proceeds" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_STUCK_MIGRATIONS="12|BackfillShardingKeyAndCleanLabelLinksTable|label_links|id|[]|5|1209600"
+    # After auto-reset, the next stuck poll should return empty.
+    export MOCK_STUCK_RESOLVE_AFTER=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --reset-stuck-finalizing --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Auto-resetting stuck finalizing(5)"* ]]
+    [[ "$output" == *"reset to active(1)"* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+}
+
+# ---------- Test 16: status=1 (active) stale -> warning only, proceeds ----------
+@test "full-flow: status=1 (active) stale only warns and proceeds" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_STUCK_MIGRATIONS="7|SlowActiveMigration|t|c|[]|1|1209600"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"appears stale but is not finalized"* ]]
+    [[ "$output" == *"id=7"* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+}
+
+# ---------- Test 17: failed(4) is fatal even with --reset-stuck-finalizing ----------
+@test "full-flow: --reset-stuck-finalizing does not bypass failed(4)" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_STUCK_MIGRATIONS="42|FailingMigration|t|c|[]|4|1209600"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --reset-stuck-finalizing --target-url=http://mock
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"FATAL ERROR! MANUAL INTERVENTION REQUIRED"* ]]
+    [[ "$output" == *"failed(4)"* ]]
+}
