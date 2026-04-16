@@ -80,6 +80,17 @@ teardown() {
     [[ "$output" == *"TARGET_URL is required"* ]]
 }
 
+# ---------- Test 7b: Missing DISCORD_URL ----------
+@test "full-flow: missing DISCORD_URL errors in unattended mode outside CI" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    unset CI
+    unset DISCORD_URL
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"DISCORD_URL is required"* ]]
+}
+
 # ---------- Test 8: Backup messages ----------
 @test "full-flow: upgrade shows backup creation messages" {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"

@@ -94,7 +94,7 @@ if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
     echo "Usage: $0 [-y] [--edition=ce|ee] [--target-url=http] [--discord-url=http] [--version=0.0.0] [--skip-latest] [--skip-lfs] [--no-step-limit] [--dry-run] [--reset-stuck-finalizing]"
 
     echo -e '\n\e[0;1mOPTIONS\e[m'
-    echo -e "-y, --yes\t\tAuto-confirm prompts for unattended/cron usage. Aborts on safety warnings and if upgrade path >= 3 steps."
+    echo -e "-y, --yes\t\tAuto-confirm prompts for unattended/cron usage. Aborts on safety warnings and if upgrade path >= 3 steps. Requires DISCORD_URL unless CI=true."
     echo -e "--help\t\t\tShow this help."
     echo -e "--edition=ce|ee\t\tForce GitLab edition (ce or ee). Auto-detected if omitted."
     echo -e "--version=0.0.0\t\tUse provided tag instead of latest tag. Partial versions (e.g. 18) are resolved automatically. EOS versions are rejected."
@@ -1696,6 +1696,12 @@ if [ -z "$TARGET_URL" ] && [ "${CI:-}" != "true" ]; then
         echo 'User abort'
         exit 1
     fi
+fi
+
+# -y 모드는 FATAL 등 중대 이벤트가 알림 없이 로그에 묻히지 않도록 Discord 알림을 필수화
+if [ $auto_yes -eq 1 ] && [ "${CI:-}" != "true" ] && [ -z "$DISCORD_URL" ]; then
+    echo "Error: DISCORD_URL is required for unattended mode (-y) so fatal events can be surfaced. Use --discord-url or DISCORD_URL env." >&2
+    exit 1
 fi
 
 if [ $auto_yes -eq 1 ] && [ $no_step_limit -eq 0 ] && [ ${#UPGRADE_POINTS_ARRAY[@]} -ge 3 ]; then

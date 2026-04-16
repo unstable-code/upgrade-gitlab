@@ -14,6 +14,9 @@ export PATH="$PROJECT_ROOT/tests/mocks:$PATH"
 # Default mock version (can be overridden per test)
 export MOCK_GITLAB_VERSION="${MOCK_GITLAB_VERSION:-16.11.0-ce.0}"
 
+# Default CI=true so local bats bypasses -y mode's DISCORD_URL requirement.
+export CI="${CI:-true}"
+
 # Note: UID is a readonly bash variable, no need to set it
 
 # State management for full-flow tests
