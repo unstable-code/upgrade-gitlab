@@ -15,6 +15,7 @@ dry_run=0
 no_step_limit=0
 skip_lfs=0
 reset_stuck_finalizing=0
+max_tier_flag=
 _interrupted=0
 _trap_active=0
 _pull_pid=
@@ -91,7 +92,7 @@ pull_with_retry() {
 }
 
 if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
-    echo "Usage: $0 [-y] [--edition=ce|ee] [--target-url=http] [--discord-url=http] [--version=0.0.0] [--skip-latest] [--skip-lfs] [--no-step-limit] [--dry-run] [--reset-stuck-finalizing]"
+    echo "Usage: $0 [-y] [--edition=ce|ee] [--target-url=http] [--discord-url=http] [--version=0.0.0] [--skip-latest] [--skip-lfs] [--no-step-limit] [--dry-run] [--reset-stuck-finalizing] [--max-tier=core|starter|premium|ultimate]"
 
     echo -e '\n\e[0;1mOPTIONS\e[m'
     echo -e "-y, --yes\t\tAuto-confirm prompts for unattended/cron usage. Aborts on safety warnings and if upgrade path >= 3 steps. Requires DISCORD_URL unless CI=true."
@@ -104,6 +105,7 @@ if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
     echo -e "--target-url=http\tPerform a simple connection test for your GitLab server."
     echo -e "--skip-lfs\t\tSkip LFS objects during backup (passes SKIP=lfs to gitlab-backup)."
     echo -e "--reset-stuck-finalizing\tReset batched_background_migrations rows stuck in status=finalizing(5) for >7 days back to active(1) so GitLab can re-finalize them. Does NOT execute the finalize rake task itself."
+    echo -e "--max-tier=TIER\t\tUpper tier bound for the 'What is new since' link in the completion webhook. One of core/starter/premium/ultimate. Default: core for CE, ultimate for EE."
     echo -e "--discord-url=http\tNotify via Discord webhook."
 
     echo -e '\n\e[0;1mENV VALUES\e[m'
@@ -137,6 +139,16 @@ else
                 skip_lfs=1
             elif [ "${params[$i]}" == "--reset-stuck-finalizing" ]; then
                 reset_stuck_finalizing=1
+            elif [[ "${params[$i]}" == "--max-tier"* ]]; then
+                case "$temp" in
+                    core|starter|premium|ultimate)
+                        max_tier_flag=$temp
+                        ;;
+                    *)
+                        echo "Error: --max-tier must be one of: core, starter, premium, ultimate" >&2
+                        exit 1
+                        ;;
+                esac
             elif [[ "${params[$i]}" == "--source"* ]]; then
                 echo "Error: --source flag has been removed. Upgrade path now uses path.json + Docker Hub automatically." >&2
                 exit 1
@@ -2019,6 +2031,14 @@ fi
 
 echo "Successfully updated GitLab server from $CURRENT_VERSION to ${UPGRADE_POINTS_ARRAY[-1]}"
 echo "Updated traceroute: ${UPGRADE_POINTS_ARRAY[*]}"
-send_discord_webhook "NOTE" "Successfully upgraded GitLab server!" "GitLab version changed from $CURRENT_VERSION to ${UPGRADE_POINTS_ARRAY[-1]}"
+if [ -n "$max_tier_flag" ]; then
+    max_tier=$max_tier_flag
+elif [ "$GITLAB_EDITION" = "ce" ]; then
+    max_tier=core
+else
+    max_tier=ultimate
+fi
+whats_new_url="https://gitlab-com.gitlab.io/cs-tools/gitlab-cs-tools/what-is-new-since/?tab=features&minVersion=${CURRENT_VERSION%%-*}&selectedMinTier=core&selectedMaxTier=${max_tier}&selectedSaaS=self-managed+only"
+send_discord_webhook "NOTE" "Successfully upgraded GitLab server!" "GitLab version changed from [$CURRENT_VERSION to ${UPGRADE_POINTS_ARRAY[-1]}]($whats_new_url)"
 
 exit 0

@@ -209,3 +209,19 @@ setup() {
     [[ "$output" == *"Resolved partial version to: 17.10.2-ce.0"* ]]
     [[ "$output" == *"Target: 17.10.2-ce.0"* ]]
 }
+
+# ---------- Test 21: --max-tier accepts valid values ----------
+@test "--max-tier=premium is accepted" {
+    export MOCK_GITLAB_VERSION="18.0.1-ce.0"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --max-tier=premium
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"=== DRY-RUN: Upgrade Path ==="* ]]
+}
+
+# ---------- Test 22: --max-tier rejects invalid values ----------
+@test "--max-tier=enterprise produces error" {
+    export MOCK_GITLAB_VERSION="18.0.1-ce.0"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --max-tier=enterprise
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"--max-tier must be one of"* ]]
+}
