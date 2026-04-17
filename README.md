@@ -10,12 +10,13 @@ An automated upgrade script for Docker-based GitLab instances. Supports both CE 
 - **CE/EE auto-detection** — Automatically detects the running edition from the container image. Supports CE-to-EE migration at the same version before proceeding with upgrades.
 - **Safe upgrade path** — Uses `path.json` from the [upgrade-path](https://gitlab.com/gitlab-com/support/toolbox/upgrade-path) project for required waypoints, with Docker Hub API for patch version resolution.
 - **Background migration tracking** — Waits for batched background migrations to complete between each version hop, with per-migration progress display.
+- **Stuck migration detection** — Flags batched migrations stuck >7 days in `failed(4)` or `finalizing(5)` state with actionable recovery guidance. Interactive mode polls until resolved; `-y` mode exits with a FATAL banner. Use `--reset-stuck-finalizing` to auto-reset `finalizing` zombies to `active`.
 - **Migration status verification** — Checks for `down` state migrations after each upgrade step.
 - **Disk space pre-check** — Validates that data and backup volumes have at least 1.5x free space before starting.
 - **Secrets integrity check** — Runs `gitlab:doctor:secrets` before and after the upgrade process.
 - **Signal safety** — Critical sections (container swap) defer SIGINT/SIGTERM/SIGTSTP/SIGHUP; `docker pull` is interruptible and auto-retries.
 - **Background pre-pull** — Downloads the next version image in the background while the current version stabilizes.
-- **Discord notifications** — Optional webhook alerts for upgrade progress, warnings, and errors.
+- **Discord notifications** — Webhook alerts for upgrade progress, warnings, and errors. The completion message links to GitLab's "What is new since" page pre-filtered to the upgrade's previous version. Required in `-y` mode (unless `CI=true`) so fatal events are never silent.
 - **Automatic backup** — Creates a GitLab backup and copies `gitlab-secrets.json` and `gitlab.rb` before upgrading.
 
 ## Requirements
@@ -45,7 +46,7 @@ EOS (end-of-support) versions are checked via GitLab releases API but not exhaus
 
 | Flag | Description |
 |------|-------------|
-| `-y`, `--yes` | Skip confirmation prompts (non-interactive mode) |
+| `-y`, `--yes` | Skip confirmation prompts (non-interactive mode). Requires `DISCORD_URL` unless `CI=true`. |
 | `--help` | Show help message |
 | `--edition=ce\|ee` | Force GitLab edition (auto-detected if omitted) |
 | `--version=X.Y.Z` | Upgrade to a specific version instead of latest. Partial versions (e.g. `18`) are resolved automatically. End-of-support versions are rejected via GitLab releases API. |
@@ -53,8 +54,10 @@ EOS (end-of-support) versions are checked via GitLab releases API but not exhaus
 | `--dry-run` | Compute and display upgrade path without executing. Implies `-y`. |
 | `--skip-lfs` | Skip LFS objects during backup |
 | `--no-step-limit` | Disable the 3-step safety limit for `-y` mode. Requires `CI=true`. |
+| `--reset-stuck-finalizing` | Reset batched_background_migrations rows stuck in `finalizing(5)` state for >7 days back to `active(1)` so GitLab can re-finalize them. Does NOT execute the finalize rake task itself. |
+| `--max-tier=TIER` | Upper tier bound (`core`/`starter`/`premium`/`ultimate`) for the "What is new since" link in the completion webhook. Default: `core` for CE, `ultimate` for EE. |
 | `--target-url=URL` | GitLab server URL for connection testing |
-| `--discord-url=URL` | Discord webhook URL for notifications |
+| `--discord-url=URL` | Discord webhook URL for notifications (required in `-y` mode unless `CI=true`) |
 
 ### Environment Variables
 

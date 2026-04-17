@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**upgrade-gitlab** is an automated, Docker-based GitLab upgrade tool that performs safe, step-by-step version upgrades following the official GitLab upgrade path. Single bash script (`upgrade-gitlab`, ~1600 lines) supporting CE/EE editions with background migration tracking, signal safety, and Discord notifications.
+**upgrade-gitlab** is an automated, Docker-based GitLab upgrade tool that performs safe, step-by-step version upgrades following the official GitLab upgrade path. Single bash script (`upgrade-gitlab`, ~2000 lines) supporting CE/EE editions with background migration tracking, stuck-migration detection, signal safety, and Discord notifications.
 
 Repository: `gitlab.com/gitlab-useful-scripts/upgrade-gitlab` (GitLab, not GitHub — use `glab` instead of `gh`)
 
@@ -44,6 +44,12 @@ Single unified source: **path.json** provides required waypoints (major.minor st
 ### Signal Safety
 Critical sections (`enter_critical`/`exit_critical`) defer SIGINT/SIGTERM/SIGTSTP during container swap operations (stop → remove → pull → run). Ctrl+\\ (SIGQUIT) forces immediate exit.
 
+### Stuck Migration Detection
+`_check_stuck_migrations` runs at the top of every `wait_for_background_migrations` call and scans `batched_background_migrations` for rows with `updated_at` older than 7 days. Routing by status:
+- `failed(4)` → FATAL banner + recovery guide + `exit 1` (always; auto recovery is unsafe).
+- `finalizing(5)` → FATAL in `-y` mode; interactive mode polls every 30s until resolved externally; `--reset-stuck-finalizing` auto-resets to `active(1)` so GitLab re-finalizes on the next post-deploy migration (does NOT run the finalize rake itself).
+- `paused(0)`/`active(1)`/`aborted(2)` stale → warning only (may be a slow active migration).
+
 ### Main Upgrade Flow
 1. Pre-flight checks (disk space, secrets integrity)
 2. Backup (gitlab-backup or gitlab-rake for <12.2)
@@ -59,12 +65,12 @@ Terminal detected → animated spinners, progress bars with ETA. No terminal (CI
 Tests use [BATS](https://github.com/bats-core/bats-core) (Bash Automated Testing System).
 
 ### Test Structure
-- `tests/upgrade_path.bats` — Logic tests using `--dry-run` (path resolution, `--skip-latest`, `--version`)
-- `tests/full_flow.bats` — Integration tests simulating full upgrade loops via mocks
-- `tests/test_helper.bash` — Shared setup; prepends `tests/mocks/` to PATH, sets default version `16.11.0-ce.0`
+- `tests/upgrade_path.bats` — Logic tests using `--dry-run` (path resolution, `--skip-latest`, `--version`, `--max-tier` validation)
+- `tests/full_flow.bats` — Integration tests simulating full upgrade loops via mocks (includes stuck-migration scenarios)
+- `tests/test_helper.bash` — Shared setup; prepends `tests/mocks/` to PATH, sets default version `16.11.0-ce.0`, and defaults `CI=true` so local bats bypasses `-y` mode's `DISCORD_URL` requirement. Tests that need to exercise non-CI paths explicitly `unset CI`.
 
 ### Mock System
-Stateful mock binaries in `tests/mocks/` (curl, docker, df, du, id) shadow real binaries via PATH priority. Docker mock tracks version state through `MOCK_STATE_DIR/current_version` file, enabling multi-step upgrade simulation. Curl mock routes URLs to fixture files.
+Stateful mock binaries in `tests/mocks/` (curl, docker, df, du, id) shadow real binaries via PATH priority. Docker mock tracks version state through `MOCK_STATE_DIR/current_version` file, enabling multi-step upgrade simulation. Curl mock routes URLs to fixture files. `MOCK_STUCK_MIGRATIONS` / `MOCK_STUCK_RESOLVE_AFTER` env vars simulate stuck batched_background_migrations for detection tests.
 
 ### Fixtures
 - `tests/fixtures/path.json` — Pre-computed upgrade path waypoints (major.minor stops)
@@ -76,9 +82,9 @@ Stages: `lint` → `test` → `promote`
 
 - **shellcheck**: Lints on develop, master, MRs
 - **logic-test**: Runs `bats tests/` with kcov coverage on develop, master, MRs
-- **integration-test**: Spins up real GitLab container, runs full upgrade (schedule/manual only, self-hosted runner, 6h timeout)
+- **integration-test**: Spins up real GitLab container, runs full upgrade, then impersonates stuck batched_background_migrations (status=4 / status=5) to validate real-PG detection against the recovery path triggered via `docker kill`. Schedule/manual only, self-hosted runner, 6h timeout.
 - **promote-to-master**: Auto-pushes develop → master (official project only, uses `PUSH_TOKEN`)
 
 ## Key Flags
 
-`-y` auto-confirm | `--dry-run` compute path only | `--version=X[.Y[.Z]]` target version | `--skip-latest`/`--n-1` previous minor | `--no-step-limit` (CI only) | `--skip-lfs` skip LFS in backup | `--edition=ce|ee` | `--target-url` health check URL | `--discord-url` webhook
+`-y` auto-confirm (requires `DISCORD_URL` unless `CI=true`) | `--dry-run` compute path only | `--version=X[.Y[.Z]]` target version | `--skip-latest`/`--n-1` previous minor | `--no-step-limit` (CI only) | `--skip-lfs` skip LFS in backup | `--edition=ce|ee` | `--reset-stuck-finalizing` auto-reset status=5 zombies | `--max-tier=core|starter|premium|ultimate` what's-new URL tier | `--target-url` health check URL | `--discord-url` webhook
