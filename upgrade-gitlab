@@ -1845,6 +1845,19 @@ BACKUP_DIR=$(docker exec "$CONTAINER_NAME" grep "'backup_path'" /etc/gitlab/gitl
 docker exec "$CONTAINER_NAME" sh -c "cp /etc/gitlab/gitlab-secrets.json $BACKUP_DIR/gitlab-secrets.json.${CURRENT_VERSION}-backup"
 docker exec "$CONTAINER_NAME" sh -c "cp /etc/gitlab/gitlab.rb $BACKUP_DIR/gitlab.rb.${CURRENT_VERSION}-backup"
 
+# config backup 정리: gitlab.rb의 backup_keep_time(초) 기준으로 오래된 파일 삭제.
+# GitLab 본체 *.tar 백업과 동일한 retention 정책. 0/미설정이면 영구 보관.
+backup_keep_time=$(docker exec "$CONTAINER_NAME" grep "'backup_keep_time'" /etc/gitlab/gitlab.rb 2>/dev/null \
+    | awk -F"=" '{print $2}' | sed 's/\"//g' | sed 's/^ //')
+if [[ "$backup_keep_time" =~ ^[0-9]+$ ]] && [ "$backup_keep_time" -gt 0 ]; then
+    keep_minutes=$((backup_keep_time / 60))
+    if [ "$keep_minutes" -gt 0 ]; then
+        docker exec "$CONTAINER_NAME" sh -c \
+            "find '$BACKUP_DIR' -maxdepth 1 -type f \( -name 'gitlab.rb.*-backup' -o -name 'gitlab-secrets.json.*-backup' \) -mmin +$keep_minutes -delete 2>/dev/null" || true
+        echo "Pruned config backups older than ${backup_keep_time}s (backup_keep_time)"
+    fi
+fi
+
 # Secrets 무결성 기준선 확인
 if ! check_secrets_integrity "pre-upgrade"; then
     if [ $auto_yes -eq 1 ]; then
