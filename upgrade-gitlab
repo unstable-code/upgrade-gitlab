@@ -951,6 +951,7 @@ _draw_backup_progress() {
     local label=$1
     local pct=$2
     local tick=$3
+    local approx=${4:-0}
     local cols=${COLUMNS:-$(tput cols 2>/dev/null || stty size 2>/dev/null | awk '{print $2}' || echo 80)}
     local reset='\033[0m'
 
@@ -960,7 +961,11 @@ _draw_backup_progress() {
     fi
 
     local suffix
-    suffix=$(printf " %d%%" "$pct")
+    if [ "$approx" -eq 1 ]; then
+        suffix=$(printf " ~%d%%" "$pct")
+    else
+        suffix=$(printf " %d%%" "$pct")
+    fi
     # overhead: "[" label "]" " [" bar "]" suffix
     local overhead=$(( ${#label} + 5 + ${#suffix} ))
     local bar_length=$(( cols - overhead ))
@@ -1053,6 +1058,17 @@ _start_size_poller() {
     docker exec "$CONTAINER_NAME" sh -c '
         while true; do
             stat -c "%s %n" /var/opt/gitlab/backups/*.tar.gz 2>/dev/null
+            stat -c "%s %n" /var/opt/gitlab/backups/*_gitlab_backup.tar 2>/dev/null
+            sum=0
+            for f in /sys/class/net/*/statistics/tx_bytes; do
+                name=${f%/statistics/tx_bytes}; name=${name##*/}
+                [ "$name" = "lo" ] && continue
+                if [ -r "$f" ]; then
+                    v=$(cat "$f" 2>/dev/null) || v=0
+                    sum=$((sum + ${v:-0}))
+                fi
+            done
+            echo "$sum tx_bytes_total"
             echo ---
             sleep 0.5
         done
@@ -1085,6 +1101,18 @@ _get_current_tar_size() {
     # Ensure integer (strip non-digits)
     size="${size//[!0-9]/}"
     echo "${size:-0}"
+}
+
+# Prints the latest container egress total (bytes) from the poller output.
+_get_current_tx_bytes() {
+    if [ -z "${_size_poller_file:-}" ] || [ ! -f "$_size_poller_file" ]; then
+        echo 0
+        return
+    fi
+    local v
+    v=$(grep "tx_bytes_total" "$_size_poller_file" | tail -1 | awk '{print $1}')
+    v="${v//[!0-9]/}"
+    echo "${v:-0}"
 }
 
 draw_progress() {
@@ -1240,7 +1268,10 @@ run_with_progress_bar() {
     local tick=0
     local last_line_count=0
     local current_stage=""
+    local prev_stage=""
     local repo_completed=0
+    local upload_baseline_tx=0
+    local upload_target_size=0
 
     _start_size_poller
 
@@ -1266,8 +1297,18 @@ run_with_progress_bar() {
             current_stage="$detected_stage"
         fi
 
+        # 스테이지 전환 시점 처리: upload 진입 시 baseline tx_bytes + 최종 tar 크기 캡처
+        if [ "$current_stage" != "$prev_stage" ]; then
+            prev_stage="$current_stage"
+            if [[ "$current_stage" == "Uploading backup archive to remote storage"* ]]; then
+                upload_baseline_tx=$(_get_current_tx_bytes)
+                upload_target_size=$(_get_current_tar_size "_gitlab_backup.tar")
+            fi
+        fi
+
         # 스테이지별 진행률 계산
         local pct=-1
+        local approx=0
         local display_label="Backup"
         case "$current_stage" in
             "Dumping repositories"*)
@@ -1306,6 +1347,21 @@ run_with_progress_bar() {
                     pct=$(( cur_size * 100 / _total_lfs_size ))
                 fi
                 ;;
+            "Uploading backup archive to remote storage"*)
+                # fog SDK가 chunk마다 file을 open/close해서 FD-기반 추적이 불가능하므로
+                # 컨테이너 egress 누적 바이트와 tar 크기 비율로 근사 (~ prefix로 명시).
+                # ambient 트래픽(exporter, sidekiq)은 보통 GB급 업로드 대비 노이즈 < 1%.
+                display_label="Backup: Uploading to remote storage"
+                if [ "$upload_target_size" -gt 0 ]; then
+                    local now_tx sent
+                    now_tx=$(_get_current_tx_bytes)
+                    sent=$(( now_tx - upload_baseline_tx ))
+                    if [ "$sent" -gt 0 ]; then
+                        pct=$(( sent * 100 / upload_target_size ))
+                        approx=1
+                    fi
+                fi
+                ;;
             *)
                 if [ -n "$current_stage" ]; then
                     display_label="Backup: $current_stage"
@@ -1315,7 +1371,7 @@ run_with_progress_bar() {
 
         if [ "$pct" -ge 0 ]; then
             if [ "$pct" -gt 100 ]; then pct=100; fi
-            _draw_backup_progress "$display_label" "$pct" "$tick"
+            _draw_backup_progress "$display_label" "$pct" "$tick" "$approx"
         else
             _draw_bouncing_frame "$display_label" "$tick"
         fi
