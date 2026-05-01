@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# Example post-config-backup hook for upgrade-gitlab.
+#
+# Activation (option 1, recommended): copy this file alongside the
+# upgrade-gitlab script with the .example suffix removed, then chmod +x:
+#     cp upload-config.hook.example upload-config.hook
+#     chmod +x upload-config.hook
+# upgrade-gitlab auto-detects 'upload-config.hook' next to itself.
+#
+# Activation (option 2): set the env var explicitly:
+#     export UPGRADE_GITLAB_CONFIG_HOOK=/absolute/path/to/upload-config.hook
+#
+# Receives via environment:
+#   UPGRADE_GITLAB_BACKUP_DIR — container-side path to GitLab's backup
+#                               directory (e.g. "/var/opt/gitlab/backups")
+#   UPGRADE_GITLAB_VERSION    — version tag of the just-created snapshots
+#                               (e.g. "18.10.4-ee.0")
+#   UPGRADE_GITLAB_CONTAINER  — container name
+#   UPGRADE_GITLAB_SCRIPT_DIR — directory holding the upgrade-gitlab script
+#                               (handy for sibling files like rclone.conf)
+#
+# The two files inside the container at hook time:
+#   $UPGRADE_GITLAB_BACKUP_DIR/gitlab.rb.${UPGRADE_GITLAB_VERSION}-backup
+#   $UPGRADE_GITLAB_BACKUP_DIR/gitlab-secrets.json.${UPGRADE_GITLAB_VERSION}-backup
+#
+# This template uses `docker cp` to extract them so the hook works
+# regardless of how the container's volumes are mounted on the host
+# (bind mount, named volume, tmpfs, Docker Desktop VM, etc.).
+#
+# Uncomment ONE of the upload sections below and fill in credentials
+# / bucket names. The first four backends mirror what GitLab itself
+# supports for its main backup uploads (S3, GCS, Azure Blob, OpenStack
+# Swift); the fifth (Google Drive via rclone) is provided for personal /
+# Workspace deployments.
+#
+# If no section is uncommented, this hook is a silent no-op — the tar
+# archive is created in a tempdir and discarded on exit. You will see
+# nothing in your target storage; check the docker run output of the
+# uncommented section to confirm uploads.
+#
+# Smoke-test your chosen backend AFTER setup, BEFORE the next real
+# upgrade. Adapt the docker invocation of the section you uncommented
+# to a list command. Examples (replace placeholders with real values):
+#   rclone:   docker run --rm -v "/path/to/rclone.conf:/config/rclone/rclone.conf:ro" \
+#                 rclone/rclone lsd gdrive:
+#   AWS S3:   docker run --rm -e AWS_ACCESS_KEY_ID=... -e AWS_SECRET_ACCESS_KEY=... \
+#                 -e AWS_DEFAULT_REGION=... amazon/aws-cli s3 ls s3://YOUR_BUCKET/
+#   GCS:      docker run --rm -v "/path/to/sa-key.json:/key.json:ro" \
+#                 -e GOOGLE_APPLICATION_CREDENTIALS=/key.json \
+#                 gcr.io/google.com/cloudsdktool/cloud-sdk:slim gsutil ls gs://YOUR_BUCKET/
+#   Azure:    docker run --rm -e AZURE_STORAGE_ACCOUNT=... -e AZURE_STORAGE_KEY=... \
+#                 mcr.microsoft.com/azure-cli az storage container list
+#   Swift:    set OS_* envs as in the upload section, then 'swift list YOUR_CONTAINER'
+
+set -euo pipefail
+
+: "${UPGRADE_GITLAB_BACKUP_DIR:?required}"
+: "${UPGRADE_GITLAB_VERSION:?required}"
+: "${UPGRADE_GITLAB_CONTAINER:?required}"
+
+WORK_DIR=$(mktemp -d)
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+# Extract the just-created snapshots from the container
+docker cp \
+    "${UPGRADE_GITLAB_CONTAINER}:${UPGRADE_GITLAB_BACKUP_DIR}/gitlab.rb.${UPGRADE_GITLAB_VERSION}-backup" \
+    "$WORK_DIR/"
+docker cp \
+    "${UPGRADE_GITLAB_CONTAINER}:${UPGRADE_GITLAB_BACKUP_DIR}/gitlab-secrets.json.${UPGRADE_GITLAB_VERSION}-backup" \
+    "$WORK_DIR/"
+
+ARCHIVE_NAME="gitlab-config-${UPGRADE_GITLAB_VERSION}-$(date +%Y-%m-%d).tar.gz"
+ARCHIVE_PATH="${WORK_DIR}/${ARCHIVE_NAME}"
+tar -czf "$ARCHIVE_PATH" -C "$WORK_DIR" \
+    "gitlab.rb.${UPGRADE_GITLAB_VERSION}-backup" \
+    "gitlab-secrets.json.${UPGRADE_GITLAB_VERSION}-backup"
+
+# ---------------------------------------------------------------------------
+# AWS S3 (or any S3-compatible: MinIO, Cloudflare R2, Backblaze B2, ...)
+# ---------------------------------------------------------------------------
+# docker run --rm \
+#     -e AWS_ACCESS_KEY_ID=YOUR_KEY \
+#     -e AWS_SECRET_ACCESS_KEY=YOUR_SECRET \
+#     -e AWS_DEFAULT_REGION=ap-northeast-2 \
+#     -v "${WORK_DIR}:/work:ro" \
+#     amazon/aws-cli \
+#     s3 cp "/work/${ARCHIVE_NAME}" "s3://YOUR_BUCKET/gitlab-configs/"
+
+# ---------------------------------------------------------------------------
+# Google Cloud Storage
+# ---------------------------------------------------------------------------
+# docker run --rm \
+#     -v "/path/to/service-account-key.json:/key.json:ro" \
+#     -v "${WORK_DIR}:/work:ro" \
+#     -e GOOGLE_APPLICATION_CREDENTIALS=/key.json \
+#     gcr.io/google.com/cloudsdktool/cloud-sdk:slim \
+#     gsutil cp "/work/${ARCHIVE_NAME}" "gs://YOUR_BUCKET/gitlab-configs/"
+
+# ---------------------------------------------------------------------------
+# Azure Blob Storage
+# ---------------------------------------------------------------------------
+# docker run --rm \
+#     -e AZURE_STORAGE_ACCOUNT=YOUR_ACCOUNT \
+#     -e AZURE_STORAGE_KEY=YOUR_KEY \
+#     -v "${WORK_DIR}:/work:ro" \
+#     mcr.microsoft.com/azure-cli \
+#     az storage blob upload \
+#         --container-name YOUR_CONTAINER \
+#         --name "gitlab-configs/${ARCHIVE_NAME}" \
+#         --file "/work/${ARCHIVE_NAME}"
+
+# ---------------------------------------------------------------------------
+# OpenStack Swift
+# ---------------------------------------------------------------------------
+# docker run --rm \
+#     -e OS_AUTH_URL=https://identity.example.com/v3 \
+#     -e OS_USERNAME=YOUR_USER \
+#     -e OS_PASSWORD=YOUR_PASS \
+#     -e OS_PROJECT_NAME=YOUR_PROJECT \
+#     -e OS_REGION_NAME=YOUR_REGION \
+#     -e OS_USER_DOMAIN_NAME=Default \
+#     -e OS_PROJECT_DOMAIN_NAME=Default \
+#     -e OS_IDENTITY_API_VERSION=3 \
+#     -v "${WORK_DIR}:/work:ro" \
+#     python:3-slim sh -c "
+#         pip install --quiet python-swiftclient python-keystoneclient &&
+#         swift upload --object-name 'gitlab-configs/${ARCHIVE_NAME}' \
+#             YOUR_CONTAINER '/work/${ARCHIVE_NAME}'"
+
+# ---------------------------------------------------------------------------
+# Google Drive (via rclone)
+# ---------------------------------------------------------------------------
+# Two credential paths — uncomment ONE of the two blocks below.
+#
+# A) GCP Service Account (automation-friendly, no token refresh)
+#    1. In GCP Console: create a service account, enable Drive API,
+#       download its JSON key.
+#    2. In Drive UI: share the target folder with the service account's
+#       email address (Editor role).
+#    3. Replace YOUR_FOLDER_ID with the ID from the folder URL
+#       (https://drive.google.com/drive/folders/<YOUR_FOLDER_ID>).
+#    Drive itself is billed by your Drive subscription; using a service
+#    account does not add GCP charges.
+#
+# docker run --rm \
+#     -v "/path/to/sa-key.json:/key.json:ro" \
+#     -v "${WORK_DIR}:/work:ro" \
+#     rclone/rclone \
+#     --drive-service-account-file=/key.json \
+#     --drive-root-folder-id=YOUR_FOLDER_ID \
+#     copy "/work/${ARCHIVE_NAME}" :drive:gitlab-configs/
+#
+# B) Pre-configured rclone.conf (no GCP project required)
+#    1. On a machine with a browser, run 'rclone config' once and create
+#       a Drive remote (e.g. named 'gdrive') via the OAuth flow.
+#    2. Place the resulting rclone.conf next to this hook (so
+#       UPGRADE_GITLAB_SCRIPT_DIR finds it automatically), or anywhere
+#       else and adjust the path below. rclone refreshes the OAuth
+#       token automatically on subsequent runs.
+#    3. Replace REMOTE_NAME with the name chosen during 'rclone config'.
+#
+# docker run --rm \
+#     -v "${UPGRADE_GITLAB_SCRIPT_DIR}/rclone.conf:/config/rclone/rclone.conf:ro" \
+#     -v "${WORK_DIR}:/work:ro" \
+#     rclone/rclone \
+#     copy "/work/${ARCHIVE_NAME}" REMOTE_NAME:gitlab-configs/

@@ -54,7 +54,7 @@ case "$args" in
         echo "external_url 'http://gitlab.test'"
         ;;
     *"exec"*"grep"*"backup_path"*)
-        echo ""
+        echo "gitlab_rails['backup_path'] = \"/var/opt/gitlab/backups\""
         ;;
     # gitlab-psql: patterns must follow argument order in the expanded args string
     # e.g. "exec gitlab gitlab-psql -tAc SELECT COUNT(*) FROM ci_runners WHERE active = true;"

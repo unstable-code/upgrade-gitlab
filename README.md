@@ -65,6 +65,7 @@ EOS (end-of-support) versions are checked via GitLab releases API but not exhaus
 |----------|-------------|
 | `TARGET_URL` | Same as `--target-url` |
 | `DISCORD_URL` | Same as `--discord-url` |
+| `UPGRADE_GITLAB_CONFIG_HOOK` | Path to an executable run after the `gitlab.rb` / `gitlab-secrets.json` snapshots are copied and pruned. If unset, an executable file named `upload-config.hook` next to the script is auto-detected. Receives `UPGRADE_GITLAB_BACKUP_DIR` (container-side path; use `docker cp` to extract), `UPGRADE_GITLAB_VERSION`, `UPGRADE_GITLAB_CONTAINER`, `UPGRADE_GITLAB_SCRIPT_DIR` env vars. Hook failure logs a warning but does not abort the upgrade. See [`upload-config.hook.example`](upload-config.hook.example) for a template covering S3 / GCS / Azure Blob / OpenStack Swift / Google Drive uploads. |
 
 ### Examples
 

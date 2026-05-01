@@ -4,6 +4,8 @@ BACKUP_DIR=
 DISCORD_URL=${DISCORD_URL:-}
 GITLAB_EDITION=
 PULL_PID=
+config_backup_hook=${UPGRADE_GITLAB_CONFIG_HOOK:-}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || SCRIPT_DIR=""
 
 skip_latest=0
 target_version_tag=
@@ -111,6 +113,7 @@ if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
     echo -e '\n\e[0;1mENV VALUES\e[m'
     echo -e "TARGET_URL=http\t\tSame as --target-url flag."
     echo -e "DISCORD_URL=http\tSame as --discord-url flag."
+    echo -e "UPGRADE_GITLAB_CONFIG_HOOK=PATH\tExecutable run after gitlab.rb / gitlab-secrets.json copies are created and pruned. If unset, an executable file named 'upload-config.hook' next to this script is auto-detected. Receives env vars UPGRADE_GITLAB_BACKUP_DIR (container-side path; use 'docker cp' to extract), UPGRADE_GITLAB_VERSION, UPGRADE_GITLAB_CONTAINER, UPGRADE_GITLAB_SCRIPT_DIR. Hook failure logs a warning but does not abort the upgrade. See upload-config.hook.example."
     exit 0
 else
     params=("${@}")
@@ -1911,6 +1914,38 @@ if [[ "$backup_keep_time" =~ ^[0-9]+$ ]] && [ "$backup_keep_time" -gt 0 ]; then
         docker exec "$CONTAINER_NAME" sh -c \
             "find '$BACKUP_DIR' -maxdepth 1 -type f \( -name 'gitlab.rb.*-backup' -o -name 'gitlab-secrets.json.*-backup' \) -mmin +$keep_minutes -delete 2>/dev/null" || true
         echo "Pruned config backups older than ${backup_keep_time}s (backup_keep_time)"
+    fi
+fi
+
+# 사용자 hook: config 백업 직후 임의 처리 (예: 원격지 업로드).
+# UPGRADE_GITLAB_CONFIG_HOOK 환경변수로 지정 가능. 미설정이면
+# upgrade-gitlab 스크립트와 같은 디렉토리의 upload-config.hook을 자동 탐지.
+# 실패 시 warning만 찍고 업그레이드는 계속 진행 (config 사본은 로컬에 남아있음).
+# Hook은 컨테이너 측 BACKUP_DIR 경로를 받음 — host 경로 해석은 docker cp 등에 위임.
+if [ -z "$config_backup_hook" ] && [ -n "$SCRIPT_DIR" ]; then
+    _hook_candidate="${SCRIPT_DIR}/upload-config.hook"
+    if [ -e "$_hook_candidate" ]; then
+        if [ -x "$_hook_candidate" ]; then
+            config_backup_hook="$_hook_candidate"
+            echo "Auto-detected post-config-backup hook: $config_backup_hook"
+        else
+            echo "Warning: $_hook_candidate exists but is not executable, skipping auto-discovery" >&2
+        fi
+    fi
+fi
+
+if [ -n "$config_backup_hook" ]; then
+    if [ ! -x "$config_backup_hook" ]; then
+        echo "Warning: UPGRADE_GITLAB_CONFIG_HOOK is not executable: $config_backup_hook" >&2
+    else
+        echo "Running post-config-backup hook: $config_backup_hook"
+        if ! UPGRADE_GITLAB_BACKUP_DIR="$BACKUP_DIR" \
+             UPGRADE_GITLAB_VERSION="$CURRENT_VERSION" \
+             UPGRADE_GITLAB_CONTAINER="$CONTAINER_NAME" \
+             UPGRADE_GITLAB_SCRIPT_DIR="$SCRIPT_DIR" \
+             "$config_backup_hook"; then
+            echo "Warning: post-config-backup hook exited non-zero (continuing upgrade)" >&2
+        fi
     fi
 fi
 

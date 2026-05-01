@@ -207,3 +207,104 @@ teardown() {
     [[ "$output" == *"FATAL ERROR! MANUAL INTERVENTION REQUIRED"* ]]
     [[ "$output" == *"failed(4)"* ]]
 }
+
+# ---------- Test 18: post-config-backup hook receives expected env ----------
+@test "full-flow: post-config-backup hook is invoked with expected env vars" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    HOOK_DIR=$(mktemp -d)
+    HOOK_OUT="$HOOK_DIR/captured.env"
+    cat > "$HOOK_DIR/hook.sh" <<HOOK
+#!/usr/bin/env bash
+{
+    echo "version=\$UPGRADE_GITLAB_VERSION"
+    echo "container=\$UPGRADE_GITLAB_CONTAINER"
+    echo "backup_dir=\$UPGRADE_GITLAB_BACKUP_DIR"
+} > "$HOOK_OUT"
+HOOK
+    chmod +x "$HOOK_DIR/hook.sh"
+    export UPGRADE_GITLAB_CONFIG_HOOK="$HOOK_DIR/hook.sh"
+
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Running post-config-backup hook"* ]]
+    [ -f "$HOOK_OUT" ]
+    grep -q "^version=17.11.3-ce.0" "$HOOK_OUT"
+    grep -q "^container=gitlab" "$HOOK_OUT"
+    # Hook receives the container-side BACKUP_DIR (use `docker cp` from there).
+    grep -q "^backup_dir=/var/opt/gitlab/backups$" "$HOOK_OUT"
+
+    rm -rf "$HOOK_DIR"
+    unset UPGRADE_GITLAB_CONFIG_HOOK
+}
+
+# ---------- Test 19: post-config-backup hook failure is non-fatal ----------
+@test "full-flow: post-config-backup hook failure logs warning but continues" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    HOOK_DIR=$(mktemp -d)
+    cat > "$HOOK_DIR/hook.sh" <<'HOOK'
+#!/usr/bin/env bash
+exit 13
+HOOK
+    chmod +x "$HOOK_DIR/hook.sh"
+    export UPGRADE_GITLAB_CONFIG_HOOK="$HOOK_DIR/hook.sh"
+
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"hook exited non-zero"* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+
+    rm -rf "$HOOK_DIR"
+    unset UPGRADE_GITLAB_CONFIG_HOOK
+}
+
+# ---------- Test 20: auto-discover upload-config.hook next to script ----------
+@test "full-flow: auto-discovers upload-config.hook next to script" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+
+    SCRIPT_DIR_TEST=$(mktemp -d)
+    cp "$PROJECT_ROOT/upgrade-gitlab" "$SCRIPT_DIR_TEST/upgrade-gitlab"
+    chmod +x "$SCRIPT_DIR_TEST/upgrade-gitlab"
+
+    HOOK_OUT="$SCRIPT_DIR_TEST/captured.env"
+    cat > "$SCRIPT_DIR_TEST/upload-config.hook" <<HOOK
+#!/usr/bin/env bash
+{
+    echo "auto_hook_ran=yes"
+    echo "script_dir=\$UPGRADE_GITLAB_SCRIPT_DIR"
+} > "$HOOK_OUT"
+HOOK
+    chmod +x "$SCRIPT_DIR_TEST/upload-config.hook"
+
+    unset UPGRADE_GITLAB_CONFIG_HOOK
+    run bash "$SCRIPT_DIR_TEST/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Auto-detected post-config-backup hook"* ]]
+    [ -f "$HOOK_OUT" ]
+    grep -q "^auto_hook_ran=yes" "$HOOK_OUT"
+    grep -q "^script_dir=$SCRIPT_DIR_TEST$" "$HOOK_OUT"
+
+    rm -rf "$SCRIPT_DIR_TEST"
+}
+
+# ---------- Test 21: warn when upload-config.hook exists but not executable ----------
+@test "full-flow: warns when sibling upload-config.hook is non-executable" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+
+    SCRIPT_DIR_TEST=$(mktemp -d)
+    cp "$PROJECT_ROOT/upgrade-gitlab" "$SCRIPT_DIR_TEST/upgrade-gitlab"
+    chmod +x "$SCRIPT_DIR_TEST/upgrade-gitlab"
+    echo "#!/bin/bash" > "$SCRIPT_DIR_TEST/upload-config.hook"
+    # intentionally NOT chmod +x
+
+    unset UPGRADE_GITLAB_CONFIG_HOOK
+    run bash "$SCRIPT_DIR_TEST/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"exists but is not executable"* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+
+    rm -rf "$SCRIPT_DIR_TEST"
+}
