@@ -1,7 +1,7 @@
 # upgrade-gitlab
 
-[![pipeline status](https://gitlab.com/unstable-code/upgrade-gitlab/badges/master/pipeline.svg)](https://gitlab.com/unstable-code/upgrade-gitlab/-/commits/master)
-[![coverage report](https://gitlab.com/unstable-code/upgrade-gitlab/badges/master/coverage.svg?job=integration-test)](https://gitlab.com/unstable-code/upgrade-gitlab/-/commits/master)
+[![pipeline status](https://gitlab.com/gitlab-useful-scripts/upgrade-gitlab/badges/master/pipeline.svg)](https://gitlab.com/gitlab-useful-scripts/upgrade-gitlab/-/commits/master)
+[![coverage report](https://gitlab.com/gitlab-useful-scripts/upgrade-gitlab/badges/master/coverage.svg?job=integration-test)](https://gitlab.com/gitlab-useful-scripts/upgrade-gitlab/-/commits/master)
 
 An automated upgrade script for Docker-based GitLab instances. Supports both CE and EE editions with safe, step-by-step version upgrades following the [official upgrade path](https://gitlab-com.gitlab.io/support/toolbox/upgrade-path/).
 
@@ -17,7 +17,10 @@ An automated upgrade script for Docker-based GitLab instances. Supports both CE 
 - **Signal safety** — Critical sections (container swap) defer SIGINT/SIGTERM/SIGTSTP/SIGHUP; `docker pull` is interruptible and auto-retries.
 - **Background pre-pull** — Downloads the next version image in the background while the current version stabilizes.
 - **Discord notifications** — Webhook alerts for upgrade progress, warnings, and errors. The completion message links to GitLab's "What is new since" page pre-filtered to the upgrade's previous version. Required in `-y` mode (unless `CI=true`) so fatal events are never silent.
-- **Automatic backup** — Creates a GitLab backup and copies `gitlab-secrets.json` and `gitlab.rb` before upgrading.
+- **Automatic backup** — Creates a GitLab backup and copies `gitlab-secrets.json` and `gitlab.rb` before upgrading. Old config copies are pruned with the same retention as `gitlab.rb`'s `backup_keep_time`, mirroring GitLab's own retention policy for the main `*.tar` files.
+- **Approximate upload progress** — During `Uploading backup archive to remote storage` (when GitLab's `backup_upload_*` is configured), shows an approximate `~%` derived from container egress bytes vs the assembled tar size. fog SDK's per-chunk open/close defeats exact tracking, so the percentage is explicitly marked with `~`.
+- **Post-config-backup hook** — Optional executable invoked after the config snapshots are made and pruned. Use it to ship `gitlab.rb` / `gitlab-secrets.json` to wherever you want (S3, GCS, Azure Blob, OpenStack Swift, Google Drive — or anywhere `docker run ...` can reach). See [`upload-config.hook.example`](upload-config.hook.example).
+- **Recovery on abnormal exit** — If the previous run left the container with a non-zero exit code, re-running the script at the already-installed version skips the backup and re-runs health, migration, and secrets checks instead of silently exiting "already satisfied".
 
 ## Requirements
 
@@ -96,23 +99,27 @@ EOS (end-of-support) versions are checked via GitLab releases API but not exhaus
 ```
 Pre-checks:
   1. Disk space validation (data + backup volumes)
-  2. Backup creation (gitlab-backup + secrets + config)
-  3. Secrets integrity baseline check
+  2. Backup creation (gitlab-backup) + copy gitlab.rb / gitlab-secrets.json
+  3. Prune old config copies via backup_keep_time
+  4. Optional post-config-backup hook (UPGRADE_GITLAB_CONFIG_HOOK)
+  5. Secrets integrity baseline check
 
 Edition switch (if CE -> EE):
-  4. Same-version edition migration
+  6. Same-version edition migration
 
 For each version in upgrade path:
-  5. Pre-pull next version image (background)
-  6. Health check + reconfigure current container
-  7. Container swap (stop -> rm -> pull -> run)
-  8. Wait for HTTP 200 + healthy status
-  9. Wait for background migrations to complete
-  10. Verify migration status (no 'down' states)
+  7. Pre-pull next version image (background)
+  8. Health check current container
+  9. Wait for background migrations to complete (with stuck detection)
+  10. Container swap (stop -> rm -> pull -> run)
+  11. Wait for HTTP 200 + healthy status
+  12. Wait for background migrations to complete (with stuck detection)
+  13. Verify migration status (no 'down' states)
 
 Post-upgrade:
-  11. Final health check (skip reconfigure)
-  12. Secrets integrity verification
+  14. Final health check
+  15. Secrets integrity verification
+  16. Resume any runners that were paused before the upgrade
 ```
 
 ## Signal Handling
@@ -127,12 +134,21 @@ Post-upgrade:
 
 ## Testing
 
-### Logic tests (BATS)
-
-Runs parameter parsing and upgrade path computation against mock data:
+### Lint
 
 ```bash
-bats tests/upgrade_path.bats
+shellcheck upgrade-gitlab
+```
+
+### BATS suites (mock-driven, no Docker required)
+
+```bash
+# All suites
+bats tests/
+
+# Single suite
+bats tests/upgrade_path.bats   # arg parsing + path resolution via --dry-run
+bats tests/full_flow.bats      # full upgrade flow against stateful mocks (incl. stuck-migration scenarios)
 ```
 
 ### Integration test (CI only)
@@ -141,10 +157,10 @@ Runs a real GitLab upgrade via Docker-in-Docker. Triggered by scheduled or manua
 
 ## Wiki
 
-For detailed guides, see the [project wiki](https://gitlab.com/unstable-code/upgrade-gitlab/-/wikis/home):
+For detailed guides, see the [project wiki](https://gitlab.com/gitlab-useful-scripts/upgrade-gitlab/-/wikis/home):
 
-- [Pre-upgrade Checklist](https://gitlab.com/unstable-code/upgrade-gitlab/-/wikis/Pre-upgrade-Checklist) — Manual steps to complete before running the script
-- [Troubleshooting](https://gitlab.com/unstable-code/upgrade-gitlab/-/wikis/Troubleshooting) — Solutions for DB migration failures and debugging tips
+- [Pre-upgrade Checklist](https://gitlab.com/gitlab-useful-scripts/upgrade-gitlab/-/wikis/Pre-upgrade-Checklist) — Manual steps to complete before running the script
+- [Troubleshooting](https://gitlab.com/gitlab-useful-scripts/upgrade-gitlab/-/wikis/Troubleshooting) — Solutions for DB migration failures and debugging tips
 
 ## License
 

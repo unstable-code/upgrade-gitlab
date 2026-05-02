@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**upgrade-gitlab** is an automated, Docker-based GitLab upgrade tool that performs safe, step-by-step version upgrades following the official GitLab upgrade path. Single bash script (`upgrade-gitlab`, ~2000 lines) supporting CE/EE editions with background migration tracking, stuck-migration detection, signal safety, and Discord notifications.
+**upgrade-gitlab** is an automated, Docker-based GitLab upgrade tool that performs safe, step-by-step version upgrades following the official GitLab upgrade path. Single bash script (`upgrade-gitlab`, ~2150 lines) supporting CE/EE editions with background migration tracking, stuck-migration detection, signal safety, and Discord notifications.
 
 Repository: `gitlab.com/gitlab-useful-scripts/upgrade-gitlab` (GitLab, not GitHub — use `glab` instead of `gh`)
 
@@ -56,6 +56,21 @@ Critical sections (`enter_critical`/`exit_critical`) defer SIGINT/SIGTERM/SIGTST
 3. Optional edition switch (CE→EE)
 4. Version upgrade loop: for each stop → pre-pull next image → wait for background migrations → swap container → health check → verify migrations
 5. Post-upgrade: final health check, resume paused runners
+
+### Recovery Path
+When `UPGRADE_POINTS_ARRAY` is empty (already at target) AND `_prev_exit != 0` (previous container exit was abnormal), the script skips backup and re-runs health/migration/secrets checks only. This is also the entry point exercised by integration-test's stuck-injection scenarios via `docker kill` (which sets ExitCode=137 so the next invocation enters the recovery path without a fresh backup).
+
+### Backup Progress Tracking
+A background `_size_poller` runs `docker exec` in a loop and writes per-tick lines to a tempfile: sizes of `*.tar.gz` staging files, size of the assembled `*_gitlab_backup.tar`, and total non-loopback `tx_bytes` from `/sys/class/net/*/statistics`. `run_with_progress_bar` consumes these to compute per-stage percentages:
+- `Dumping repositories` → `_total_project_count` vs `"completed create"` log lines
+- `Dumping uploads/builds/artifacts/lfs` → tar.gz size vs precomputed total from `project_statistics`
+- `Uploading backup archive to remote storage` → egress bytes since stage start vs final tar size, rendered with `~` prefix to indicate approximation (fog SDK's per-chunk open/close defeats FD-position tracking, so network bytes are the only viable signal)
+
+### Config Backup Lifecycle
+After GitLab's `.tar` backup (which GitLab handles + uploads itself if `backup_upload_*` is configured), the script:
+1. Copies `gitlab.rb` and `gitlab-secrets.json` into `BACKUP_DIR` with the `*-${VERSION}-backup` naming.
+2. Prunes old copies using `gitlab.rb`'s `backup_keep_time` (parsed with the same simple grep+awk+sed pattern as `backup_path`; missing/0 = keep forever, mirroring GitLab's own retention semantics for `.tar`).
+3. Optionally invokes a user hook (see `UPGRADE_GITLAB_CONFIG_HOOK` below). The hook receives the container-side `BACKUP_DIR` (host-path translation is intentionally left to the hook via `docker cp`, so the feature works regardless of mount topology). Hook failures warn but never abort the upgrade.
 
 ### TTY-Aware Output
 Terminal detected → animated spinners, progress bars with ETA. No terminal (CI) → plain text status.
