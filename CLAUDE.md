@@ -42,7 +42,7 @@ The entire tool is one bash script (`upgrade-gitlab`) with no external library d
 Single unified source: **path.json** provides required waypoints (major.minor stops), **Docker Hub** resolves each waypoint to its latest patch version and determines the overall latest tag. No `--source` flag, no freshness check, no interactive prompt.
 
 ### Signal Safety
-Critical sections (`enter_critical`/`exit_critical`) defer SIGINT/SIGTERM/SIGTSTP during container swap operations (stop → remove → pull → run). Ctrl+\\ (SIGQUIT) forces immediate exit.
+The whole post-confirmation flow (after pre-upgrade secrets check, through runner-resume) runs as a single `enter_critical`/`exit_critical` zone. Inside that zone, SIGINT/SIGTERM/SIGTSTP/SIGHUP set the `_interrupted` flag and return without exiting. Each upgrade-loop iteration begins with a flag check that breaks the loop early when set; post-upgrade verification (health, secrets, runner resume) then still runs, after which the script exits 130. The recovery branch (line 1782) opens its own short-lived critical zone with the same semantics. Ctrl+\\ (SIGQUIT) forces immediate exit at any time. `check_gitlab_server_healthy` no longer manages its own critical zone — it relies on the caller's outer zone.
 
 ### Stuck Migration Detection
 `_check_stuck_migrations` runs at the top of every `wait_for_background_migrations` call and scans `batched_background_migrations` for rows with `updated_at` older than 7 days. Routing by status:

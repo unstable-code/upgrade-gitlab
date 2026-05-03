@@ -55,15 +55,13 @@ _pull_signal_handler() {
 
 enter_critical() {
     _trap_active=1
-    echo "Entering critical section: only SIGQUIT (Ctrl+\\) or SIGKILL can interrupt." >&2
+    echo "Entering critical section: signals deferred until next safe checkpoint. SIGQUIT (Ctrl+\\) or SIGKILL forces immediate exit." >&2
 }
 exit_critical() {
     _trap_active=0
     echo "Exiting critical section." >&2
-    if [ "$_interrupted" -eq 1 ]; then
-        echo "Interrupted. Exiting at safe point." >&2
-        exit 130
-    fi
+    # _interrupted 처리는 main flow가 담당 — 여기서 exit 안 함.
+    # Loop iteration 끝/CE→EE 끝에서 break + post-upgrade 후 최종 exit code 결정.
 }
 
 pull_with_retry() {
@@ -870,8 +868,8 @@ wait_for_healthy() {
 
 check_gitlab_server_healthy() {
     local skip_reconfigure=${1:-0}
+    # caller (main flow / recovery branch)가 outer critical로 감싸고 있음.
     if docker exec "$CONTAINER_NAME" gitlab-ctl status; then
-        enter_critical
         if [ "$skip_reconfigure" -eq 0 ]; then
             run_with_bouncing_bar "Reconfigure" docker exec "$CONTAINER_NAME" gitlab-ctl reconfigure
         else
@@ -879,7 +877,6 @@ check_gitlab_server_healthy() {
         fi
         run_with_bouncing_bar "PG Upgrade" docker exec "$CONTAINER_NAME" gitlab-ctl pg-upgrade
         run_with_bouncing_bar "DB Migrate" docker exec "$CONTAINER_NAME" gitlab-rake db:migrate
-        exit_critical
         run_with_bouncing_bar "Status" docker exec "$CONTAINER_NAME" gitlab-ctl status || print_stacktrace_errors
     else
         print_stacktrace_errors
@@ -1785,13 +1782,18 @@ fi
 if [ ${#UPGRADE_POINTS_ARRAY[@]} -eq 0 ]; then
     if [ "${_prev_exit:-0}" -ne 0 ]; then
         echo "Resuming post-upgrade checks for $CURRENT_VERSION..."
+        enter_critical
         wait_for_http_ready "Recovery"
         wait_for_healthy "Recovery"
         wait_for_background_migrations
         check_migration_status
         check_gitlab_server_healthy 1
         check_secrets_integrity "post-upgrade"
+        exit_critical
         echo "WARNING: Previous run exited abnormally (exit code: $_prev_exit)"
+        if [ "$_interrupted" -eq 1 ]; then
+            exit 130
+        fi
     else
         echo "Requirements already satisfied: v$CURRENT_VERSION"
         if ! curl -sf -o /dev/null "$TARGET_URL/users/sign_in"; then
@@ -1963,6 +1965,10 @@ if ! check_secrets_integrity "pre-upgrade"; then
     fi
 fi
 
+# 약관 동의 + 백업 + 사전 검증을 모두 통과한 시점부터 끝까지를 단일 critical zone으로.
+# SIGINT/SIGTERM/SIGTSTP/SIGHUP은 deferred → 다음 안전 checkpoint(=각 iteration 끝, post-upgrade 끝)에서 처리.
+enter_critical
+
 # 에디션 전환 (같은 버전에서 CE → EE)
 if [ "$DETECTED_EDITION" != "$GITLAB_EDITION" ]; then
     echo "Switching edition at current version: $CURRENT_VERSION -> $EDITION_SWITCH_TAG"
@@ -1970,8 +1976,6 @@ if [ "$DETECTED_EDITION" != "$GITLAB_EDITION" ]; then
 
     wait_for_background_migrations
     check_gitlab_server_healthy 0
-
-    enter_critical
 
     if docker ps --format "{{.Names}}" | grep -q "^$CONTAINER_NAME$"; then
         echo "stopping $CURRENT_VERSION container..."
@@ -2001,8 +2005,6 @@ if [ "$DETECTED_EDITION" != "$GITLAB_EDITION" ]; then
     # shellcheck disable=SC2086
     docker run -d --name "$CONTAINER_NAME" $VOLUMES $PORTS "$GITLAB_IMAGE:$EDITION_SWITCH_TAG"
 
-    exit_critical
-
     wait_for_http_ready "$GITLAB_IMAGE:$EDITION_SWITCH_TAG"
     wait_for_healthy "$GITLAB_IMAGE:$EDITION_SWITCH_TAG"
 
@@ -2020,6 +2022,13 @@ fi
 index=1
 CNT_VERSION=$CURRENT_VERSION
 for ver in "${UPGRADE_POINTS_ARRAY[@]}"; do
+    # 안전 checkpoint: 이전 iteration 도중 또는 CE→EE 도중 SIGINT가 들어왔으면
+    # 새 버전 진입 안 하고 break, post-upgrade로 직행.
+    if [ "$_interrupted" -eq 1 ]; then
+        echo "Interrupted at safe checkpoint. Stopping upgrade loop. Running post-upgrade verification." >&2
+        break
+    fi
+
     send_discord_webhook "INFO" "GitLab server is upgrading now! ($index/${#UPGRADE_POINTS_ARRAY[@]})" "Please wait until upgrading process is done."
     echo "Updating $CNT_VERSION to $ver... ($index/${#UPGRADE_POINTS_ARRAY[@]})"
 
@@ -2038,8 +2047,6 @@ for ver in "${UPGRADE_POINTS_ARRAY[@]}"; do
 
     wait_for_background_migrations
     check_gitlab_server_healthy 0
-
-    enter_critical
 
     if docker ps --format "{{.Names}}" | grep -q "^$CONTAINER_NAME$"; then
         echo "stopping $CNT_VERSION container..."
@@ -2075,8 +2082,6 @@ for ver in "${UPGRADE_POINTS_ARRAY[@]}"; do
     # shellcheck disable=SC2086
     docker run -d --name "$CONTAINER_NAME" $VOLUMES $PORTS "$GITLAB_IMAGE:$ver"
 
-    exit_critical
-
     wait_for_http_ready "$GITLAB_IMAGE:$ver"
     wait_for_healthy "$GITLAB_IMAGE:$ver"
 
@@ -2106,6 +2111,15 @@ if [ -n "$PAUSED_RUNNER_IDS" ]; then
     docker exec "$CONTAINER_NAME" gitlab-psql -c "UPDATE ci_runners SET active = true WHERE id IN ($id_list);" > /dev/null
     echo "Resumed previously paused runners: $id_list"
     send_discord_webhook "NOTE" "Runners resumed" "IDs: $id_list"
+fi
+
+exit_critical
+
+# Interrupted 종료 처리 (RestartPolicy 변경, Discord NOTE는 정상 완료 시에만)
+if [ "$_interrupted" -eq 1 ]; then
+    echo "Upgrade was interrupted by user signal. Post-upgrade verification completed." >&2
+    send_discord_webhook "WARN" "Upgrade interrupted" "User signal received during upgrade. Post-upgrade verification completed; current version: $CURRENT_VERSION"
+    exit 130
 fi
 
 if [ "$auto_restart_enabled" == "$(docker inspect --format='{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER_NAME")" ] && [ "$auto_restart_enabled" == 'no' ]; then

@@ -124,13 +124,15 @@ Post-upgrade:
 
 ## Signal Handling
 
-| Signal | Normal | Critical Section | During Pull |
-|--------|--------|-----------------|-------------|
-| SIGINT (Ctrl+C) | Exit | Deferred | Restart pull |
-| SIGTERM | Exit | Deferred | Restart pull |
-| SIGTSTP (Ctrl+Z) | Exit | Deferred | Restart pull |
-| SIGHUP | Exit | Deferred | Restart pull |
-| SIGQUIT (Ctrl+\\) | Exit | Exit | Exit |
+The whole upgrade flow from the post-secrets-check point through runner-resume is a single critical zone. SIGINT/SIGTERM/SIGTSTP/SIGHUP inside that zone are deferred — set a flag and return; the script reaches the next safe checkpoint (start of next loop iteration) and breaks early, then still runs post-upgrade verification (final health check, secrets check, runner resume) before exiting 130. This means an aborted upgrade still leaves GitLab in a consistent, verified state at whichever version step had completed.
+
+| Signal | Outside critical (backup, prompts, RestartPolicy) | Inside critical (CE→EE, upgrade loop, post-upgrade) | During docker pull |
+|--------|---------------------------------------------------|-----------------------------------------------------|--------------------|
+| SIGINT (Ctrl+C) | Exit immediately | Deferred → finish current iteration → break loop → post-upgrade → exit 130 | Restart pull |
+| SIGTERM | Exit immediately | Deferred (same as SIGINT) | Restart pull |
+| SIGTSTP (Ctrl+Z) | Exit immediately | Deferred (same as SIGINT) | Restart pull |
+| SIGHUP | Exit immediately | Deferred (same as SIGINT) | Restart pull |
+| SIGQUIT (Ctrl+\\) | Exit immediately | Exit immediately (escape hatch) | Exit immediately |
 
 ## Testing
 
