@@ -308,3 +308,98 @@ HOOK
 
     rm -rf "$SCRIPT_DIR_TEST"
 }
+
+# ---------- Test 22: background-migration check skipped only when table truly absent ----------
+@test "full-flow: skips background migration check when table is genuinely absent (old version)" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_BBM_TABLE=missing
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    # Accurate "table not present (GitLab < 13.10)" wording, NOT the old generic one
+    [[ "$output" == *"table not present (GitLab < 13.10)"* ]]
+    [[ "$output" != *"table not available in this version"* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+}
+
+# ---------- Test 23: genuine secrets failure (findings, exit 0) is detected via row count ----------
+@test "full-flow: real doctor:secrets findings are detected from row count, not exit code" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_SECRETS=bad
+    # Rake exits 0 but reports "Total: 2 row(s) affected"; pre-upgrade check aborts in -y mode.
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"found 2 undecryptable row(s) (pre-upgrade)"* ]]
+    # The captured rake output is now shown (was hidden behind "review manually" before)
+    [[ "$output" == *"Total: 2 row(s) affected"* ]]
+    [[ "$output" == *"Aborted due to secrets integrity check failure"* ]]
+}
+
+# ---------- Test 24: transient post-restart secrets failure recovers via retry ----------
+@test "full-flow: incomplete doctor:secrets run retries until services are ready" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    # First 2 invocations fail WITHOUT 'Done!' (restart window), then succeed.
+    export MOCK_SECRETS=ok
+    export MOCK_SECRETS_CRASH_BEFORE=2
+    export _SECRETS_RETRY_SLEEP=0
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"retrying in 0s"* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+    # Must NOT have given up with a false failure
+    [[ "$output" != *"Secrets integrity check failed"* ]]
+}
+
+# ---------- Test 25: transient db:migrate:status failure recovers via retry ----------
+@test "full-flow: incomplete db:migrate:status retries until the status table appears" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    # First 2 status reads return no up/down table (restart window), then recover.
+    export MOCK_MIGRATE_STATUS_CRASH_BEFORE=2
+    export _MIGRATE_STATUS_RETRY_SLEEP=0
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Migration status not available yet"* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+    # Empty output must NOT be silently treated as a clean "0 down" result
+    [[ "$output" != *"could not read migration status after"* ]]
+}
+
+# ---------- Test 26: transient gitlab-ctl status flap does not skip reconfigure block ----------
+@test "full-flow: gitlab-ctl status gate retries instead of skipping reconfigure/migrate" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    # status fails twice (services still starting), then comes up.
+    export MOCK_CTL_STATUS_CRASH_BEFORE=2
+    export _HEALTH_STATUS_RETRY_SLEEP=0
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"gitlab-ctl status not ready yet"* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+}
+
+# ---------- Test 27: failed runner-count query is handled gracefully ----------
+@test "full-flow: runner table query failure warns and skips pause without crashing" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_RUNNER_QUERY_FAIL=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"could not query the runner table"* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+    # An empty count must not have triggered a bash "integer expression expected" error
+    [[ "$output" != *"integer expression expected"* ]]
+}
+
+# ---------- Test 28: missing backup_path falls back to GitLab default ----------
+@test "full-flow: empty backup_path parse falls back to the GitLab default dir" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_NO_BACKUP_PATH=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"using GitLab default /var/opt/gitlab/backups"* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+}

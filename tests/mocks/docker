@@ -14,6 +14,19 @@ MOCK_CONTAINER="gitlab"
 MOCK_IMAGE="gitlab/gitlab-${MOCK_EDITION}:${MOCK_GITLAB_VERSION}"
 MOCK_RUNNER_COUNT="${MOCK_RUNNER_COUNT:-0}"
 
+# _mock_crash_before <key> <threshold>: true (=still "crashing") for the first <threshold>
+# invocations keyed by <key>, then false. Used to simulate transient post-restart failures
+# that recover after a few retries. Requires MOCK_STATE_DIR.
+_mock_crash_before() {
+    local key=$1 threshold=$2 f c=0
+    [ -z "$threshold" ] && return 1
+    [ -z "$MOCK_STATE_DIR" ] && return 1
+    f="$MOCK_STATE_DIR/${key}_count"
+    [ -f "$f" ] && c=$(cat "$f")
+    c=$((c + 1)); echo "$c" > "$f"
+    [ "$c" -le "$threshold" ]
+}
+
 args="$*"
 
 case "$args" in
@@ -54,13 +67,20 @@ case "$args" in
         echo "external_url 'http://gitlab.test'"
         ;;
     *"exec"*"grep"*"backup_path"*)
+        # MOCK_NO_BACKUP_PATH=1 → gitlab.rb has no backup_path line at all (grep finds nothing).
+        if [ "${MOCK_NO_BACKUP_PATH:-0}" -eq 1 ]; then exit 1; fi
         echo "gitlab_rails['backup_path'] = \"/var/opt/gitlab/backups\""
         ;;
     # gitlab-psql: patterns must follow argument order in the expanded args string
     # e.g. "exec gitlab gitlab-psql -tAc SELECT COUNT(*) FROM ci_runners WHERE active = true;"
     #       → COUNT appears before ci_runners before active = true
     *"exec"*"gitlab-psql"*"information_schema"*)
-        echo "t"
+        # MOCK_BBM_TABLE=missing → table genuinely absent (old GitLab); fail → psql error.
+        case "${MOCK_BBM_TABLE:-present}" in
+            missing) echo "f" ;;
+            fail) exit 2 ;;
+            *) echo "t" ;;
+        esac
         ;;
     # Stuck migration detection query (uses INTERVAL clause).
     # Must come BEFORE the generic "job_class_name" pattern.
@@ -96,6 +116,7 @@ case "$args" in
         fi
         ;;
     *"exec"*"gitlab-psql"*"COUNT"*"ci_runners"*)
+        if [ "${MOCK_RUNNER_QUERY_FAIL:-0}" -eq 1 ]; then exit 1; fi
         echo "$MOCK_RUNNER_COUNT"
         ;;
     *"exec"*"gitlab-psql"*"UPDATE"*)
@@ -145,10 +166,49 @@ case "$args" in
         exit 0
         ;;
     *"exec"*"gitlab-ctl status"*)
+        if _mock_crash_before ctl_status "${MOCK_CTL_STATUS_CRASH_BEFORE:-}"; then
+            echo "run: puma: (pid 0) not running" >&2
+            exit 1
+        fi
         exit 0
         ;;
     *"exec"*"gitlab-rake"*"db:migrate:status"*)
+        if _mock_crash_before migrate_status "${MOCK_MIGRATE_STATUS_CRASH_BEFORE:-}"; then
+            # task failed to boot → no status table (up/down rows) in output
+            echo "rails aborted! ActiveRecord::ConnectionNotEstablished"
+            exit 1
+        fi
         echo "  up  20240101  TestMigration"
+        ;;
+    *"exec"*"gitlab-rake"*"gitlab:doctor:secrets"*)
+        # MOCK_SECRETS=ok|bad ; MOCK_SECRETS_CRASH_BEFORE=N (state-counted) makes the first N
+        # invocations exit non-zero WITHOUT "Done!" (restart-window transient), then succeed —
+        # exercises check_secrets_integrity's retry-until-complete path.
+        if [ -n "$MOCK_STATE_DIR" ] && [ -n "${MOCK_SECRETS_CRASH_BEFORE:-}" ]; then
+            _sc=0
+            [ -f "$MOCK_STATE_DIR/secrets_call_count" ] && _sc=$(cat "$MOCK_STATE_DIR/secrets_call_count")
+            _sc=$((_sc + 1))
+            echo "$_sc" > "$MOCK_STATE_DIR/secrets_call_count"
+            if [ "$_sc" -le "${MOCK_SECRETS_CRASH_BEFORE}" ]; then
+                echo "rails aborted! PG::ConnectionBad: could not connect to server: Connection refused"
+                exit 1
+            fi
+        fi
+        # Real GitLab behavior: doctor:secrets logs failures but ALWAYS exits 0 + prints "Done!".
+        # Integrity is judged from the "Total: N row(s) affected" line, not the exit code.
+        case "${MOCK_SECRETS:-ok}" in
+            bad)
+                echo "I, [ts #1]  INFO -- : - User failures: 2"
+                echo "I, [ts #1]  INFO -- : Total: 2 row(s) affected"
+                echo "I, [ts #1]  INFO -- : Done!"
+                exit 0
+                ;;
+            *)
+                echo "I, [ts #1]  INFO -- : Total: 0 row(s) affected"
+                echo "I, [ts #1]  INFO -- : Done!"
+                exit 0
+                ;;
+        esac
         ;;
     *"exec"*"gitlab-rake"*)
         exit 0

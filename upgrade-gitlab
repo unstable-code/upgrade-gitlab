@@ -475,20 +475,53 @@ check_disk_space() {
 check_secrets_integrity() {
     local phase=$1
     echo "Verifying secrets integrity ($phase)..."
-    # gitlab:doctor:secrets 는 GitLab 13.1 이상에서만 사용 가능
-    local output
-    output=$(run_with_bouncing_bar "Secrets Check" docker exec "$CONTAINER_NAME" gitlab-rake gitlab:doctor:secrets 2>&1)
-    local rc=$?
-    if [ $rc -ne 0 ]; then
+    # gitlab:doctor:secrets 는 GitLab 13.1 이상에서만 사용 가능.
+    #
+    # 주의: 이 task는 복호화 실패를 발견해도 예외/비-0 종료를 하지 않는다. 실패 건수를 로그로만
+    # 남기고 항상 "Done!"을 찍으며 exit 0 한다 (lib/gitlab/doctor/secrets.rb 의 run!).
+    # 따라서 비-0 종료(+ "Done!" 부재)는 "복호화 실패"가 아니라 "task가 부팅/연결 단계에서 죽어
+    # 완주하지 못함"을 뜻한다(gitlab-ctl restart/pg-upgrade 직후 Rails/DB/Redis 미준비 등).
+    # → 완주 여부는 (exit 0 || "Done!")로 판단해 미완주면 재시도하고,
+    #   실제 무결성은 완주한 출력의 "Total: N row(s) affected" 값으로 판정한다.
+    local output rc attempt=0 affected
+    local max_attempts=4
+    local retry_sleep=${_SECRETS_RETRY_SLEEP:-15}
+    while :; do
+        output=$(run_with_bouncing_bar "Secrets Check" docker exec "$CONTAINER_NAME" gitlab-rake gitlab:doctor:secrets 2>&1)
+        rc=$?
+
         if echo "$output" | grep -q "Don't know how to build task"; then
             echo "Skipping secrets integrity check ($phase): task not available in this version" >&2
             return 0
         fi
-        echo "Warning: Secrets integrity check failed ($phase). Please review manually." >&2
-        send_discord_webhook "WARN" "Secrets check failed ($phase)" "Run gitlab-rake gitlab:doctor:secrets"
-        return 1
-    fi
-    return 0
+
+        # task가 완주했는가? (정상 종료 또는 "Done!" 출력)
+        if [ "$rc" -eq 0 ] || echo "$output" | grep -q "Done!"; then
+            affected=$(printf '%s\n' "$output" | sed -n 's/.*Total:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*row(s) affected.*/\1/p' | tail -n1)
+            if [ -n "$affected" ] && [ "$affected" -gt 0 ] 2>/dev/null; then
+                echo "Warning: Secrets integrity check found ${affected} undecryptable row(s) ($phase). Please review manually." >&2
+                echo "----- gitlab:doctor:secrets output (last 20 lines) -----" >&2
+                printf '%s\n' "$output" | tail -n 20 >&2
+                echo "-------------------------------------------------------" >&2
+                send_discord_webhook "WARN" "Secrets check found ${affected} affected row(s) ($phase)" "Run gitlab-rake gitlab:doctor:secrets"
+                return 1
+            fi
+            return 0
+        fi
+
+        # 완주 못 함 → restart 직후 일시 장애 가능성, 서비스 기동 시간을 두고 재시도
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge "$max_attempts" ]; then
+            echo "Warning: secrets check could not complete after ${max_attempts} attempts ($phase); service may still be unavailable. Re-run 'gitlab-rake gitlab:doctor:secrets' manually." >&2
+            echo "----- last attempt output (last 20 lines) -----" >&2
+            printf '%s\n' "$output" | tail -n 20 >&2
+            echo "-----------------------------------------------" >&2
+            send_discord_webhook "WARN" "Secrets check did not complete ($phase)" "Run gitlab-rake gitlab:doctor:secrets"
+            return 1
+        fi
+        echo "Secrets check did not complete (services may still be starting after restart); retrying in ${retry_sleep}s... (attempt ${attempt}/${max_attempts})" >&2
+        sleep "$retry_sleep"
+    done
 }
 
 _STUCK_THRESHOLD_DAYS=7
@@ -713,13 +746,31 @@ _check_stuck_migrations() {
 }
 
 wait_for_background_migrations() {
-    # batched_background_migrations 테이블은 GitLab 13.10 이상에서만 존재
-    local table_exists
-    table_exists=$(docker exec "$CONTAINER_NAME" gitlab-psql -tAc \
-        "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'batched_background_migrations');" \
-        2>/dev/null | tr -d '[:space:]')
-    if [ "$table_exists" != "t" ]; then
-        echo "Skipping background migration check: table not available in this version"
+    # batched_background_migrations 테이블은 GitLab 13.10 이상에서만 존재.
+    # 단, 쿼리 자체가 실패(컨테이너 start/swap 직후 PostgreSQL이 아직 연결을 받지 못하거나
+    # pg-upgrade로 PG가 잠시 내려간 상태 등)하면 빈 값이 돌아오는데, 이를 "테이블 없음(구버전)"과
+    # 혼동해 검사를 통째로 스킵하면 안 된다. psql이 성공적으로 t/f를 돌려줄 때까지 짧게 재시도하고,
+    # 명시적으로 f(=테이블 없음)일 때만 스킵한다.
+    local table_exists rc attempt=0
+    while :; do
+        table_exists=$(docker exec "$CONTAINER_NAME" gitlab-psql -tAc \
+            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'batched_background_migrations');" \
+            2>/dev/null)
+        rc=$?
+        table_exists=${table_exists//[[:space:]]/}
+        if [ "$rc" -eq 0 ] && { [ "$table_exists" = "t" ] || [ "$table_exists" = "f" ]; }; then
+            break
+        fi
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge 45 ]; then
+            echo "Warning: batched_background_migrations table query did not succeed after ${attempt} attempts (database not reachable?). Skipping background migration check." >&2
+            return 0
+        fi
+        sleep 2
+    done
+
+    if [ "$table_exists" = "f" ]; then
+        echo "Skipping background migration check: batched_background_migrations table not present (GitLab < 13.10)"
         return 0
     fi
 
@@ -824,13 +875,32 @@ wait_for_background_migrations() {
 }
 
 check_migration_status() {
-    local migrate_output
-    migrate_output=$(run_with_bouncing_bar "Migration Status" docker exec "$CONTAINER_NAME" gitlab-rake db:migrate:status 2>/dev/null)
+    # db:migrate:status 도 restart/swap 직후엔 일시적으로 실패해 빈 출력을 낼 수 있다.
+    # 빈 출력을 "down 0건"으로 오인하면 실제 문제를 놓치므로(=false negative), 상태 테이블
+    # (up/down 행)이 실제로 나올 때까지 짧게 재시도한 뒤 down 개수를 센다.
+    local migrate_output attempt=0
+    local max_attempts=4
+    local retry_sleep=${_MIGRATE_STATUS_RETRY_SLEEP:-15}
+    while :; do
+        migrate_output=$(run_with_bouncing_bar "Migration Status" docker exec "$CONTAINER_NAME" gitlab-rake db:migrate:status 2>/dev/null)
+        if printf '%s\n' "$migrate_output" | grep -qE '^[[:space:]]*(up|down)[[:space:]]'; then
+            break
+        fi
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge "$max_attempts" ]; then
+            echo "Warning: could not read migration status after ${max_attempts} attempts (service may still be starting). Re-run 'gitlab-rake db:migrate:status' manually." >&2
+            send_discord_webhook "WARN" "Migration status unavailable" "Could not read db:migrate:status after upgrade"
+            return 0
+        fi
+        echo "Migration status not available yet (service may still be starting); retrying in ${retry_sleep}s... (attempt ${attempt}/${max_attempts})" >&2
+        sleep "$retry_sleep"
+    done
+
     local down_count
-    down_count=$(echo "$migrate_output" | grep -c "^\s*down")
+    down_count=$(printf '%s\n' "$migrate_output" | grep -c "^[[:space:]]*down")
     if [ "$down_count" -gt 0 ]; then
         echo "Warning: $down_count migration(s) in 'down' state detected" >&2
-        echo "$migrate_output" | grep "^\s*down" >&2
+        printf '%s\n' "$migrate_output" | grep "^[[:space:]]*down" >&2
         send_discord_webhook "WARN" "Migration status issue" "$down_count migration(s) in down state"
     fi
 }
@@ -869,18 +939,29 @@ wait_for_healthy() {
 check_gitlab_server_healthy() {
     local skip_reconfigure=${1:-0}
     # caller (main flow / recovery branch)가 outer critical로 감싸고 있음.
-    if docker exec "$CONTAINER_NAME" gitlab-ctl status; then
-        if [ "$skip_reconfigure" -eq 0 ]; then
-            run_with_bouncing_bar "Reconfigure" docker exec "$CONTAINER_NAME" gitlab-ctl reconfigure
-        else
-            run_with_bouncing_bar "Restart" docker exec "$CONTAINER_NAME" gitlab-ctl restart
+    # gitlab-ctl status는 서비스가 다 뜨기 전엔 일시적으로 비-0일 수 있다. 컨테이너는 살아있는데
+    # 한 번의 status 실패로 reconfigure/pg-upgrade/db:migrate를 통째로 건너뛰지 않도록 짧게 재시도하고,
+    # 끝까지 실패할 때만 print_stacktrace_errors(컨테이너가 실제로 죽었으면 exit 1)로 넘긴다.
+    local attempt=0 max_attempts=5
+    local retry_sleep=${_HEALTH_STATUS_RETRY_SLEEP:-15}
+    while ! docker exec "$CONTAINER_NAME" gitlab-ctl status > /dev/null 2>&1; do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge "$max_attempts" ]; then
+            print_stacktrace_errors
+            return
         fi
-        run_with_bouncing_bar "PG Upgrade" docker exec "$CONTAINER_NAME" gitlab-ctl pg-upgrade
-        run_with_bouncing_bar "DB Migrate" docker exec "$CONTAINER_NAME" gitlab-rake db:migrate
-        run_with_bouncing_bar "Status" docker exec "$CONTAINER_NAME" gitlab-ctl status || print_stacktrace_errors
+        echo "gitlab-ctl status not ready yet (services may still be starting); retrying in ${retry_sleep}s... (attempt ${attempt}/${max_attempts})" >&2
+        sleep "$retry_sleep"
+    done
+
+    if [ "$skip_reconfigure" -eq 0 ]; then
+        run_with_bouncing_bar "Reconfigure" docker exec "$CONTAINER_NAME" gitlab-ctl reconfigure
     else
-        print_stacktrace_errors
+        run_with_bouncing_bar "Restart" docker exec "$CONTAINER_NAME" gitlab-ctl restart
     fi
+    run_with_bouncing_bar "PG Upgrade" docker exec "$CONTAINER_NAME" gitlab-ctl pg-upgrade
+    run_with_bouncing_bar "DB Migrate" docker exec "$CONTAINER_NAME" gitlab-rake db:migrate
+    run_with_bouncing_bar "Status" docker exec "$CONTAINER_NAME" gitlab-ctl status || print_stacktrace_errors
 }
 
 print_stacktrace_errors() {
@@ -913,8 +994,9 @@ if ! docker ps --format "{{.Names}}" | grep -q "^$CONTAINER_NAME$"; then
     wait_for_healthy "GitLab server"
 fi
 
-CURRENT_VERSION=$(docker exec "$CONTAINER_NAME" dpkg -l | grep gitlab | awk '{ print $3 }')
+CURRENT_VERSION=$(docker exec "$CONTAINER_NAME" dpkg -l 2>/dev/null | awk '/^ii/ && $2 ~ /^gitlab-(ce|ee)$/ { print $3 }' | head -n1)
 if [ -z "$CURRENT_VERSION" ]; then
+    echo "Error: could not determine current GitLab version (dpkg query failed or gitlab-ce/gitlab-ee package not found in container)." >&2
     exit 1
 fi
 
@@ -1826,14 +1908,21 @@ echo -e "\t- I checked gitlab external_url in gitlab.rb file: $(docker exec "$CO
 echo -e "\t- I checked gitlab backup_path in gitlab.rb file: $(docker exec "$CONTAINER_NAME" grep "'backup_path'" /etc/gitlab/gitlab.rb | awk -F"=" '{print $2}' | sed 's/\"//g' | sed 's/^ //')"
 PAUSED_RUNNER_IDS=""
 active_runners=0
-if [ "$(docker exec "$CONTAINER_NAME" gitlab-psql -tAc "SELECT COUNT(*) FROM ci_runners;")" -eq 0 ]; then
+total_runners=$(docker exec "$CONTAINER_NAME" gitlab-psql -tAc "SELECT COUNT(*) FROM ci_runners;" 2>/dev/null | tr -d '[:space:]')
+if ! [[ "$total_runners" =~ ^[0-9]+$ ]]; then
+    # 쿼리 실패 시 빈 값을 "러너 0개"로 오인하지 않는다 — 알 수 없으므로 일시정지를 건너뛴다.
+    echo -e "\t- Warning: could not query the runner table (DB error); skipping runner pause. Verify runners manually." >&2
+    total_runners=0
+fi
+if [ "$total_runners" -eq 0 ]; then
     echo -e "\t- I checked this GitLab server has not configured any runners yet."
 else
     echo ''
     echo -e "\t- I checked this GitLab server is configured with the following runners:"
     docker exec "$CONTAINER_NAME" gitlab-psql -c "SELECT id, description, contacted_at, active FROM ci_runners ORDER BY id;"
     echo ''
-    active_runners=$(docker exec "$CONTAINER_NAME" gitlab-psql -tAc "SELECT COUNT(*) FROM ci_runners WHERE active = true;")
+    active_runners=$(docker exec "$CONTAINER_NAME" gitlab-psql -tAc "SELECT COUNT(*) FROM ci_runners WHERE active = true;" 2>/dev/null | tr -d '[:space:]')
+    [[ "$active_runners" =~ ^[0-9]+$ ]] || active_runners=0
     if [ "$active_runners" -gt 0 ]; then
         echo -e "\t- I checked $active_runners active runner(s) will be paused after I accept this notice (resumed after the upgrade)"
     fi
@@ -1908,7 +1997,13 @@ else
         fi
     fi
 fi
-BACKUP_DIR=$(docker exec "$CONTAINER_NAME" grep "'backup_path'" /etc/gitlab/gitlab.rb | awk -F"=" '{ print $2 }' | sed 's/\"//g' | sed 's/^ //')
+BACKUP_DIR=$(docker exec "$CONTAINER_NAME" grep "'backup_path'" /etc/gitlab/gitlab.rb 2>/dev/null | awk -F"=" '{ print $2 }' | sed 's/\"//g' | sed 's/^ //')
+if [ -z "$BACKUP_DIR" ]; then
+    # gitlab.rb에 backup_path 줄이 없으면 빈 값을 그대로 쓰지 않고 GitLab 기본 경로로 폴백한다
+    # (빈 값이면 cp 대상이 컨테이너 루트가 되고 hook에도 빈 경로가 전달됨).
+    BACKUP_DIR="/var/opt/gitlab/backups"
+    echo "Note: backup_path not found in gitlab.rb; using GitLab default $BACKUP_DIR for config snapshots."
+fi
 docker exec "$CONTAINER_NAME" sh -c "cp /etc/gitlab/gitlab-secrets.json $BACKUP_DIR/gitlab-secrets.json.${CURRENT_VERSION}-backup"
 docker exec "$CONTAINER_NAME" sh -c "cp /etc/gitlab/gitlab.rb $BACKUP_DIR/gitlab.rb.${CURRENT_VERSION}-backup"
 
