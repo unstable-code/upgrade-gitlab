@@ -1824,6 +1824,8 @@ echo -e "\t- I checked container PORTS: ${_ports:-not configured}"
 echo -e "\t- I checked container DRIVE: $(docker inspect "$CONTAINER_NAME" --format='{{range .Mounts}}{{.Source}}:{{.Destination}} {{end}}')"
 echo -e "\t- I checked gitlab external_url in gitlab.rb file: $(docker exec "$CONTAINER_NAME" grep '^external_url' /etc/gitlab/gitlab.rb | awk -F"'" '{print $2}')"
 echo -e "\t- I checked gitlab backup_path in gitlab.rb file: $(docker exec "$CONTAINER_NAME" grep "'backup_path'" /etc/gitlab/gitlab.rb | awk -F"=" '{print $2}' | sed 's/\"//g' | sed 's/^ //')"
+PAUSED_RUNNER_IDS=""
+active_runners=0
 if [ "$(docker exec "$CONTAINER_NAME" gitlab-psql -tAc "SELECT COUNT(*) FROM ci_runners;")" -eq 0 ]; then
     echo -e "\t- I checked this GitLab server has not configured any runners yet."
 else
@@ -1831,22 +1833,9 @@ else
     echo -e "\t- I checked this GitLab server is configured with the following runners:"
     docker exec "$CONTAINER_NAME" gitlab-psql -c "SELECT id, description, contacted_at, active FROM ci_runners ORDER BY id;"
     echo ''
-    PAUSED_RUNNER_IDS=""
     active_runners=$(docker exec "$CONTAINER_NAME" gitlab-psql -tAc "SELECT COUNT(*) FROM ci_runners WHERE active = true;")
     if [ "$active_runners" -gt 0 ]; then
-        echo "WARNING: $active_runners active runner(s) detected. Runners should be paused before upgrading."
-        if [ $auto_yes -eq 0 ]; then
-            echo -n "Pause runners automatically? (Y/n) > "
-            read -r runner_confirm < "$_tty"
-            if [ "$runner_confirm" == "n" ] || [ "$runner_confirm" == "N" ]; then
-                echo "Aborted. Pause runners in Admin > Runners, then re-run this script."
-                exit 1
-            fi
-        fi
-        echo "Pausing $active_runners active runner(s)..."
-        PAUSED_RUNNER_IDS=$(docker exec "$CONTAINER_NAME" gitlab-psql -tAc "SELECT id FROM ci_runners WHERE active = true;")
-        docker exec "$CONTAINER_NAME" gitlab-psql -c "UPDATE ci_runners SET active = false WHERE active = true;" > /dev/null
-        echo "Runners paused. They will be resumed after the upgrade."
+        echo -e "\t- I checked $active_runners active runner(s) will be paused after I accept this notice (resumed after the upgrade)"
     fi
 fi
 echo -e "\t- I checked TARGET_URL is valid: $TARGET_URL"
@@ -1860,6 +1849,23 @@ else
         echo 'User abort' >&2
         exit 1
     fi
+fi
+
+# 약관 동의 이후에만 runner를 일시정지한다 — 동의 거부 시 runner는 건드리지 않으므로
+# 조기 abort로 runner가 일시정지된 채 방치되는 일이 없다.
+if [ "$active_runners" -gt 0 ]; then
+    if [ $auto_yes -eq 0 ]; then
+        echo -n "Pause runners automatically? (Y/n) > "
+        read -r runner_confirm < "$_tty"
+        if [ "$runner_confirm" == "n" ] || [ "$runner_confirm" == "N" ]; then
+            echo "Aborted. Pause runners in Admin > Runners, then re-run this script."
+            exit 1
+        fi
+    fi
+    echo "Pausing $active_runners active runner(s)..."
+    PAUSED_RUNNER_IDS=$(docker exec "$CONTAINER_NAME" gitlab-psql -tAc "SELECT id FROM ci_runners WHERE active = true;")
+    docker exec "$CONTAINER_NAME" gitlab-psql -c "UPDATE ci_runners SET active = false WHERE active = true;" > /dev/null
+    echo "Runners paused. They will be resumed after the upgrade."
 fi
 
 send_discord_webhook "NOTE" "Updating GitLab now!" "GitLab will be upgraded from $CURRENT_VERSION to ${UPGRADE_POINTS_ARRAY[-1]}"
