@@ -75,14 +75,13 @@ integration-test:
       CAP_LATEST=$(echo "$TAGS" \
         | jq -r --argjson maj "$CAP_MAJOR" '[.results[].name | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-'${GITLAB_EDITION}'\\.0$")) | select((split(".")[0] | tonumber) == $maj)] | sort_by(split(".") | map(split("-")[0]) | map(tonumber)) | reverse | .[0]')
       CAP_MINOR=$(echo "$CAP_LATEST" | cut -d. -f2)
-      # Start one minor below the capped target (N-1 = a single real hop). Multi-step path
-      # resolution is already covered by the bats suite, and the integration-test timeout is
-      # tight, so one hop is enough to exercise the real swap/reconfigure/migration flow.
-      N1_MINOR=$((CAP_MINOR - 1))
+      # Start two minors below the capped target (N-2 = two real hops), preserving the original
+      # multi-step integration coverage now that the target is locked to major ${CAP_MAJOR}.
+      N2_MINOR=$((CAP_MINOR - 2))
       START_TAG=$(echo "$TAGS" \
-        | jq -r --arg prefix "${CAP_MAJOR}.${N1_MINOR}." \
+        | jq -r --arg prefix "${CAP_MAJOR}.${N2_MINOR}." \
           '[.results[].name | select(startswith($prefix))] | sort_by(split(".") | map(split("-")[0]) | map(tonumber)) | reverse | .[0]')
-      echo "Capped target (major ${CAP_MAJOR}): $CAP_LATEST / Starting from N-1: $START_TAG"
+      echo "Capped target (major ${CAP_MAJOR}): $CAP_LATEST / Starting from N-2: $START_TAG"
       docker run -d --name gitlab \
         --hostname gitlab.test \
         -v gitlab-config:/etc/gitlab \
