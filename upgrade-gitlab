@@ -1483,7 +1483,9 @@ run_with_progress_bar() {
             "Uploading backup archive to remote storage"*)
                 # fog SDK가 chunk마다 file을 open/close해서 FD-기반 추적이 불가능하므로
                 # 컨테이너 egress 누적 바이트와 tar 크기 비율로 근사 (~ prefix로 명시).
-                # ambient 트래픽(exporter, sidekiq)은 보통 GB급 업로드 대비 노이즈 < 1%.
+                # ambient 트래픽(exporter, sidekiq, 백업과 겹쳐 도는 첫 이미지 사전 Pull의 TCP ACK 등)은
+                # 노이즈 원천이나 보통 GB급 업로드 대비 < 1%다. 사전 Pull은 다운로드(rx) 위주라 egress엔
+                # ACK만 보태고, 대개 이 마지막 업로드 단계가 시작되기 전에 끝나 겹침 자체가 드물다.
                 display_label="Backup: Uploading to remote storage"
                 if [ "$upload_target_size" -gt 0 ]; then
                     local now_tx sent
@@ -2023,6 +2025,16 @@ echo "Creating backups for $CURRENT_VERSION. Please wait until backup process is
 if [ $skip_lfs -eq 1 ]; then
     echo "Note: LFS objects will be skipped during backup (--skip-lfs)."
 fi
+
+# 1번째 iteration(또는 CE→EE swap) 대상 이미지를 백업과 동시에 사전 Pull.
+# 백업(특히 backup_upload_* 원격 전송)은 보통 I/O 바운드라 docker pull과 거의 경합하지 않으므로
+# 이 겹침 구간은 사실상 공짜다. 루프 내 사전 Pull과 동일하게 PULL_PID를 쓰므로
+# _handle_signal의 기존 kill이 백업 중 SIGINT에도 그대로 적용된다(별도 처리 불필요).
+# 실패해도 무해 — swap 시 pull_with_retry가 어차피 foreground로 다시 받는다.
+PULL_PID=
+docker pull "$GITLAB_IMAGE:${UPGRADE_POINTS_ARRAY[0]}" &> /dev/null &
+PULL_PID=$!
+
 _query_backup_stats
 if docker exec "$CONTAINER_NAME" which gitlab-backup &>/dev/null; then
     if [ "$_backup_stats_available" -eq 1 ]; then
@@ -2120,6 +2132,12 @@ if ! check_secrets_integrity "pre-upgrade"; then
         echo "Aborted due to secrets integrity check failure." >&2
         exit 1
     fi
+fi
+
+# 백업과 겹쳐 돌던 첫 이미지 사전 Pull 완료 대기 (critical zone 진입 전, 루프와 PULL_PID 겹치지 않게 clear).
+if [ -n "$PULL_PID" ]; then
+    wait "$PULL_PID" 2>/dev/null || true
+    PULL_PID=
 fi
 
 # 약관 동의 + 백업 + 사전 검증을 모두 통과한 시점부터 끝까지를 단일 critical zone으로.
