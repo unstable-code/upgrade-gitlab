@@ -979,11 +979,17 @@ print_stacktrace_errors() {
 
         if echo "$logs" | grep -q "Removed configurations found in gitlab.rb"; then
             # 메이저 업그레이드에서 제거된 설정 키 때문에 reconfigure가 중단된 경우.
-            # 백업 복원이 아니라 gitlab.rb에서 해당 키를 지우고 재실행하는 것이 정답이다.
-            echo 'Reconfigure aborted: gitlab.rb contains configuration keys removed in this GitLab version.' >&2
-            echo 'This is NOT fixed by restoring a backup. Remove the keys reported above from gitlab.rb' >&2
-            echo '(e.g. GitLab 19.0 removed bundled Mattermost — delete all mattermost[...] lines), then re-run this script.' >&2
-            send_discord_webhook "ERR" "Reconfigure aborted: removed config keys" "Remove the deprecated keys from gitlab.rb, then re-run."
+            # 백업 복원이 아니라 해당 키를 제거하고 재실행하는 것이 정답이다. GitLab 19.0의 번들
+            # Mattermost 제거가 대표 사례인데, 트리거는 보통 gitlab.rb가 아니라 gitlab-secrets.json에
+            # 자동 생성된 mattermost 섹션이다(미사용 stock 설치도 영향받음).
+            echo 'Reconfigure aborted: configuration keys removed in this GitLab version are still present.' >&2
+            echo 'This is NOT fixed by restoring a backup. For GitLab 19.0 (bundled Mattermost removed):' >&2
+            echo '  1) remove the "mattermost" section from /etc/gitlab/gitlab-secrets.json' >&2
+            echo '     (it is auto-generated even if you never used bundled Mattermost),' >&2
+            echo '  2) delete any mattermost[...] lines from gitlab.rb,' >&2
+            echo '  then re-run this script. If you DID use bundled Mattermost, migrate it to a standalone' >&2
+            echo '  server first: https://docs.gitlab.com/integration/mattermost/' >&2
+            send_discord_webhook "ERR" "Reconfigure aborted: removed config keys" "Remove the 'mattermost' section from gitlab-secrets.json (and mattermost[...] from gitlab.rb), then re-run."
         else
             # shellcheck disable=SC2016
             echo 'upgrade-gitlab script does not recover this issue. Please restore previous backup with `gitlab-rake gitlab:backup:restore`' >&2

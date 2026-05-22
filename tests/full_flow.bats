@@ -416,7 +416,8 @@ HOOK
 Removed configurations found in gitlab.rb. Aborting reconfigure."
     run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
     [ "$status" -ne 0 ]
-    [[ "$output" == *"Remove the keys reported above"* ]]
+    # Accurate guidance: the stock-install trigger lives in gitlab-secrets.json, not gitlab.rb
+    [[ "$output" == *"gitlab-secrets.json"* ]]
     [[ "$output" == *"mattermost"* ]]
     # Must NOT give the misleading restore-backup advice for this failure mode
     [[ "$output" != *"restore previous backup"* ]]
