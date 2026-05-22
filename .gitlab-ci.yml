@@ -87,6 +87,12 @@ integration-test:
       '
       echo "GitLab is healthy."
     - |
+      # GitLab 19.0 removed bundled Mattermost: reconfigure hard-aborts ("Removed
+      # configurations found in gitlab.rb") if any active mattermost[...] key remains.
+      # Strip them up front, mirroring the documented 19.0 manual upgrade step, so the
+      # stock instance can cross the 19.0 boundary. (Comments are left untouched.)
+      docker exec gitlab sed -i -E "/^[[:space:]]*mattermost/d" /etc/gitlab/gitlab.rb || true
+    - |
       set -o pipefail
       kcov --include-pattern=/upgrade-gitlab/upgrade-gitlab coverage_output \
         ./upgrade-gitlab -y --no-step-limit --edition=ee \

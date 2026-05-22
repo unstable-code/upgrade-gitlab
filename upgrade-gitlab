@@ -972,13 +972,25 @@ print_stacktrace_errors() {
         _in_stacktrace=1
         echo -e "\nError: gitlab container died with the following status code: $(docker inspect --format='{{.State.ExitCode}}' "$CONTAINER_NAME")" >&2
 
-        docker logs --tail 200 "$CONTAINER_NAME" >&2
-        send_discord_webhook "ERR" "FATAL ERROR occurred!" "See: https://docs.gitlab.com/administration/backup_restore"
+        local logs
+        logs=$(docker logs --tail 200 "$CONTAINER_NAME" 2>&1)
+        echo "$logs" >&2
         echo -e '\e[1;5;37;41mFATAL ERROR: MANUAL INTERVENTION IS REQUIRED\e[0m' >&2
-        # shellcheck disable=SC2016
-        echo 'upgrade-gitlab script does not recover this issue. Please restore previous backup with `gitlab-rake gitlab:backup:restore`' >&2
-        echo 'For more information, please visit: https://docs.gitlab.com/administration/backup_restore' >&2
-        echo 'Troubleshooting guide: https://gitlab.com/unstable-code/upgrade-gitlab/-/wikis/Troubleshooting' >&2
+
+        if echo "$logs" | grep -q "Removed configurations found in gitlab.rb"; then
+            # 메이저 업그레이드에서 제거된 설정 키 때문에 reconfigure가 중단된 경우.
+            # 백업 복원이 아니라 gitlab.rb에서 해당 키를 지우고 재실행하는 것이 정답이다.
+            echo 'Reconfigure aborted: gitlab.rb contains configuration keys removed in this GitLab version.' >&2
+            echo 'This is NOT fixed by restoring a backup. Remove the keys reported above from gitlab.rb' >&2
+            echo '(e.g. GitLab 19.0 removed bundled Mattermost — delete all mattermost[...] lines), then re-run this script.' >&2
+            send_discord_webhook "ERR" "Reconfigure aborted: removed config keys" "Remove the deprecated keys from gitlab.rb, then re-run."
+        else
+            # shellcheck disable=SC2016
+            echo 'upgrade-gitlab script does not recover this issue. Please restore previous backup with `gitlab-rake gitlab:backup:restore`' >&2
+            echo 'For more information, please visit: https://docs.gitlab.com/administration/backup_restore' >&2
+            send_discord_webhook "ERR" "FATAL ERROR occurred!" "See: https://docs.gitlab.com/administration/backup_restore"
+        fi
+        echo 'Troubleshooting guide: https://gitlab.com/gitlab-useful-scripts/upgrade-gitlab/-/wikis/Troubleshooting' >&2
         if [ -z "$BACKUP_DIR" ]; then
             BACKUP_DIR=$(docker exec "$CONTAINER_NAME" grep "'backup_path'" /etc/gitlab/gitlab.rb 2>/dev/null | awk -F"=" '{ print $2 }' | sed 's/\"//g' | sed 's/^ //')
         fi

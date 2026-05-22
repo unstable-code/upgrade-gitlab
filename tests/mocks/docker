@@ -55,7 +55,7 @@ case "$args" in
         echo "443/tcp -> 443 80/tcp -> 80 22/tcp -> 22"
         ;;
     *"inspect"*"ExitCode"*)
-        echo "0"
+        echo "${MOCK_EXIT_CODE:-0}"
         ;;
     *"exec"*"dpkg -l"*)
         echo "ii  gitlab-${MOCK_EDITION}  ${MOCK_GITLAB_VERSION}  amd64  GitLab ${MOCK_EDITION^^}"
@@ -260,6 +260,8 @@ case "$args" in
         exit 0
         ;;
     *"logs"*)
+        # MOCK_LOGS lets tests feed container log content to print_stacktrace_errors.
+        [ -n "${MOCK_LOGS:-}" ] && printf '%s\n' "$MOCK_LOGS"
         exit 0
         ;;
     *)

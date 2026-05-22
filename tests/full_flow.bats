@@ -403,3 +403,21 @@ HOOK
     [[ "$output" == *"using GitLab default /var/opt/gitlab/backups"* ]]
     [[ "$output" == *"Successfully updated"* ]]
 }
+
+# ---------- Test 29: reconfigure abort on removed config keys gives accurate guidance ----------
+@test "full-flow: 'Removed configurations found' yields remove-keys guidance, not restore-backup" {
+    # Already at latest + abnormal previous exit → recovery path runs check_gitlab_server_healthy.
+    export MOCK_GITLAB_VERSION="18.0.1-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_EXIT_CODE=1                  # _prev_exit != 0 → recovery branch
+    export MOCK_CTL_STATUS_CRASH_BEFORE=99   # gitlab-ctl status never recovers → print_stacktrace_errors
+    export _HEALTH_STATUS_RETRY_SLEEP=0
+    export MOCK_LOGS="WARN: mattermost has been deprecated since 19.0 and was removed in 19.0.
+Removed configurations found in gitlab.rb. Aborting reconfigure."
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Remove the keys reported above"* ]]
+    [[ "$output" == *"mattermost"* ]]
+    # Must NOT give the misleading restore-backup advice for this failure mode
+    [[ "$output" != *"restore previous backup"* ]]
+}
