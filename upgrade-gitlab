@@ -1044,14 +1044,16 @@ _query_backup_stats() {
     _backup_stats_available=1
 }
 
-# _draw_backup_progress <label> <percentage> <tick>
-# Renders: [label] [###############·····························] 52%
+# _draw_backup_progress <label> <percentage> <tick> [approx] [extra]
+# Renders: [label] [###############·····························] 52% ETA 00:12:34
 # Label has a shimmer effect: a bright highlight wave scrolls left-to-right
+# <extra> (optional) is appended verbatim after the percentage (ETA text).
 _draw_backup_progress() {
     local label=$1
     local pct=$2
     local tick=$3
     local approx=${4:-0}
+    local extra=${5:-}
     local cols=${COLUMNS:-$(tput cols 2>/dev/null || stty size 2>/dev/null | awk '{print $2}' || echo 80)}
     local reset='\033[0m'
 
@@ -1066,6 +1068,7 @@ _draw_backup_progress() {
     else
         suffix=$(printf " %d%%" "$pct")
     fi
+    suffix+="$extra"
     # overhead: "[" label "]" " [" bar "]" suffix
     local overhead=$(( ${#label} + 5 + ${#suffix} ))
     local bar_length=$(( cols - overhead ))
@@ -1357,6 +1360,34 @@ run_with_bouncing_bar() {
     return $rc
 }
 
+# _fmt_duration <seconds>
+# Formats a duration as hh:mm:ss always (e.g. 00:30:27). The fixed-width 3-part shape
+# matches draw_progress' ETA and stays unambiguous — a 2-part "30:27" reads as either
+# 30m27s or 30h27m, "00:30:27" cannot be misread and never shifts width as hours grow.
+_fmt_duration() {
+    local total=$1
+    printf '%02d:%02d:%02d' "$(( total / 3600 ))" "$(( (total % 3600) / 60 ))" "$(( total % 60 ))"
+}
+
+# _backup_progress_extra <is_upload:0|1> <pct> <elapsed_seconds>
+# Builds the ETA suffix appended after the percentage in the backup bar, shown only
+# when pct is in (1,100) and elapsed >= 5s (avoids div-by-zero / wild early estimates).
+# ETA is derived from progress rate: eta = elapsed * (100 - pct) / pct.
+# Upload uses an approximate pct, so its ETA gets a ~ prefix matching the ~% it shows.
+_backup_progress_extra() {
+    local is_upload=$1 pct=$2 elapsed=$3
+    if [ "$pct" -le 1 ] || [ "$pct" -ge 100 ] || [ "$elapsed" -lt 5 ]; then
+        return
+    fi
+    local eta
+    eta=$(_fmt_duration $(( elapsed * (100 - pct) / pct )))
+    if [ "$is_upload" -eq 1 ]; then
+        printf ' ETA ~%s' "$eta"
+    else
+        printf ' ETA %s' "$eta"
+    fi
+}
+
 # run_with_progress_bar <label> <command...>
 # backup 전용: stage별 진행률 바를 표시하며 명령 실행
 run_with_progress_bar() {
@@ -1372,6 +1403,7 @@ run_with_progress_bar() {
     local repo_completed=0
     local upload_baseline_tx=0
     local upload_target_size=0
+    local stage_start=$SECONDS
 
     _start_size_poller
 
@@ -1397,9 +1429,10 @@ run_with_progress_bar() {
             current_stage="$detected_stage"
         fi
 
-        # 스테이지 전환 시점 처리: upload 진입 시 baseline tx_bytes + 최종 tar 크기 캡처
+        # 스테이지 전환 시점 처리: 스테이지 시작 시각 기록 + upload 진입 시 baseline tx_bytes/tar 크기 캡처
         if [ "$current_stage" != "$prev_stage" ]; then
             prev_stage="$current_stage"
+            stage_start=$SECONDS
             if [[ "$current_stage" == "Uploading backup archive to remote storage"* ]]; then
                 upload_baseline_tx=$(_get_current_tx_bytes)
                 upload_target_size=$(_get_current_tar_size "_gitlab_backup.tar")
@@ -1470,8 +1503,13 @@ run_with_progress_bar() {
         esac
 
         if [ "$pct" -ge 0 ]; then
+            # ETA 부가 정보 계산 (pct 캡 전 raw 값 사용; upload는 ~ 접두사)
+            local is_upload=0
+            [[ "$current_stage" == "Uploading backup archive to remote storage"* ]] && is_upload=1
+            local extra
+            extra=$(_backup_progress_extra "$is_upload" "$pct" "$(( SECONDS - stage_start ))")
             if [ "$pct" -gt 100 ]; then pct=100; fi
-            _draw_backup_progress "$display_label" "$pct" "$tick" "$approx"
+            _draw_backup_progress "$display_label" "$pct" "$tick" "$approx" "$extra"
         else
             _draw_bouncing_frame "$display_label" "$tick"
         fi
