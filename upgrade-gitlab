@@ -44,6 +44,16 @@ _handle_signal() {
 }
 trap _handle_signal SIGINT SIGTERM SIGTSTP SIGHUP
 
+# 임시 파일 레지스트리 — 비정상 종료(에러/시그널 후 exit)에도 새지 않도록 EXIT에서 일괄 정리.
+# 각 함수의 즉시 rm은 그대로 두고, 이 트랩은 누락분을 쓸어담는 안전망이다.
+_TMPFILES=()
+# shellcheck disable=SC2329
+_cleanup_tmpfiles() {
+    [ ${#_TMPFILES[@]} -gt 0 ] && rm -f "${_TMPFILES[@]}" 2>/dev/null
+    return 0
+}
+trap _cleanup_tmpfiles EXIT
+
 # shellcheck disable=SC2329
 _pull_signal_handler() {
     if [ -n "$_pull_pid" ]; then
@@ -1158,6 +1168,7 @@ _draw_bouncing_frame() {
 
 _start_size_poller() {
     _size_poller_file=$(mktemp)
+    _TMPFILES+=("$_size_poller_file")
     docker exec "$CONTAINER_NAME" sh -c '
         while true; do
             stat -c "%s %n" /var/opt/gitlab/backups/*.tar.gz 2>/dev/null
@@ -1277,6 +1288,7 @@ run_with_bouncing_bar() {
     local cmd=("$@")
     local tmpfile
     tmpfile=$(mktemp)
+    _TMPFILES+=("$tmpfile")
     local cols=${COLUMNS:-$(tput cols 2>/dev/null || stty size 2>/dev/null | awk '{print $2}' || echo 80)}
     local pos=0
     local direction=1
@@ -1396,6 +1408,7 @@ run_with_progress_bar() {
     local cmd=("$@")
     local tmpfile
     tmpfile=$(mktemp)
+    _TMPFILES+=("$tmpfile")
     local tick=0
     local last_line_count=0
     local current_stage=""
@@ -1548,6 +1561,7 @@ poll_with_bouncing_bar() {
     local cond=("$@")
     local tmpfile
     tmpfile=$(mktemp)
+    _TMPFILES+=("$tmpfile")
     local cols=${COLUMNS:-$(tput cols 2>/dev/null || stty size 2>/dev/null | awk '{print $2}' || echo 80)}
     local pos=0
     local direction=1
