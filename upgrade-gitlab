@@ -101,6 +101,27 @@ pull_with_retry() {
     trap _handle_signal SIGINT SIGTERM SIGTSTP SIGHUP
 }
 
+# 영속 상태 파일에 기록된 "우리가 일시정지한" 러너를 모두 재개하고 파일을 제거한다.
+# 정상 종료 경로와 recovery 경로가 공유한다. 파일이 source of truth이며,
+# 파일 기록이 실패했던 경우에 한해 이번 실행의 메모리 변수(PAUSED_RUNNER_IDS)로 폴백한다.
+# 멱등하다 — 파일이 없으면 rm -f만 수행하는 no-op이므로 어느 경로에서 불러도 안전하다.
+# shellcheck disable=SC2329
+_resume_paused_runners() {
+    local id_list=""
+    if [ -f "$_runner_state_file" ]; then
+        id_list=$(grep -E '^[0-9]+$' "$_runner_state_file" | tr '\n' ',' | sed 's/,$//')
+    fi
+    if [ -z "$id_list" ] && [ -n "${PAUSED_RUNNER_IDS:-}" ]; then
+        id_list=$(echo "$PAUSED_RUNNER_IDS" | tr -s '[:space:]' ',' | sed 's/^,//;s/,$//')
+    fi
+    if [ -n "$id_list" ]; then
+        docker exec "$CONTAINER_NAME" gitlab-psql -c "UPDATE ci_runners SET active = true WHERE id IN ($id_list);" > /dev/null
+        echo "Resumed previously paused runners: $id_list"
+        send_discord_webhook "NOTE" "Runners resumed" "IDs: $id_list"
+    fi
+    rm -f "$_runner_state_file"
+}
+
 if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
     echo "Usage: $0 [-y] [--edition=ce|ee] [--target-url=http] [--discord-url=http] [--version=0.0.0] [--skip-latest] [--skip-lfs] [--no-step-limit] [--dry-run] [--reset-stuck-finalizing] [--max-tier=core|starter|premium|ultimate]"
 
@@ -271,6 +292,20 @@ fi
 
 CONTAINER_NAME=$CONTAINER_CANDIDATES
 echo "Detected gitlab container: $CONTAINER_NAME"
+
+# 영속 러너 일시정지 상태 파일 — 업그레이드가 중간에 실패해도(스크립트 종료/컨테이너 사망)
+# 다음 실행이 "우리가 일시정지한" 러너를 정확히 되살릴 수 있도록 ID를 기록한다.
+# 메모리 변수 PAUSED_RUNNER_IDS는 프로세스가 죽으면 사라지므로 이 파일이 source of truth다.
+# 런타임 디렉터리(/var/run/user/$UID)를 우선 쓰고, 없거나 쓸 수 없으면 /var/run → /tmp로 폴백한다.
+# 모두 이미 존재하는 디렉터리라 별도 생성이 필요 없고 부수효과도 없다(dry-run에서도 무해).
+_runner_state_dir=/tmp
+for _d in "${XDG_RUNTIME_DIR:-/var/run/user/$UID}" /var/run /tmp; do
+    if [ -d "$_d" ] && [ -w "$_d" ]; then
+        _runner_state_dir="$_d"
+        break
+    fi
+done
+_runner_state_file="$_runner_state_dir/upgrade-gitlab-${CONTAINER_NAME}.paused-runners"
 
 # --------------------------
 # 에디션 자동 감지 (CE/EE)
@@ -1943,6 +1978,9 @@ if [ ${#UPGRADE_POINTS_ARRAY[@]} -eq 0 ]; then
         check_migration_status
         check_gitlab_server_healthy 1
         check_secrets_integrity "post-upgrade"
+        # 이전 실행이 일시정지한 러너가 방치되지 않도록 복원 — 이 recovery 경로는 정상
+        # end-of-upgrade 복원 지점에 도달하지 않으므로 여기서 명시적으로 되살린다.
+        _resume_paused_runners
         exit_critical
         echo "WARNING: Previous run exited abnormally (exit code: $_prev_exit)"
         if [ "$_interrupted" -eq 1 ]; then
@@ -1950,7 +1988,10 @@ if [ ${#UPGRADE_POINTS_ARRAY[@]} -eq 0 ]; then
         fi
     else
         echo "Requirements already satisfied: v$CURRENT_VERSION"
-        if ! curl -sf -o /dev/null "$TARGET_URL/users/sign_in"; then
+        if curl -sf -o /dev/null "$TARGET_URL/users/sign_in"; then
+            # 이전 실행이 일시정지한 러너가 남아 있으면 복원 (멱등; 파일 없으면 no-op)
+            _resume_paused_runners
+        else
             echo "NOTE: If your GitLab server does not work properly, please edit $(docker inspect "$CONTAINER_NAME" --format='{{range .Mounts}}{{.Source}}:{{.Destination}} {{end}}' | tr ' ' '\n' | grep /etc/gitlab | awk -F ':' '{ print $1 }')/gitlab.rb file or 'docker exec -it $CONTAINER_NAME /bin/bash && vi /etc/gitlab/gitlab.rb'"
         fi
     fi
@@ -2026,6 +2067,15 @@ if [ "$active_runners" -gt 0 ]; then
     echo "Pausing $active_runners active runner(s)..."
     PAUSED_RUNNER_IDS=$(docker exec "$CONTAINER_NAME" gitlab-psql -tAc "SELECT id FROM ci_runners WHERE active = true;")
     docker exec "$CONTAINER_NAME" gitlab-psql -c "UPDATE ci_runners SET active = false WHERE active = true;" > /dev/null
+    # 프로세스가 죽어도 다음 실행이 되살릴 수 있도록 일시정지한 ID를 영속 파일에 기록한다.
+    # 이전 실행이 남긴 잔여 ID와 합집합(sort -un)으로 병합 — > 리다이렉트가 먼저 truncate하지
+    # 않도록 기존 내용을 변수로 먼저 읽는다.
+    _prev_paused_state=""
+    [ -f "$_runner_state_file" ] && _prev_paused_state=$(cat "$_runner_state_file")
+    if ! printf '%s\n%s\n' "$_prev_paused_state" "$PAUSED_RUNNER_IDS" \
+        | grep -E '^[0-9]+$' | sort -un > "$_runner_state_file" 2>/dev/null; then
+        echo "Warning: could not persist runner pause-state to $_runner_state_file; resume will rely on this run staying alive." >&2
+    fi
     echo "Runners paused. They will be resumed after the upgrade."
 fi
 
@@ -2294,13 +2344,8 @@ check_gitlab_server_healthy 1
 # 최종 시크릿 무결성 확인
 check_secrets_integrity "post-upgrade"
 
-# 업그레이드 전 비활성화한 러너 복원
-if [ -n "$PAUSED_RUNNER_IDS" ]; then
-    id_list=$(echo "$PAUSED_RUNNER_IDS" | tr -s '[:space:]' ',' | sed 's/^,//;s/,$//')
-    docker exec "$CONTAINER_NAME" gitlab-psql -c "UPDATE ci_runners SET active = true WHERE id IN ($id_list);" > /dev/null
-    echo "Resumed previously paused runners: $id_list"
-    send_discord_webhook "NOTE" "Runners resumed" "IDs: $id_list"
-fi
+# 업그레이드 전 비활성화한 러너 복원 (영속 상태 파일이 기준; 메모리 변수는 폴백)
+_resume_paused_runners
 
 exit_critical
 

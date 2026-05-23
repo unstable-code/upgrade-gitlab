@@ -422,3 +422,58 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     # Must NOT give the misleading restore-backup advice for this failure mode
     [[ "$output" != *"restore previous backup"* ]]
 }
+
+# ---------- Test 30: recovery resumes runners from the persistent state file ----------
+@test "full-flow: recovery path resumes runners recorded in the persistent state file" {
+    # Already at latest + abnormal previous exit → recovery branch (no fresh backup).
+    # Simulates a prior run that paused runners then aborted before the end-of-upgrade resume.
+    export MOCK_GITLAB_VERSION="18.0.1-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_EXIT_CODE=137                    # _prev_exit != 0 → recovery branch
+    export XDG_RUNTIME_DIR=$(mktemp -d)         # state-dir override (runtime dir is preferred)
+    sf="$XDG_RUNTIME_DIR/upgrade-gitlab-gitlab.paused-runners"
+    printf '3\n7\n' > "$sf"
+
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Resuming post-upgrade checks"* ]]
+    [[ "$output" == *"Resumed previously paused runners: 3,7"* ]]
+    [ ! -f "$sf" ]                              # state file consumed after resume
+
+    rm -rf "$XDG_RUNTIME_DIR"
+}
+
+# ---------- Test 31: recovery without a state file is an idempotent no-op ----------
+@test "full-flow: recovery path without a state file does not resume any runner" {
+    export MOCK_GITLAB_VERSION="18.0.1-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_EXIT_CODE=137
+    export XDG_RUNTIME_DIR=$(mktemp -d)         # empty: no leftover state file
+
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Resuming post-upgrade checks"* ]]
+    # No file → must not touch runners we never paused (e.g. admin-paused ones).
+    [[ "$output" != *"Resumed previously paused runners"* ]]
+
+    rm -rf "$XDG_RUNTIME_DIR"
+}
+
+# ---------- Test 32: pause merges leftover IDs with newly paused runners (union) ----------
+@test "full-flow: pause merges leftover paused-runner IDs and resumes the union" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"   # 1-step upgrade
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_RUNNER_COUNT=2                   # SELECT id ... active=true → 1,2
+    export XDG_RUNTIME_DIR=$(mktemp -d)
+    sf="$XDG_RUNTIME_DIR/upgrade-gitlab-gitlab.paused-runners"
+    printf '9\n' > "$sf"                         # leftover from a prior aborted run
+
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    # union {9} ∪ {1,2}, sorted-unique = 1,2,9 → proves the file is merged AND used as source of truth
+    # (the in-memory fallback alone would yield only 1,2).
+    [[ "$output" == *"Resumed previously paused runners: 1,2,9"* ]]
+    [ ! -f "$sf" ]
+
+    rm -rf "$XDG_RUNTIME_DIR"
+}
