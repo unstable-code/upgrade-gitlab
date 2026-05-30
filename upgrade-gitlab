@@ -1730,6 +1730,189 @@ _check_eos() {
     fi
 }
 
+# --- 릴리즈 프리플라이트 (이슈 #11) ---
+# 확정 prompt 직전에 각 hop별 deprecation/removal/breaking-change h3을 노출하고,
+# 메이저 경계 hop에서는 새 기능 highlight도 함께 보여 사용자가 진입 여부를 판단할 수 있게 한다.
+# fetch 실패는 워닝만 띄우고 업그레이드 흐름은 그대로 진행한다 (path.json 처리와 같은 posture).
+
+# shellcheck disable=SC2329
+_decode_entities_stream() {
+    sed -e 's/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g; s/&#x27;/'\''/g; s/&#39;/'\''/g'
+}
+
+# 입력 HTML(stdin) → h3 평문 한 줄씩.
+# 19.x/18.x 릴리즈 페이지의 h3은 모두 `<h3 id=...>plain</h3>` 형태(중첩 태그 없음)라 단순 패턴으로 충분.
+# shellcheck disable=SC2329
+_extract_h3_titles() {
+    grep -oE '<h3[^>]*>[^<]+</h3>' \
+        | sed -E 's|^<h3[^>]*>||; s|</h3>$||' \
+        | _decode_entities_stream
+}
+
+# h3 평문(stdin)에서 "깨지는 변경" 후보만 통과시킨다.
+# 출처 페이지에 별도 "Deprecations" 섹션 헤더가 없어 제목 키워드로 식별. 마이너 페이지에서는
+# 매칭 0 (false-positive 없음) 확인 완료 (18.11).
+# shellcheck disable=SC2329
+_filter_breaking() {
+    grep -iE 'removed|discontinued|deprecat|minimum requirement|replaced by|breaking change|end of support|no longer (supported|available)' || true
+}
+
+# h3 평문(stdin)에서 "깨지는 변경"을 제외한 신기능 후보만 통과 (메이저 hop highlight 용).
+# shellcheck disable=SC2329
+_filter_features() {
+    grep -ivE 'removed|discontinued|deprecat|minimum requirement|replaced by|breaking change|end of support|no longer (supported|available)' || true
+}
+
+# 패치 릴리즈 URL 찾기. GitLab은 보통 같은 시점의 여러 패치(예: 18.11.3, 18.10.6, 18.9.7)를
+# 한 페이지로 묶고 URL은 그 중 최상위 패치 이름으로 짓는다. 따라서 단순 "버전이 URL에 박혔는지"가
+# 아니라 "엔트리 <title>에 우리 버전이 적혔는지"로 찾아야 18.10.6 같은 합본 묶임 케이스도 잡힌다.
+# 방어: (1) 본문(content)에 backreference로 적힌 옛 버전이 잘못 잡히지 않도록 <title>만 검사,
+#        (2) 버전 일치는 워드 경계([^0-9.])로 확인해서 "18.11.3"이 "18.11.30"의 부분문자열로 잘못
+#        잡히는 것 방지. 첫 record는 feed-level <title>이 entry <title>과 함께 있어 모든 <title>
+#        매치를 순회한다.
+# 입력: <version> <feed>; 출력: URL (없으면 빈 줄).
+# shellcheck disable=SC2329
+_find_patch_url() {
+    local target_ver=$1 feed=$2
+    printf '%s' "$feed" \
+        | awk -v v="$target_ver" '
+            BEGIN {
+                RS = "</entry>"
+                vesc = v
+                gsub(/\./, "\\.", vesc)
+                pat = "(^|[^0-9.])" vesc "([^0-9.]|$)"
+            }
+            {
+                text = $0
+                found = 0
+                while (match(text, /<title>[^<]+<\/title>/)) {
+                    title = substr(text, RSTART + 7, RLENGTH - 15)
+                    if (title ~ pat) { found = 1; break }
+                    text = substr(text, RSTART + RLENGTH)
+                }
+                if (found) print $0
+            }
+        ' \
+        | grep -oE 'https?://docs\.gitlab\.com/releases/patches/patch-release-gitlab-[0-9]+-[0-9]+-[0-9]+-released/' \
+        | head -1
+}
+
+# 패치 릴리즈 페이지(stdin)에서 CVE ID만 정렬/유니크.
+# shellcheck disable=SC2329
+_extract_cves() {
+    grep -oE 'CVE-[0-9]+-[0-9]+' | sort -u
+}
+
+# 메인: confirmation block 직전에 호출. UPGRADE_POINTS_ARRAY를 순회하며 hop별로 정보 출력.
+# shellcheck disable=SC2329
+release_preflight() {
+    local feed_url='https://docs.gitlab.com/releases/all-releases.xml'
+    local feed
+    feed=$(curl -sfL "$feed_url") || {
+        echo "Warning: could not fetch release feed; preflight skipped." >&2
+        return 0
+    }
+
+    echo
+    echo "Release preflight for upgrade path:"
+    local prev_major prev_minor prev_patch stop core maj min patch blog_url blog titles notes feats cves line is_major is_patch
+    local idx=0 fcount=0
+    prev_major=${CURRENT_VERSION%%.*}
+    prev_minor=$(echo "$CURRENT_VERSION" | awk -F'[.-]' '{print $2}')
+    prev_patch=$(echo "$CURRENT_VERSION" | awk -F'[.-]' '{print $3}')
+    local total=${#UPGRADE_POINTS_ARRAY[@]}
+
+    for stop in "${UPGRADE_POINTS_ARRAY[@]}"; do
+        idx=$((idx+1))
+        core=${stop%%-*}
+        maj=$(echo "$core" | awk -F. '{print $1}')
+        min=$(echo "$core" | awk -F. '{print $2}')
+        patch=$(echo "$core" | awk -F. '{print $3}')
+        is_major=0; is_patch=0
+        if [ "$maj" -gt "$prev_major" ]; then
+            is_major=1
+        elif [ "$maj" -eq "$prev_major" ] && [ "$min" -eq "$prev_minor" ]; then
+            is_patch=1
+        fi
+
+        printf '\n  Hop %d/%d: %s.%s.%s → %s.%s.%s' \
+            "$idx" "$total" "$prev_major" "$prev_minor" "$prev_patch" "$maj" "$min" "$patch"
+        [ "$is_major" -eq 1 ] && printf '  ⚠ MAJOR'
+        printf '\n'
+
+        if [ "$is_patch" -eq 1 ]; then
+            # 패치 hop: CVE/버그픽스 페이지로 라우팅. 합본 묶임 케이스(18.10.6 in 18.11.3 announcement)
+            # 때문에 URL은 _find_patch_url로 본문 검색해서 찾는다.
+            blog_url=$(_find_patch_url "${maj}.${min}.${patch}" "$feed")
+            if [ -z "$blog_url" ]; then
+                echo "    (patch release announcement not found in feed)"
+                prev_major=$maj; prev_minor=$min; prev_patch=$patch; continue
+            fi
+            blog=$(curl -sfL "$blog_url") || {
+                echo "    Warning: patch page fetch failed; full notes: $blog_url" >&2
+                prev_major=$maj; prev_minor=$min; prev_patch=$patch; continue
+            }
+            cves=$(printf '%s' "$blog" | _extract_cves)
+            echo "    Notes (security/bug fixes):"
+            if [ -z "$cves" ]; then
+                echo "      (no CVE matches — check Full notes for fix details)"
+            else
+                fcount=0
+                while IFS= read -r line; do
+                    fcount=$((fcount+1))
+                    [ "$fcount" -le 5 ] && echo "      • $line"
+                done <<< "$cves"
+                [ "$fcount" -gt 5 ] && echo "      + $((fcount-5)) more CVE(s)"
+            fi
+            echo "    Full notes: $blog_url"
+            prev_major=$maj; prev_minor=$min; prev_patch=$patch
+            continue
+        fi
+
+        # 마이너/메이저 hop
+        blog_url=$(printf '%s' "$feed" | grep -oE "https://docs\.gitlab\.com/releases/${maj}/gitlab-${maj}-${min}-released/" | head -1)
+        if [ -z "$blog_url" ]; then
+            echo "    (release notes not found in feed)"
+            prev_major=$maj; prev_minor=$min; prev_patch=$patch; continue
+        fi
+
+        blog=$(curl -sfL "$blog_url") || {
+            echo "    Warning: blog fetch failed; full notes: $blog_url" >&2
+            prev_major=$maj; prev_minor=$min; prev_patch=$patch; continue
+        }
+
+        titles=$(printf '%s' "$blog" | _extract_h3_titles)
+        notes=$(printf '%s' "$titles" | _filter_breaking)
+        echo "    Notes (breaking/deprecations):"
+        if [ -z "$notes" ]; then
+            echo "      (no keyword matches — check Full notes for unflagged changes)"
+        else
+            fcount=0
+            while IFS= read -r line; do
+                fcount=$((fcount+1))
+                [ "$fcount" -le 5 ] && echo "      • $line"
+            done <<< "$notes"
+            [ "$fcount" -gt 5 ] && echo "      + $((fcount-5)) more"
+        fi
+
+        if [ "$is_major" -eq 1 ]; then
+            feats=$(printf '%s' "$titles" | _filter_features | head -5)
+            echo "    Highlights:"
+            if [ -z "$feats" ]; then
+                echo "      (no keyword matches — check Full notes for unflagged changes)"
+            else
+                while IFS= read -r line; do
+                    echo "      • $line"
+                done <<< "$feats"
+            fi
+        fi
+
+        echo "    Full notes: $blog_url"
+        prev_major=$maj; prev_minor=$min; prev_patch=$patch
+    done
+    echo
+}
+
 # --- 통합 경로: path.json (경유 버전) + Docker Hub (패치 해석) ---
 _fetch_upgrade_path() {
     # 1. path.json → 필수 경유 버전 (major.minor)
@@ -2010,7 +2193,7 @@ if [ ${#UPGRADE_POINTS_ARRAY[@]} -le 5 ]; then
     echo -e "\ttraceroute: ${UPGRADE_POINTS_ARRAY[*]}"
 fi
 echo "Follow this link to get more information: https://gitlab-com.gitlab.io/support/toolbox/upgrade-path/?current=${CURRENT_VERSION%%-*}&target=${UPGRADE_POINTS_ARRAY[-1]%%-*}&distro=docker&edition=${GITLAB_EDITION}"
-echo ''
+release_preflight
 echo -e "\t- I understood that this action DOES NOT SUPPORT rollback"
 echo -e "\t- I understood that this action may take a long time due to the ROUTING COUNT."
 echo -e "\t- I checked container restart policy: $(docker inspect --format='{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER_NAME")"
