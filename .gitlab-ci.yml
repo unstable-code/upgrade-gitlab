@@ -201,6 +201,7 @@ integration-test:
         path: coverage_output/upgrade-gitlab/cobertura.xml
     paths:
       - coverage_output/
+      - stuck_*.log
     when: always
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
