@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+<title>GitLab Releases</title>
+<entry>
+<title>GitLab Patch Release: 18.0.1, 17.11.5, 17.10.8</title>
+<link href="https://docs.gitlab.com/releases/patches/patch-release-gitlab-18-0-1-released/"/>
+</entry>
+<entry>
+<title>GitLab Patch Release: 17.9.10, 17.8.12</title>
+<link href="https://docs.gitlab.com/releases/patches/patch-release-gitlab-17-9-10-released/"/>
+</entry>
+<entry>
+<title>GitLab 18.0</title>
+<link href="https://docs.gitlab.com/releases/18/gitlab-18-0-released/"/>
+</entry>
+</feed>

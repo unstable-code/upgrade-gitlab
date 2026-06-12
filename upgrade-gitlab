@@ -1681,8 +1681,10 @@ poll_with_bouncing_bar() {
 }
 
 # --- 업그레이드 경로 데이터 소스 결정 ---
-_GITLAB_PROJECT_ID="278964"  # gitlab-org/gitlab
 _TAGS_URL="https://gitlab-com.gitlab.io/support/toolbox/upgrade-path/path.json"
+# Public Atom feed of releases (anonymous-readable). 익명 사용자에게 닫혀버린
+# gitlab.com/api/v4/projects/.../releases 대체. _check_eos 와 release_preflight 가 공유.
+_RELEASE_FEED_URL="https://docs.gitlab.com/releases/all-releases.xml"
 
 # --- N-1 버전 결정 (공통 헬퍼) ---
 # 인자: 최신버전, 후보목록(줄바꿈 구분)
@@ -1704,20 +1706,35 @@ _resolve_n1() {
 
 
 # --- EOS (End-of-Support) 체크 ---
-# GitLab 공개 API로 현재 지원 중인 3개 마이너 트랙 조회
+# 공개 Atom 피드(_RELEASE_FEED_URL)의 entry <title>에서 모든 X.Y(.Z?)를 모아 major.minor로
+# 절단한 뒤 숫자 정렬해 상위 3개를 지원 트랙으로 본다. gitlab.com API의 익명 releases
+# 엔드포인트가 403으로 닫힌 후 이쪽으로 이행. 정렬 기반이라 critical CVE 백포트 엔트리
+# (예: "18.9.8, 18.8.10, 18.7.7, ...")가 피드 상단에 끼어도 결과가 흔들리지 않음.
 _check_eos() {
     # target_version_tag가 없으면 (latest 대상) 스킵
     [ -z "$target_version_tag" ] && return 0
 
-    local releases supported_minors target_major target_minor
-    releases=$(curl -sf "https://gitlab.com/api/v4/projects/${_GITLAB_PROJECT_ID}/releases?per_page=3")
-    if [ -z "$releases" ]; then
-        echo "Warning: Could not check EOS status (GitLab API unreachable)" >&2
-        return 0  # API 실패 시 차단하지 않음
+    local feed supported_minors target_major target_minor
+    feed=$(curl -sfL "$_RELEASE_FEED_URL")
+    if [ -z "$feed" ]; then
+        echo "Warning: Could not check EOS status (release feed unreachable)" >&2
+        return 0  # 피드 실패 시 차단하지 않음
     fi
 
-    # 지원 트랙 추출: v18.9.0-ee → 18.9
-    supported_minors=$(echo "$releases" | jq -r '.[].tag_name' | sed 's/^v//;s/\.[0-9]*-.*$//')
+    # docs.gitlab.com 피드에는 미공개 릴리즈 노트 페이지가 "not yet released" 마커와 함께
+    # 포함되어 있어, 필터하지 않으면 미발표 마이너(예: 19.1)가 supported로 오인됨.
+    supported_minors=$(printf '%s' "$feed" \
+        | grep -oE '<title>[^<]+</title>' \
+        | grep -v 'not yet released' \
+        | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' \
+        | awk -F. '{print $1"."$2}' \
+        | sort -t. -k1,1n -k2,2n -u \
+        | tail -3)
+
+    if [ -z "$supported_minors" ]; then
+        echo "Warning: Could not parse supported tracks from release feed; skipping EOS check" >&2
+        return 0
+    fi
 
     # 타겟의 major.minor 추출 (suffix 제거)
     target_major=$(echo "$target_version_tag" | awk -F'[.-]' '{print $1}')
@@ -1806,9 +1823,8 @@ _extract_cves() {
 # 메인: confirmation block 직전에 호출. UPGRADE_POINTS_ARRAY를 순회하며 hop별로 정보 출력.
 # shellcheck disable=SC2329
 release_preflight() {
-    local feed_url='https://docs.gitlab.com/releases/all-releases.xml'
     local feed
-    feed=$(curl -sfL "$feed_url") || {
+    feed=$(curl -sfL "$_RELEASE_FEED_URL") || {
         echo "Warning: could not fetch release feed; preflight skipped." >&2
         return 0
     }
