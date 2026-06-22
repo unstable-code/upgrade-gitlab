@@ -2186,10 +2186,12 @@ if [ ${#UPGRADE_POINTS_ARRAY[@]} -eq 0 ]; then
         # end-of-upgrade 복원 지점에 도달하지 않으므로 여기서 명시적으로 되살린다.
         _resume_paused_runners
         exit_critical
-        echo "WARNING: Previous run exited abnormally (exit code: $_prev_exit)"
         if [ "$_interrupted" -eq 1 ]; then
+            echo "Recovery interrupted by signal before finishing (it had started because the previous run exited with code $_prev_exit)." >&2
             exit 130
         fi
+        echo "Recovery completed successfully: $CURRENT_VERSION is healthy."
+        echo "(This recovery pass ran because the previous run had exited with code $_prev_exit; that condition is now resolved — no action needed.)"
     else
         echo "Requirements already satisfied: v$CURRENT_VERSION"
         if curl -sf -o /dev/null "$TARGET_URL/users/sign_in"; then
