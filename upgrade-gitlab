@@ -1050,19 +1050,6 @@ print_stacktrace_errors() {
     fi
 }
 
-_prev_exit=$(docker inspect --format='{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null || echo 0)
-
-if ! docker ps --format "{{.Names}}" | grep -q "^$CONTAINER_NAME$"; then
-    docker start "$CONTAINER_NAME" &> /dev/null
-    wait_for_healthy "GitLab server"
-fi
-
-CURRENT_VERSION=$(docker exec "$CONTAINER_NAME" dpkg -l 2>/dev/null | awk '/^ii/ && $2 ~ /^gitlab-(ce|ee)$/ { print $3 }' | head -n1)
-if [ -z "$CURRENT_VERSION" ]; then
-    echo "Error: could not determine current GitLab version (dpkg query failed or gitlab-ce/gitlab-ee package not found in container)." >&2
-    exit 1
-fi
-
 start_time=$SECONDS
 
 # --- Backup progress helpers ---
@@ -2050,6 +2037,24 @@ _fetch_upgrade_path() {
     # 정렬 + 중복 제거
     mapfile -t ALL_TAGS < <(printf '%s\n' "${ALL_TAGS[@]}" | sort -Vu)
 }
+
+# 컨테이너가 멈춰 있으면 기동한 뒤 현재 설치 버전을 감지한다.
+# 이 블록은 반드시 모든 헬퍼 함수 정의 뒤에 와야 한다:
+# wait_for_healthy → poll_with_bouncing_bar 를 호출하므로, 그 정의들보다
+# 앞에서 실행되면 "poll_with_bouncing_bar: command not found"가 난다
+# (컨테이너가 멈춰 있는 크래시-복구 경로에서만 docker start 분기가 타져 드러났던 버그).
+_prev_exit=$(docker inspect --format='{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null || echo 0)
+
+if ! docker ps --format "{{.Names}}" | grep -q "^$CONTAINER_NAME$"; then
+    docker start "$CONTAINER_NAME" &> /dev/null
+    wait_for_healthy "GitLab server"
+fi
+
+CURRENT_VERSION=$(docker exec "$CONTAINER_NAME" dpkg -l 2>/dev/null | awk '/^ii/ && $2 ~ /^gitlab-(ce|ee)$/ { print $3 }' | head -n1)
+if [ -z "$CURRENT_VERSION" ]; then
+    echo "Error: could not determine current GitLab version (dpkg query failed or gitlab-ce/gitlab-ee package not found in container)." >&2
+    exit 1
+fi
 
 echo "Processing GitLab-${GITLAB_EDITION^^} upgrade path..."
 _fetch_upgrade_path
