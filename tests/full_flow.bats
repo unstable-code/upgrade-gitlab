@@ -459,6 +459,29 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     rm -rf "$XDG_RUNTIME_DIR"
 }
 
+# ---------- Test 31b: recovery starts a stopped container before version detection ----------
+@test "full-flow: recovery starts a stopped container without a poll_with_bouncing_bar ordering error" {
+    # Regression: the container-start + wait_for_healthy block once ran as top-level
+    # code positioned BEFORE the bouncing-bar/poll helper definitions, so a stopped
+    # container (crash-recovery) hit "poll_with_bouncing_bar: command not found" and
+    # skipped the health wait. The always-running mock never took the docker-start
+    # branch, so CI missed it — hence this test forces a stopped container on entry.
+    export MOCK_GITLAB_VERSION="18.0.1-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_EXIT_CODE=1                  # _prev_exit != 0 → recovery branch
+    touch "$MOCK_STATE_DIR/stopped"          # container exited → absent from `docker ps`
+
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    # The stopped-container branch was actually taken (early "GitLab server" health wait ran)...
+    [[ "$output" == *"waiting until GitLab server container is ready"* ]]
+    # ...without the function-ordering bug...
+    [[ "$output" != *"poll_with_bouncing_bar"* ]]
+    [[ "$output" != *"command not found"* ]]
+    # ...and recovery reported success rather than a bare alarming WARNING.
+    [[ "$output" == *"Recovery completed successfully"* ]]
+}
+
 # ---------- Test 32: pause merges leftover IDs with newly paused runners (union) ----------
 @test "full-flow: pause merges leftover paused-runner IDs and resumes the union" {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"   # 1-step upgrade

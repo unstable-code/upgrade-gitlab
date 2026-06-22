@@ -34,7 +34,11 @@ case "$args" in
         echo -e "${MOCK_IMAGE}\t${MOCK_CONTAINER}"
         ;;
     "ps --format {{.Names}}"*)
-        echo "$MOCK_CONTAINER"
+        # A stopped/exited container is absent from `docker ps` (running-only).
+        # MOCK_STATE_DIR/stopped marks that state; `docker start` clears it. This
+        # exercises the start-stopped-container branch (crash-recovery) that the
+        # always-running default would otherwise never reach.
+        [ -n "$MOCK_STATE_DIR" ] && [ -f "$MOCK_STATE_DIR/stopped" ] || echo "$MOCK_CONTAINER"
         ;;
     "inspect ${MOCK_CONTAINER} --format={{.Config.Image}}"*|"inspect gitlab --format={{.Config.Image}}"*)
         echo "$MOCK_IMAGE"
@@ -248,6 +252,8 @@ case "$args" in
         exit 0
         ;;
     *"start"*)
+        # Starting clears the stopped marker so later `docker ps` shows it running.
+        [ -n "$MOCK_STATE_DIR" ] && rm -f "$MOCK_STATE_DIR/stopped"
         exit 0
         ;;
     *"stop"*)
