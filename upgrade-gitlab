@@ -40,6 +40,8 @@ _handle_signal() {
     if [ -n "${_size_poller_pid:-}" ]; then
         kill "$_size_poller_pid" 2>/dev/null
     fi
+    # 일시정지한 러너 재개는 EXIT 트랩(_cleanup_on_exit)이 일괄 담당한다 — 시그널뿐 아니라
+    # 사전검사 실패/백업 실패 등 critical zone 진입 전 모든 종료 경로를 한곳에서 커버하기 위함.
     exit 130
 }
 trap _handle_signal SIGINT SIGTERM SIGTSTP SIGHUP
@@ -48,11 +50,24 @@ trap _handle_signal SIGINT SIGTERM SIGTSTP SIGHUP
 # 각 함수의 즉시 rm은 그대로 두고, 이 트랩은 누락분을 쓸어담는 안전망이다.
 _TMPFILES=()
 # shellcheck disable=SC2329
-_cleanup_tmpfiles() {
+_cleanup_on_exit() {
     [ ${#_TMPFILES[@]} -gt 0 ] && rm -f "${_TMPFILES[@]}" 2>/dev/null
+    # 안전망: critical zone 진입 전(러너 pause ~ 백업 ~ 사전 시크릿 검사)에 종료되면 — 시그널,
+    # 사전검사 실패/거부, 백업 실패, 사용자 abort 등 무엇이든 — 일시정지한 러너가 방치된다(#10).
+    # 그 구간은 아직 컨테이너를 스왑하지 않아 살아 있으므로 여기서 재개한다.
+    #  - critical zone 내부(_trap_active=1)의 비정상 종료(예: print_stacktrace_errors)에서는 건드리지
+    #    않는다: 업그레이드가 반쯤 진행/컨테이너 교체 중일 수 있어, 그 경우는 다음 실행 recovery 경로에
+    #    맡긴다(_resume_paused_runners가 실패 시 상태파일을 보존하므로 복구가 가능하다).
+    #  - 정상 완료/정상 인터럽트는 이미 _resume_paused_runners로 재개하며 파일을 제거했으므로 -f 가드로 no-op.
+    #  - command -v 가드: 시그널이 함수 정의 이전에 도착해도 'command not found'가 나지 않게 한다.
+    if [ "${_trap_active:-0}" != 1 ] \
+       && command -v _resume_paused_runners >/dev/null 2>&1 \
+       && [ -n "${_runner_state_file:-}" ] && [ -f "$_runner_state_file" ]; then
+        _resume_paused_runners
+    fi
     return 0
 }
-trap _cleanup_tmpfiles EXIT
+trap _cleanup_on_exit EXIT
 
 # shellcheck disable=SC2329
 _pull_signal_handler() {
@@ -115,11 +130,18 @@ _resume_paused_runners() {
         id_list=$(echo "$PAUSED_RUNNER_IDS" | tr -s '[:space:]' ',' | sed 's/^,//;s/,$//')
     fi
     if [ -n "$id_list" ]; then
-        docker exec "$CONTAINER_NAME" gitlab-psql -c "UPDATE ci_runners SET active = true WHERE id IN ($id_list);" > /dev/null
-        echo "Resumed previously paused runners: $id_list"
-        send_discord_webhook "NOTE" "Runners resumed" "IDs: $id_list"
+        # UPDATE가 성공해야만 "재개됨"으로 간주하고 상태파일을 제거한다. 컨테이너가 죽어 실패하면
+        # 파일을 남겨 다음 실행의 recovery 경로가 되살리도록 한다(거짓 성공 보고 + 상태파일 유실 방지).
+        if docker exec "$CONTAINER_NAME" gitlab-psql -c "UPDATE ci_runners SET active = true WHERE id IN ($id_list);" > /dev/null 2>&1; then
+            echo "Resumed previously paused runners: $id_list"
+            send_discord_webhook "NOTE" "Runners resumed" "IDs: $id_list"
+            rm -f "$_runner_state_file"
+        else
+            echo "Warning: could not resume paused runners ($id_list) — container unreachable; state file kept for the next run." >&2
+        fi
+    else
+        rm -f "$_runner_state_file"
     fi
-    rm -f "$_runner_state_file"
 }
 
 if [ "$1" == "--help" ] || [ "$1" == "help" ]; then

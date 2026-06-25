@@ -482,6 +482,64 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     [[ "$output" == *"Recovery completed successfully"* ]]
 }
 
+# ---------- Test 31c: SIGINT during backup (pre-critical zone) resumes paused runners ----------
+@test "full-flow: SIGINT during backup (pre-critical zone) resumes the runners it paused" {
+    # #10 follow-up: runners are paused BEFORE the backup, and the backup runs BEFORE
+    # enter_critical. A Ctrl+C during backup must not strand the paused runners — the
+    # non-critical signal handler resumes them before exiting.
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"   # a real 1-step upgrade → pauses + backs up
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_RUNNER_COUNT=2                    # active runners 1,2 get paused
+    export MOCK_PSQL_STATS_FAIL=1                 # route to the simple (bouncing-bar) backup branch
+    export MOCK_BACKUP_SLEEP=5                    # hold inside backup so we can signal mid-backup
+    export XDG_RUNTIME_DIR=$(mktemp -d)
+    sf="$XDG_RUNTIME_DIR/upgrade-gitlab-gitlab.paused-runners"
+
+    bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock > "$MOCK_STATE_DIR/out.log" 2>&1 &
+    pid=$!
+    # wait deterministically until the backup has started (runners are already paused by now)
+    for _ in $(seq 1 200); do [ -f "$MOCK_STATE_DIR/backup_started" ] && break; sleep 0.1; done
+    [ -f "$MOCK_STATE_DIR/backup_started" ]       # sanity: execution reached the backup
+    [ -f "$sf" ]                                  # sanity: runners were paused (state file written)
+
+    # Use SIGTERM, not SIGINT: a non-interactive shell sets background jobs to ignore
+    # SIGINT, so kill -INT on a backgrounded script is unreliable here. The real-world
+    # trigger is a foreground Ctrl+C (SIGINT), but _handle_signal is the shared trap for
+    # SIGINT/SIGTERM/SIGTSTP/SIGHUP, so SIGTERM exercises the exact same non-critical path.
+    kill -TERM "$pid"
+    status=0
+    wait "$pid" || status=$?                                       # don't let bats errexit abort on the non-zero exit
+
+    [ "$status" -eq 130 ]                                          # signal-interrupted exit
+    grep -q "Resumed previously paused runners: 1,2" "$MOCK_STATE_DIR/out.log"
+    ! grep -q "Entering critical section" "$MOCK_STATE_DIR/out.log"  # stopped in backup, before the upgrade
+    [ ! -f "$sf" ]                                                 # state file consumed by resume
+
+    rm -rf "$XDG_RUNTIME_DIR"
+}
+
+# ---------- Test 31d: non-signal abort before the critical zone resumes paused runners ----------
+@test "full-flow: abort on pre-upgrade secrets failure resumes the paused runners (EXIT trap)" {
+    # #10 follow-up, non-signal path: the pre-upgrade secrets check runs after the pause and
+    # after the backup but before enter_critical. A failure there exits without reaching the
+    # end-of-upgrade resume; the EXIT trap must release the runners it paused.
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_RUNNER_COUNT=2                    # active runners 1,2 get paused
+    export MOCK_SECRETS=bad                       # pre-upgrade secrets integrity check fails
+    export XDG_RUNTIME_DIR=$(mktemp -d)
+    sf="$XDG_RUNTIME_DIR/upgrade-gitlab-gitlab.paused-runners"
+
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 1 ]                                            # aborted on secrets failure
+    [[ "$output" == *"secrets integrity check failure"* ]]
+    [[ "$output" == *"Resumed previously paused runners: 1,2"* ]]  # EXIT trap caught the abort
+    ! [[ "$output" == *"Entering critical section"* ]]             # aborted before the upgrade
+    [ ! -f "$sf" ]                                                 # state file consumed by resume
+
+    rm -rf "$XDG_RUNTIME_DIR"
+}
+
 # ---------- Test 32: pause merges leftover IDs with newly paused runners (union) ----------
 @test "full-flow: pause merges leftover paused-runner IDs and resumes the union" {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"   # 1-step upgrade

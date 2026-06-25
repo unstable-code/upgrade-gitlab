@@ -158,6 +158,13 @@ case "$args" in
         exit 0
         ;;
     *"exec"*"gitlab-backup"*)
+        # MOCK_BACKUP_SLEEP: hold inside the backup so a test can deliver a signal
+        # mid-backup (after runners are paused, before the critical zone). The marker
+        # file lets the test wait deterministically instead of racing on a fixed sleep.
+        if [ -n "${MOCK_BACKUP_SLEEP:-}" ]; then
+            [ -n "$MOCK_STATE_DIR" ] && touch "$MOCK_STATE_DIR/backup_started"
+            sleep "$MOCK_BACKUP_SLEEP"
+        fi
         exit 0
         ;;
     *"exec"*"gitlab-ctl reconfigure"*)
