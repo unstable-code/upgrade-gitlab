@@ -27,6 +27,79 @@ if ! (: > /dev/tty) 2>/dev/null; then
 fi
 _pull_interrupted=0
 
+# --- Sticky top progress bar (멀티-hop 업그레이드 전용) ---
+# 라우팅 포인트가 2개 이상일 때, 터미널 1번째 줄을 고정해 전체 hop 진행률을 항상 보여준다.
+# 스크롤 영역(DECSTBM)으로 2..N 줄만 스크롤시키고 1번째 줄은 보존한다. 기존 바운싱/진행 바는
+# 영역 안(맨 아랫줄)에서 그대로 동작한다. 비-TTY(CI)에서는 자동 비활성. 시그널/종료 시에는
+# EXIT 트랩(_cleanup_on_exit)이 스크롤 영역을 반드시 복원한다.
+_sticky_active=0
+_sticky_index=0
+_sticky_total=0
+_sticky_from=
+_sticky_to=
+
+_sticky_rows() {
+    tput lines 2>/dev/null || stty size 2>/dev/null | awk '{print $1}' || echo 24
+}
+
+# shellcheck disable=SC2329
+_sticky_draw() {
+    [ "$_sticky_active" -eq 1 ] || return 0
+    local cols=${COLUMNS:-$(tput cols 2>/dev/null || stty size 2>/dev/null | awk '{print $2}' || echo 80)}
+    local reset='\033[0m'
+    # critical zone면 노랑, 평시 초록 (다른 바와 동일 규칙)
+    local bg=42
+    if [ "${_trap_active:-0}" -eq 1 ]; then
+        bg=43
+    fi
+    local pct=0
+    if [ "$_sticky_total" -gt 0 ]; then
+        pct=$(( _sticky_index * 100 / _sticky_total ))
+    fi
+    if [ "$pct" -gt 100 ]; then pct=100; fi
+
+    local head="$_sticky_from → $_sticky_to · Hop $_sticky_index/$_sticky_total"
+    local suffix
+    suffix=$(printf " %d%%" "$pct")
+    # overhead: "[" head "]" " [" bar "]" suffix
+    local overhead=$(( ${#head} + 5 + ${#suffix} ))
+    local bar_length=$(( cols - overhead ))
+    if [ "$bar_length" -lt 5 ]; then
+        bar_length=5
+    fi
+    local filled=$(( pct * bar_length / 100 ))
+    local empty=$(( bar_length - filled ))
+    local bar_filled bar_empty
+    bar_filled=$(printf '%*s' "$filled" '' | tr ' ' '#')
+    # shellcheck disable=SC1003
+    bar_empty=$(printf '%*s' "$empty" '' | sed 's/ /·/g')
+    # 커서 저장(DECSC) → 1행으로 이동 → 줄 지우고 헤더 출력 → 커서 복원(DECRC)
+    printf '\0337\033[1;1H\033[K\033[%dm[%s]%b [%s%s]%s\0338' \
+        "$bg" "$head" "$reset" "$bar_filled" "$bar_empty" "$suffix" > "$_tty"
+}
+
+_sticky_setup() {
+    [ "$_tty" = /dev/null ] && return 0
+    local rows
+    rows=$(_sticky_rows)
+    case "$rows" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$rows" -lt 3 ] && return 0
+    _sticky_active=1
+    # 헤더용 1행 확보: 한 줄 스크롤 → 스크롤 영역을 2..rows로 제한(커서는 home으로) → 커서를 영역 하단으로
+    printf '\n' > "$_tty"
+    printf '\033[2;%dr' "$rows" > "$_tty"
+    printf '\033[%d;1H' "$rows" > "$_tty"
+    _sticky_draw
+}
+
+# shellcheck disable=SC2329
+_sticky_teardown() {
+    [ "$_sticky_active" -eq 1 ] || return 0
+    _sticky_active=0
+    # 커서 저장 → 스크롤 영역 전체 복원(커서 home됨) → 헤더 줄 지움 → 커서 복원
+    printf '\0337\033[r\033[1;1H\033[K\0338' > "$_tty"
+}
+
 # shellcheck disable=SC2329
 _handle_signal() {
     if [ "$_trap_active" -eq 1 ]; then
@@ -51,6 +124,8 @@ trap _handle_signal SIGINT SIGTERM SIGTSTP SIGHUP
 _TMPFILES=()
 # shellcheck disable=SC2329
 _cleanup_on_exit() {
+    # 상단 고정 바가 켜진 채 종료(시그널/에러/abort)되면 터미널 스크롤 영역이 남으므로 가장 먼저 복원.
+    command -v _sticky_teardown >/dev/null 2>&1 && _sticky_teardown
     [ ${#_TMPFILES[@]} -gt 0 ] && rm -f "${_TMPFILES[@]}" 2>/dev/null
     # 안전망: critical zone 진입 전(러너 pause ~ 백업 ~ 사전 시크릿 검사)에 종료되면 — 시그널,
     # 사전검사 실패/거부, 백업 실패, 사용자 abort 등 무엇이든 — 일시정지한 러너가 방치된다(#10).
@@ -2488,6 +2563,16 @@ fi
 
 index=1
 CNT_VERSION=$CURRENT_VERSION
+
+# 멀티-hop(라우팅 포인트 2개 이상)일 때만 전체 진행률을 보여주는 상단 고정 바 활성화
+if [ ${#UPGRADE_POINTS_ARRAY[@]} -gt 1 ]; then
+    _sticky_from=$CURRENT_VERSION
+    _sticky_to=${UPGRADE_POINTS_ARRAY[-1]}
+    _sticky_total=${#UPGRADE_POINTS_ARRAY[@]}
+    _sticky_index=0
+    _sticky_setup
+fi
+
 for ver in "${UPGRADE_POINTS_ARRAY[@]}"; do
     # 안전 checkpoint: 이전 iteration 도중 또는 CE→EE 도중 SIGINT가 들어왔으면
     # 새 버전 진입 안 하고 break, post-upgrade로 직행.
@@ -2498,6 +2583,9 @@ for ver in "${UPGRADE_POINTS_ARRAY[@]}"; do
 
     send_discord_webhook "INFO" "GitLab server is upgrading now! ($index/${#UPGRADE_POINTS_ARRAY[@]})" "Please wait until upgrading process is done."
     echo "Updating $CNT_VERSION to $ver... ($index/${#UPGRADE_POINTS_ARRAY[@]})"
+
+    _sticky_index=$index
+    _sticky_draw
 
     # 다음 버전 이미지 사전 Pull (백그라운드)
     PULL_PID=
@@ -2566,6 +2654,9 @@ for ver in "${UPGRADE_POINTS_ARRAY[@]}"; do
     CNT_VERSION=$ver
     index=$((index + 1))
 done
+
+# 상단 고정 바 해제 — 이후 post-upgrade 검증/요약은 전체 화면에서 평소대로 출력
+_sticky_teardown
 
 check_gitlab_server_healthy 1
 
