@@ -42,6 +42,22 @@ _sticky_rows() {
     tput lines 2>/dev/null || stty size 2>/dev/null | awk '{print $1}' || echo 24
 }
 
+# _wait_reap <pid> — 종료코드를 신뢰성 있게 회수한다.
+# bash에서 트랩이 걸린 시그널(특히 SIGWINCH)은 `wait`를 깨워 rc>128을 반환시킨다.
+# 자식이 아직 살아 있으면(시그널로 인한 가짜 종료) 다시 wait하여 진짜 종료코드를 돌려준다.
+# 자식이 실제로 시그널에 죽은 경우(kill -0 실패)는 그 rc를 그대로 보존한다.
+_wait_reap() {
+    local p=$1 rc
+    while :; do
+        wait "$p"
+        rc=$?
+        if [ "$rc" -gt 128 ] && kill -0 "$p" 2>/dev/null; then
+            continue
+        fi
+        return "$rc"
+    done
+}
+
 # shellcheck disable=SC2329
 _sticky_draw() {
     [ "$_sticky_active" -eq 1 ] || return 0
@@ -90,11 +106,29 @@ _sticky_setup() {
     printf '\033[2;%dr' "$rows" > "$_tty"
     printf '\033[%d;1H' "$rows" > "$_tty"
     _sticky_draw
+    # 리사이즈 대응은 sticky 활성 구간에만 한정 — 프롬프트(read)·기타 wait를 불필요하게
+    # 시그널에 노출시키지 않기 위함. 이 구간의 rc-판정 wait는 _wait_reap로 보호된다.
+    trap _sticky_on_winch SIGWINCH
+}
+
+# shellcheck disable=SC2329
+# 터미널 리사이즈 시: 새 행수로 스크롤 영역을 다시 잡고 헤더를 재출력한다.
+# (폭 변화는 _sticky_draw/하단 바가 매 프레임 tput으로 다시 읽어 자동 반영)
+_sticky_on_winch() {
+    [ "$_sticky_active" -eq 1 ] || return 0
+    local rows
+    rows=$(_sticky_rows)
+    case "$rows" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$rows" -lt 3 ] && return 0
+    # 커서 저장 → 스크롤 영역 재설정(커서 home됨) → 커서 복원 → 헤더 재출력
+    printf '\0337\033[2;%dr\0338' "$rows" > "$_tty"
+    _sticky_draw
 }
 
 # shellcheck disable=SC2329
 _sticky_teardown() {
     [ "$_sticky_active" -eq 1 ] || return 0
+    trap - SIGWINCH
     _sticky_active=0
     # 커서 저장 → 스크롤 영역 전체 복원(커서 home됨) → 헤더 줄 지움 → 커서 복원
     printf '\0337\033[r\033[1;1H\033[K\0338' > "$_tty"
@@ -172,7 +206,7 @@ pull_with_retry() {
         _pull_interrupted=0
         docker pull "$image" &
         _pull_pid=$!
-        wait "$_pull_pid"
+        _wait_reap "$_pull_pid"
         local rc=$?
         _pull_pid=
 
@@ -1440,7 +1474,11 @@ run_with_bouncing_bar() {
             fi
         fi
 
-        # label 변경에 맞춰 bar_width 재계산
+        # label 변경/터미널 리사이즈에 맞춰 폭 재계산.
+        # cols를 매 프레임 다시 읽는다 — 진입 시 한 번만 캐시하면, 실행 중 창을 좁혔을 때
+        # 옛 넓은 폭 기준으로 그려져 줄바꿈(wrap)이 일어나고 '\r\033[K'가 현재 줄만 지워
+        # 넘친 잔상이 누적되는("바가 풀리는") 문제가 생긴다.
+        cols=${COLUMNS:-$(tput cols 2>/dev/null || stty size 2>/dev/null | awk '{print $2}' || echo 80)}
         bar_width=$(( cols - ${#label} - 5 ))
         if [ "$bar_width" -lt 10 ]; then
             bar_width=10
@@ -1485,7 +1523,7 @@ run_with_bouncing_bar() {
     printf '\r\033[K' > "$_tty"
 
     # 종료 코드 수집
-    wait "$cmd_pid"
+    _wait_reap "$cmd_pid"
     local rc=$?
     rm -f "$tmpfile"
     return $rc
@@ -1666,7 +1704,7 @@ run_with_progress_bar() {
     printf '\r\033[K' > "$_tty"
 
     # 종료 코드 수집
-    wait "$cmd_pid"
+    _wait_reap "$cmd_pid"
     local rc=$?
     rm -f "$tmpfile"
     return $rc
