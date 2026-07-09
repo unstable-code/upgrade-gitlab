@@ -1608,19 +1608,19 @@ _fmt_duration() {
     printf '%02d:%02d:%02d' "$(( total / 3600 ))" "$(( (total % 3600) / 60 ))" "$(( total % 60 ))"
 }
 
-# _backup_progress_extra <is_upload:0|1> <pct> <elapsed_seconds>
+# _backup_progress_extra <approx:0|1> <pct> <elapsed_seconds>
 # Builds the ETA suffix appended after the percentage in the backup bar, shown only
 # when pct is in (1,100) and elapsed >= 5s (avoids div-by-zero / wild early estimates).
 # ETA is derived from progress rate: eta = elapsed * (100 - pct) / pct.
-# Upload uses an approximate pct, so its ETA gets a ~ prefix matching the ~% it shows.
+# An approximate pct yields an approximate ETA, so the ~ prefix tracks the ~% shown.
 _backup_progress_extra() {
-    local is_upload=$1 pct=$2 elapsed=$3
+    local approx=$1 pct=$2 elapsed=$3
     if [ "$pct" -le 1 ] || [ "$pct" -ge 100 ] || [ "$elapsed" -lt 5 ]; then
         return
     fi
     local eta
     eta=$(_fmt_duration $(( elapsed * (100 - pct) / pct )))
-    if [ "$is_upload" -eq 1 ]; then
+    if [ "$approx" -eq 1 ]; then
         printf ' ETA ~%s' "$eta"
     else
         printf ' ETA %s' "$eta"
@@ -1700,11 +1700,15 @@ run_with_progress_bar() {
                 fi
                 ;;
             "Dumping uploads"*)
+                # *.tar.gz 단계는 모두 근사다: 분자는 gzip -c -1로 압축된 크기인데
+                # 분모는 DB가 기록한 압축 전 바이트라, 압축률만큼 바가 아래로 깔린다.
+                # (Backup::Helper#compress_cmd, COMPRESS_CMD로 덮어쓰면 비율이 또 달라짐)
                 display_label="Backup: Dumping uploads"
                 if [ "$_total_uploads_size" -gt 0 ]; then
                     local cur_size
                     cur_size=$(_get_current_tar_size "uploads.tar.gz")
                     pct=$(( cur_size * 100 / _total_uploads_size ))
+                    approx=1
                 fi
                 ;;
             "Dumping builds"*)
@@ -1719,6 +1723,7 @@ run_with_progress_bar() {
                     local cur_size
                     cur_size=$(_get_current_tar_size "artifacts.tar.gz")
                     pct=$(( cur_size * 100 / _total_artifacts_size ))
+                    approx=1
                 fi
                 ;;
             "Dumping lfs objects"*)
@@ -1727,6 +1732,7 @@ run_with_progress_bar() {
                     local cur_size
                     cur_size=$(_get_current_tar_size "lfs.tar.gz")
                     pct=$(( cur_size * 100 / _total_lfs_size ))
+                    approx=1
                 fi
                 ;;
             "Creating backup archive"*)
@@ -1767,11 +1773,9 @@ run_with_progress_bar() {
         esac
 
         if [ "$pct" -ge 0 ]; then
-            # ETA 부가 정보 계산 (pct 캡 전 raw 값 사용; upload는 ~ 접두사)
-            local is_upload=0
-            [[ "$current_stage" == "Uploading backup archive to remote storage"* ]] && is_upload=1
+            # ETA 부가 정보 계산 (pct 캡 전 raw 값 사용). 근사 pct → 근사 ETA.
             local extra
-            extra=$(_backup_progress_extra "$is_upload" "$pct" "$(( SECONDS - stage_start ))")
+            extra=$(_backup_progress_extra "$approx" "$pct" "$(( SECONDS - stage_start ))")
             if [ "$pct" -gt 100 ]; then pct=100; fi
             _draw_backup_progress "$display_label" "$pct" "$tick" "$approx" "$extra"
         else
