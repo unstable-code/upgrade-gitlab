@@ -143,6 +143,34 @@ teardown() {
     [[ "$output" == *"Successfully updated"* ]]
 }
 
+# ---------- Test 12b: "Creating backup archive" is a determinate stage ----------
+# MOCK_PACK_SLEEP holds the mock inside the pack stage so the polling loop samples
+# it; the bar itself renders to _tty (/dev/null under bats), so what this asserts is
+# that the tar-size/staging-total math runs to completion without erroring.
+@test "full-flow: backup archive stage computes progress from tar vs staging total" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_PACK_SLEEP=1
+    export MOCK_PACK_TOTAL=1000000
+    export MOCK_BACKUP_TAR_SIZE=500000
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Creating backup archive"* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+}
+
+# ---------- Test 12c: pack progress degrades to bouncing bar when du fails ----------
+@test "full-flow: backup archive stage survives a failed staging-total probe" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_PACK_SLEEP=1
+    export MOCK_PACK_TOTAL_FAIL=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Creating backup archive"* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+}
+
 # ---------- Test 13: Stuck failed(4) migration is fatal ----------
 @test "full-flow: status=4 (failed) migration triggers FATAL exit" {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"

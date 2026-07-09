@@ -147,6 +147,9 @@ _handle_signal() {
     if [ -n "${_size_poller_pid:-}" ]; then
         kill "$_size_poller_pid" 2>/dev/null
     fi
+    if [ -n "${_pack_probe_pid:-}" ]; then
+        kill "$_pack_probe_pid" 2>/dev/null
+    fi
     # 일시정지한 러너 재개는 EXIT 트랩(_cleanup_on_exit)이 일괄 담당한다 — 시그널뿐 아니라
     # 사전검사 실패/백업 실패 등 critical zone 진입 전 모든 종료 경로를 한곳에서 커버하기 위함.
     exit 130
@@ -1191,6 +1194,8 @@ _total_uploads_size=0
 _total_project_count=0
 _size_poller_pid=
 _size_poller_file=
+_pack_probe_pid=
+_pack_probe_file=
 
 _query_backup_stats() {
     local raw
@@ -1353,6 +1358,45 @@ _stop_size_poller() {
         rm -f "$_size_poller_file"
         _size_poller_file=
     fi
+}
+
+# "Creating backup archive" 단계의 분모(= staging 총량)를 비동기로 측정한다.
+# GitLab의 pack()은 tar를 만든 뒤 ensure 블록에서 staging을 지우므로, tar가 커지는
+# 동안 staging은 그대로 남아 있다. 따라서 tar 크기 / staging 총량 = 진행률.
+# du는 수 초가 걸릴 수 있어 백그라운드로 돌리고, 값이 준비될 때까지는 bouncing bar를 쓴다.
+# 이미 만들어지기 시작한 tar 자신은 분모에서 제외한다.
+_start_pack_total_probe() {
+    _pack_probe_file=$(mktemp)
+    _TMPFILES+=("$_pack_probe_file")
+    docker exec "$CONTAINER_NAME" sh -c \
+        'du -sb --exclude="*_gitlab_backup.tar" /var/opt/gitlab/backups 2>/dev/null | cut -f1' \
+        > "$_pack_probe_file" 2>/dev/null &
+    _pack_probe_pid=$!
+}
+
+_stop_pack_total_probe() {
+    if [ -n "${_pack_probe_pid:-}" ]; then
+        kill "$_pack_probe_pid" 2>/dev/null
+        wait "$_pack_probe_pid" 2>/dev/null
+        _pack_probe_pid=
+    fi
+    if [ -n "${_pack_probe_file:-}" ]; then
+        rm -f "$_pack_probe_file"
+        _pack_probe_file=
+    fi
+}
+
+# Prints the probed staging total (bytes), or 0 while the probe is still running
+# / if it failed. du가 아직 끝나지 않았으면 파일이 비어 있으므로 자연히 0이 된다.
+_get_pack_total_size() {
+    if [ -z "${_pack_probe_file:-}" ] || [ ! -f "$_pack_probe_file" ]; then
+        echo 0
+        return
+    fi
+    local v
+    v=$(tail -1 "$_pack_probe_file")
+    v="${v//[!0-9]/}"
+    echo "${v:-0}"
 }
 
 # _get_current_tar_size <filename>
@@ -1603,7 +1647,10 @@ run_with_progress_bar() {
         if [ "$current_stage" != "$prev_stage" ]; then
             prev_stage="$current_stage"
             stage_start=$SECONDS
-            if [[ "$current_stage" == "Uploading backup archive to remote storage"* ]]; then
+            if [[ "$current_stage" == "Creating backup archive"* ]]; then
+                _start_pack_total_probe
+            elif [[ "$current_stage" == "Uploading backup archive to remote storage"* ]]; then
+                _stop_pack_total_probe
                 upload_baseline_tx=$(_get_current_tx_bytes)
                 upload_target_size=$(_get_current_tar_size "_gitlab_backup.tar")
             fi
@@ -1650,6 +1697,19 @@ run_with_progress_bar() {
                     pct=$(( cur_size * 100 / _total_lfs_size ))
                 fi
                 ;;
+            "Creating backup archive"*)
+                # tar는 staging을 그대로 이어붙이므로 tar 크기 / staging 총량이 곧 진행률이다.
+                # 멤버당 512B 헤더 + 512B 패딩이 붙고 du는 디렉터리 엔트리를 4KB로 세는 등
+                # 양쪽 오차가 있으나 GB급 백업에서는 1% 미만이라 그대로 쓴다.
+                display_label="Backup: Creating backup archive"
+                local pack_total
+                pack_total=$(_get_pack_total_size)
+                if [ "$pack_total" -gt 0 ]; then
+                    local cur_size
+                    cur_size=$(_get_current_tar_size "_gitlab_backup.tar")
+                    pct=$(( cur_size * 100 / pack_total ))
+                fi
+                ;;
             "Uploading backup archive to remote storage"*)
                 # fog SDK가 chunk마다 file을 open/close해서 FD-기반 추적이 불가능하므로
                 # 컨테이너 egress 누적 바이트와 tar 크기 비율로 근사 (~ prefix로 명시).
@@ -1691,6 +1751,7 @@ run_with_progress_bar() {
     done
 
     _stop_size_poller
+    _stop_pack_total_probe
 
     # 남은 출력 표시
     local final_lines

@@ -155,6 +155,11 @@ case "$args" in
         echo "2026-01-01 00:00:00 UTC -- Dumping lfs objects ... done"
         echo "2026-01-01 00:00:00 UTC -- Dumping uploads ... done"
         echo "2026-01-01 00:00:00 UTC -- Dumping builds ... done"
+        # MOCK_PACK_SLEEP: linger inside the pack stage so run_with_progress_bar's
+        # polling loop actually samples it (otherwise the mock exits before a tick).
+        echo "2026-01-01 00:00:00 UTC -- Creating backup archive: ${MOCK_BACKUP_TAR_NAME:-1700000000_2026_01_01_16.11.0-ce_gitlab_backup.tar} ... "
+        [ -n "${MOCK_PACK_SLEEP:-}" ] && sleep "$MOCK_PACK_SLEEP"
+        echo "2026-01-01 00:00:00 UTC -- Creating backup archive: ${MOCK_BACKUP_TAR_NAME:-1700000000_2026_01_01_16.11.0-ce_gitlab_backup.tar} ... done"
         exit 0
         ;;
     *"exec"*"gitlab-backup"*)
@@ -228,8 +233,15 @@ case "$args" in
         echo "200"
         exit 0
         ;;
+    *"exec"*"sh -c"*"du -sb"*)
+        # staging total: denominator for the "Creating backup archive" progress bar
+        if [ "${MOCK_PACK_TOTAL_FAIL:-0}" -eq 1 ]; then exit 1; fi
+        echo "${MOCK_PACK_TOTAL:-1000000}"
+        exit 0
+        ;;
     *"exec"*"sh -c"*"stat"*"tar.gz"*)
         echo "0 /var/opt/gitlab/backups/dummy.tar.gz"
+        echo "${MOCK_BACKUP_TAR_SIZE:-500000} /var/opt/gitlab/backups/${MOCK_BACKUP_TAR_NAME:-1700000000_2026_01_01_16.11.0-ce_gitlab_backup.tar}"
         echo "---"
         exit 0
         ;;

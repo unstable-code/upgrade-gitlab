@@ -64,6 +64,7 @@ When `UPGRADE_POINTS_ARRAY` is empty (already at target) AND `_prev_exit != 0` (
 A background `_size_poller` runs `docker exec` in a loop and writes per-tick lines to a tempfile: sizes of `*.tar.gz` staging files, size of the assembled `*_gitlab_backup.tar`, and total non-loopback `tx_bytes` from `/sys/class/net/*/statistics`. `run_with_progress_bar` consumes these to compute per-stage percentages:
 - `Dumping repositories` → `_total_project_count` vs `"completed create"` log lines
 - `Dumping uploads/builds/artifacts/lfs` → tar.gz size vs precomputed total from `project_statistics`
+- `Creating backup archive` → assembled tar size vs the staging total. GitLab's `pack` only deletes staging content in its `ensure` block (after the tar is written and uploaded), so the denominator stays valid for the whole stage. The total comes from a one-shot `du -sb --exclude=*_gitlab_backup.tar` fired asynchronously on stage entry (`_start_pack_total_probe`) — `du` can take seconds on a large staging dir, so the bar stays indeterminate until the value lands, and stays indeterminate for good if the probe fails.
 - `Uploading backup archive to remote storage` → egress bytes since stage start vs final tar size, rendered with `~` prefix to indicate approximation (fog SDK's per-chunk open/close defeats FD-position tracking, so network bytes are the only viable signal)
 
 ### Config Backup Lifecycle
