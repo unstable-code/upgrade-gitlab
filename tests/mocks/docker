@@ -134,6 +134,13 @@ case "$args" in
             echo "  2 | runner-2    | 2024-01-01   | t"
         fi
         ;;
+    *"exec"*"gitlab-psql"*"FROM lfs_objects"*)
+        # Deduplicated on-disk LFS total. MOCK_LFS_DISK_FAIL=1 simulates an old
+        # GitLab / permission error so the caller keeps the project_statistics value.
+        [ -n "$MOCK_STATE_DIR" ] && touch "$MOCK_STATE_DIR/lfs_disk_query"
+        if [ "${MOCK_LFS_DISK_FAIL:-0}" -eq 1 ]; then exit 1; fi
+        echo "${MOCK_LFS_DISK_SIZE:-262144}"
+        ;;
     *"exec"*"gitlab-psql"*"project_statistics"*)
         if [ "${MOCK_PSQL_STATS_FAIL:-0}" -eq 1 ]; then exit 1; fi
         echo "1048576|${MOCK_LFS_SIZE:-524288}|262144|131072|${MOCK_PROJECT_COUNT:-3}"

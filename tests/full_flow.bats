@@ -171,6 +171,28 @@ teardown() {
     [[ "$output" == *"Successfully updated"* ]]
 }
 
+# ---------- Test 12d: LFS denominator comes from the deduplicated on-disk total ----------
+@test "full-flow: lfs progress denominator queries lfs_objects, not project_statistics" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [ -f "$MOCK_STATE_DIR/lfs_disk_query" ]
+    [[ "$output" == *"Successfully updated"* ]]
+}
+
+# ---------- Test 12e: LFS denominator falls back when lfs_objects is unqueryable ----------
+@test "full-flow: lfs denominator falls back to project_statistics on query failure" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_LFS_DISK_FAIL=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [ -f "$MOCK_STATE_DIR/lfs_disk_query" ]
+    [[ "$output" == *"Dumping lfs objects"* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+}
+
 # ---------- Test 13: Stuck failed(4) migration is fatal ----------
 @test "full-flow: status=4 (failed) migration triggers FATAL exit" {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"

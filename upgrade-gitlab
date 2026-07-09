@@ -1210,6 +1210,32 @@ _query_backup_stats() {
     fi
     IFS='|' read -r _ _total_lfs_size _total_artifacts_size _total_uploads_size _total_project_count <<< "$raw"
     _backup_stats_available=1
+
+    # lfs.tar.gz는 project_statistics가 아니라 oid로 중복제거된 전역 저장소를 압축한다.
+    # 더 정확한 분모를 구할 수 있으면 갈아끼운다 (_query_lfs_disk_size 주석 참고).
+    local lfs_on_disk
+    if lfs_on_disk=$(_query_lfs_disk_size); then
+        _total_lfs_size=$lfs_on_disk
+    fi
+}
+
+# lfs.tar.gz가 압축하는 대상은 Settings.lfs.storage_path — oid로 주소화된 전역
+# 중복제거 저장소다. 반면 SUM(project_statistics.lfs_objects_size)는 프로젝트별
+# 링크를 각각 더하므로(update_lfs_objects_size), 분모가 두 방향으로 어긋난다:
+#   - 포크 등으로 여러 프로젝트가 공유하는 객체가 중복 계산 → 바가 100%에 못 닿음
+#   - 오브젝트 스토리지에 있어 디스크에 없는 객체까지 포함 → 역시 과대 계상
+# lfs_objects를 직접 세면 둘 다 사라진다. file_store가 NULL인 레거시 행은 GitLab이
+# 로컬로 취급하므로(object_store: "null value indicates the local storage") COALESCE한다.
+# 실패(구버전/권한 등) 시 비-0 종료로 알려서 호출부가 기존 값을 유지하게 한다. 단
+# 정상적으로 0이 나온 경우(전부 오브젝트 스토리지)는 성공이며, 그때는 bouncing bar로
+# 떨어지는 게 맞다 — tar에 담길 게 실제로 없기 때문이다.
+_query_lfs_disk_size() {
+    local v
+    v=$(docker exec "$CONTAINER_NAME" gitlab-psql -tAc \
+        "SELECT COALESCE(SUM(size),0) FROM lfs_objects WHERE COALESCE(file_store, 1) = 1;" 2>/dev/null) || return 1
+    v="${v//[[:space:]]/}"
+    [[ "$v" =~ ^[0-9]+$ ]] || return 1
+    echo "$v"
 }
 
 # _draw_backup_progress <label> <percentage> <tick> [approx] [extra]
@@ -1681,7 +1707,13 @@ run_with_progress_bar() {
                     pct=$(( cur_size * 100 / _total_uploads_size ))
                 fi
                 ;;
-            "Dumping builds"*|"Dumping artifacts"*)
+            "Dumping builds"*)
+                # builds.tar.gz는 Settings.gitlab_ci.builds_path(CI job 로그)를 담는다.
+                # artifacts.tar.gz와는 별개 파일이고 대응하는 크기 컬럼도 없으므로
+                # 진행률 없이 bouncing bar로 둔다.
+                display_label="Backup: Dumping builds"
+                ;;
+            "Dumping artifacts"*)
                 display_label="Backup: Dumping artifacts"
                 if [ "$_total_artifacts_size" -gt 0 ]; then
                     local cur_size
