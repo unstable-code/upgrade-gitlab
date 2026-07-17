@@ -143,6 +143,39 @@ teardown() {
     [[ "$output" == *"Successfully updated"* ]]
 }
 
+# ---------- --skip-object-storage: detected resources become SKIP= ----------
+@test "full-flow: --skip-object-storage passes detected resources as SKIP" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_OBJECT_STORAGE="lfs artifacts packages"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock --skip-object-storage
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"will be skipped during backup"* ]]
+    # detected components reach gitlab-backup as a single SKIP= env, in detection order
+    grep -q "SKIP=lfs,artifacts,packages" "$MOCK_STATE_DIR/backup_args"
+}
+
+# ---------- --skip-object-storage merges with --skip-lfs without duplicating ----------
+@test "full-flow: --skip-object-storage merges with --skip-lfs without duplicating lfs" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_OBJECT_STORAGE="lfs uploads"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock --skip-lfs --skip-object-storage
+    [ "$status" -eq 0 ]
+    # --skip-lfs seeds lfs; detection adds uploads but must not re-add lfs
+    grep -q "SKIP=lfs,uploads" "$MOCK_STATE_DIR/backup_args"
+    ! grep -qE "lfs,lfs|lfs,uploads,lfs" "$MOCK_STATE_DIR/backup_args"
+}
+
+# ---------- no skip flags: backup receives no SKIP= ----------
+@test "full-flow: backup passes no SKIP when no skip flags are given" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    ! grep -q "SKIP=" "$MOCK_STATE_DIR/backup_args"
+}
+
 # ---------- Test 12b: "Creating backup archive" is a determinate stage ----------
 # MOCK_PACK_SLEEP holds the mock inside the pack stage so the polling loop samples
 # it; the bar itself renders to _tty (/dev/null under bats), so what this asserts is

@@ -151,7 +151,16 @@ case "$args" in
     *"exec"*"which"*)
         exit 0
         ;;
+    *"exec"*"gitlab-rails runner"*)
+        # --skip-object-storage detection: emit the object-storage-enabled resource
+        # types from MOCK_OBJECT_STORAGE (space-separated), one per line, mimicking the
+        # Gitlab.config probe. Empty/unset → no output → nothing gets skipped.
+        for _t in ${MOCK_OBJECT_STORAGE:-}; do echo "$_t"; done
+        exit 0
+        ;;
     *"exec"*"-t"*"gitlab-backup"*)
+        # Record the full arg string so tests can assert on the passed SKIP= value.
+        [ -n "$MOCK_STATE_DIR" ] && echo "$args" > "$MOCK_STATE_DIR/backup_args"
         # -t flag backup (progress bar path)
         echo "2026-01-01 00:00:00 UTC -- Dumping database ... done"
         echo "2026-01-01 00:00:00 UTC -- Dumping repositories ..."

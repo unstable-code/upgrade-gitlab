@@ -15,7 +15,8 @@ edition_flag=
 auto_yes=0
 dry_run=0
 no_step_limit=0
-skip_lfs=0
+skip_components=""
+skip_object_storage=0
 reset_stuck_finalizing=0
 max_tier_flag=
 _interrupted=0
@@ -257,7 +258,7 @@ _resume_paused_runners() {
 }
 
 if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
-    echo "Usage: $0 [-y] [--edition=ce|ee] [--target-url=http] [--discord-url=http] [--version=0.0.0] [--skip-latest] [--skip-lfs] [--no-step-limit] [--dry-run] [--reset-stuck-finalizing] [--max-tier=core|starter|premium|ultimate]"
+    echo "Usage: $0 [-y] [--edition=ce|ee] [--target-url=http] [--discord-url=http] [--version=0.0.0] [--skip-latest] [--skip-lfs] [--skip-object-storage] [--no-step-limit] [--dry-run] [--reset-stuck-finalizing] [--max-tier=core|starter|premium|ultimate]"
 
     echo -e '\n\e[0;1mOPTIONS\e[m'
     echo -e "-y, --yes\t\tAuto-confirm prompts for unattended/cron usage. Aborts on safety warnings and if upgrade path >= 3 steps. Requires DISCORD_URL unless CI=true."
@@ -269,6 +270,7 @@ if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
     echo -e "--no-step-limit\t\tDisable the 3-step safety limit for -y mode. Requires CI=true."
     echo -e "--target-url=http\tPerform a simple connection test for your GitLab server."
     echo -e "--skip-lfs\t\tSkip LFS objects during backup (passes SKIP=lfs to gitlab-backup)."
+    echo -e "--skip-object-storage\tSkip every resource already offloaded to object storage (detected via gitlab-rails) from the backup. Assumes the bucket is backed up separately; prints exactly what it skips."
     echo -e "--reset-stuck-finalizing\tReset batched_background_migrations rows stuck in status=finalizing(5) for >7 days back to active(1) so GitLab can re-finalize them. Does NOT execute the finalize rake task itself."
     echo -e "--max-tier=TIER\t\tUpper tier bound for the 'What is new since' link in the completion webhook. One of core/starter/premium/ultimate. Default: core for CE, ultimate for EE."
     echo -e "--discord-url=http\tNotify via Discord webhook."
@@ -302,7 +304,9 @@ else
                 fi
                 skip_latest=1
             elif [ "${params[$i]}" == "--skip-lfs" ]; then
-                skip_lfs=1
+                skip_components="${skip_components:+$skip_components,}lfs"
+            elif [ "${params[$i]}" == "--skip-object-storage" ]; then
+                skip_object_storage=1
             elif [ "${params[$i]}" == "--reset-stuck-finalizing" ]; then
                 reset_stuck_finalizing=1
             elif [[ "${params[$i]}" == "--max-tier"* ]]; then
@@ -1196,6 +1200,24 @@ _size_poller_pid=
 _size_poller_file=
 _pack_probe_pid=
 _pack_probe_file=
+
+# object storage로 오프로드된(그래서 --skip-object-storage 시 백업 tar에서 제외할)
+# 자원 컴포넌트를 개행 구분으로 출력한다. gitlab.rb를 grep하지 않고 렌더된
+# Gitlab.config를 직접 읽어 consolidated object storage의 기본-enabled 타입까지 잡는다.
+# 각 config 섹션은 GitLab 버전에 따라 없을 수 있으므로 루프 내에서 개별 rescue한다.
+# 실패 시(구버전/rails 미탑재/권한) 빈 출력 → skip_components 변화 없음(안전).
+_detect_object_storage_skips() {
+    local runner_script
+    runner_script='%w[artifacts external_diffs lfs uploads packages terraform_state pages ci_secure_files].each do |t|
+  begin
+    os = Gitlab.config.public_send(t)["object_store"]
+    puts t if os && os["enabled"]
+  rescue StandardError
+  end
+end'
+    docker exec "$CONTAINER_NAME" gitlab-rails runner "$runner_script" 2>/dev/null \
+        | grep -Ex 'artifacts|external_diffs|lfs|uploads|packages|terraform_state|pages|ci_secure_files'
+}
 
 _query_backup_stats() {
     local raw
@@ -2524,9 +2546,6 @@ auto_restart_enabled=$(docker inspect --format='{{.HostConfig.RestartPolicy.Name
 check_disk_space
 
 echo "Creating backups for $CURRENT_VERSION. Please wait until backup process is completed..."
-if [ $skip_lfs -eq 1 ]; then
-    echo "Note: LFS objects will be skipped during backup (--skip-lfs)."
-fi
 
 # 1번째 iteration(또는 CE→EE swap) 대상 이미지를 백업과 동시에 사전 Pull.
 # 백업(특히 backup_upload_* 원격 전송)은 보통 I/O 바운드라 docker pull과 거의 경합하지 않으므로
@@ -2537,34 +2556,43 @@ PULL_PID=
 docker pull "$GITLAB_IMAGE:${UPGRADE_POINTS_ARRAY[0]}" &> /dev/null &
 PULL_PID=$!
 
+# --skip-object-storage: object storage로 오프로드된 자원을 감지해 skip_components에 합류.
+# gitlab.rb grep은 consolidated object storage의 기본-enabled 타입을 놓치므로
+# source of truth인 Gitlab.config를 직접 읽는다(rails 로드에 ~30초). 위 docker pull과 겹쳐 돈다.
+if [ "$skip_object_storage" -eq 1 ]; then
+    echo "Detecting object-storage-backed resources via gitlab-rails (this can take ~30s)..."
+    _os_skips=$(_detect_object_storage_skips)
+    for _c in $_os_skips; do
+        case ",$skip_components," in
+            *",$_c,"*) ;;  # 이미 --skip-lfs 등으로 포함된 컴포넌트는 건너뜀
+            *) skip_components="${skip_components:+$skip_components,}$_c" ;;
+        esac
+    done
+fi
+
+# SKIP 컴포넌트를 두 호출 규약에 맞춰 한 번만 조립한다:
+# gitlab-backup은 docker exec 환경변수(-e SKIP=), gitlab-rake는 rake 인자(SKIP=).
+# 비어 있으면 두 배열 모두 비어 확장되어(set -u 미사용) 기존 무-skip 동작과 동일.
+backup_skip_env=()
+backup_skip_rake=()
+if [ -n "$skip_components" ]; then
+    echo "Note: the following resources will be skipped during backup: ${skip_components//,/, } (SKIP=$skip_components)."
+    backup_skip_env=(-e "SKIP=$skip_components")
+    backup_skip_rake=("SKIP=$skip_components")
+fi
+
 _query_backup_stats
 if docker exec "$CONTAINER_NAME" which gitlab-backup &>/dev/null; then
     if [ "$_backup_stats_available" -eq 1 ]; then
-        if [ $skip_lfs -eq 1 ]; then
-            run_with_progress_bar "Backup" docker exec -t -e TERM=dumb -e SKIP=lfs "$CONTAINER_NAME" gitlab-backup create
-        else
-            run_with_progress_bar "Backup" docker exec -t -e TERM=dumb "$CONTAINER_NAME" gitlab-backup create
-        fi
+        run_with_progress_bar "Backup" docker exec -t -e TERM=dumb "${backup_skip_env[@]}" "$CONTAINER_NAME" gitlab-backup create
     else
-        if [ $skip_lfs -eq 1 ]; then
-            run_with_bouncing_bar "Backup" docker exec -e SKIP=lfs "$CONTAINER_NAME" gitlab-backup create
-        else
-            run_with_bouncing_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-backup create
-        fi
+        run_with_bouncing_bar "Backup" docker exec "${backup_skip_env[@]}" "$CONTAINER_NAME" gitlab-backup create
     fi
 else
     if [ "$_backup_stats_available" -eq 1 ]; then
-        if [ $skip_lfs -eq 1 ]; then
-            run_with_progress_bar "Backup" docker exec -t -e TERM=dumb "$CONTAINER_NAME" gitlab-rake gitlab:backup:create SKIP=lfs
-        else
-            run_with_progress_bar "Backup" docker exec -t -e TERM=dumb "$CONTAINER_NAME" gitlab-rake gitlab:backup:create
-        fi
+        run_with_progress_bar "Backup" docker exec -t -e TERM=dumb "$CONTAINER_NAME" gitlab-rake gitlab:backup:create "${backup_skip_rake[@]}"
     else
-        if [ $skip_lfs -eq 1 ]; then
-            run_with_bouncing_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-rake gitlab:backup:create SKIP=lfs
-        else
-            run_with_bouncing_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-rake gitlab:backup:create
-        fi
+        run_with_bouncing_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-rake gitlab:backup:create "${backup_skip_rake[@]}"
     fi
 fi
 BACKUP_DIR=$(docker exec "$CONTAINER_NAME" grep "'backup_path'" /etc/gitlab/gitlab.rb 2>/dev/null | awk -F"=" '{ print $2 }' | sed 's/\"//g' | sed 's/^ //')

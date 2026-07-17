@@ -107,6 +107,6 @@ Stages: `lint` → `test` → `promote`
 
 ## Key Flags
 
-`-y` auto-confirm (requires `DISCORD_URL` unless `CI=true`) | `--dry-run` compute path only | `--version=X[.Y[.Z]]` target version | `--skip-latest`/`--n-1` previous minor | `--no-step-limit` (CI only) | `--skip-lfs` skip LFS in backup | `--edition=ce|ee` | `--reset-stuck-finalizing` auto-reset status=5 zombies | `--max-tier=core|starter|premium|ultimate` what's-new URL tier | `--target-url` health check URL | `--discord-url` webhook
+`-y` auto-confirm (requires `DISCORD_URL` unless `CI=true`) | `--dry-run` compute path only | `--version=X[.Y[.Z]]` target version | `--skip-latest`/`--n-1` previous minor | `--no-step-limit` (CI only) | `--skip-lfs` skip LFS in backup | `--skip-object-storage` skip every resource offloaded to object storage (detected via `gitlab-rails runner` reading `Gitlab.config.<type>.object_store.enabled`; merges into the same `SKIP=` list as `--skip-lfs`) | `--edition=ce|ee` | `--reset-stuck-finalizing` auto-reset status=5 zombies | `--max-tier=core|starter|premium|ultimate` what's-new URL tier | `--target-url` health check URL | `--discord-url` webhook
 
 Env-only: `UPGRADE_GITLAB_CONFIG_HOOK=PATH` runs an executable after gitlab.rb/secrets.json copies are made and pruned. If unset, an executable `upload-config.hook` next to the script is auto-detected. Hook receives `UPGRADE_GITLAB_SCRIPT_DIR` so it can locate sibling files (rclone.conf, etc.). Template at `upload-config.hook.example`.
