@@ -513,8 +513,8 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_GITLAB_VERSION="18.0.1-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_EXIT_CODE=137                    # _prev_exit != 0 → recovery branch
-    export XDG_RUNTIME_DIR=$(mktemp -d)         # state-dir override (runtime dir is preferred)
-    sf="$XDG_RUNTIME_DIR/upgrade-gitlab-gitlab.paused-runners"
+    sf="$RUNNER_STATE_FILE"                       # persistent-first state path (see test_helper)
+    mkdir -p "$(dirname "$sf")"
     printf '3\n7\n' > "$sf"
 
     run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
@@ -522,8 +522,6 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     [[ "$output" == *"Resuming post-upgrade checks"* ]]
     [[ "$output" == *"Resumed previously paused runners: 3,7"* ]]
     [ ! -f "$sf" ]                              # state file consumed after resume
-
-    rm -rf "$XDG_RUNTIME_DIR"
 }
 
 # ---------- Test 31: recovery without a state file is an idempotent no-op ----------
@@ -531,15 +529,13 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_GITLAB_VERSION="18.0.1-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_EXIT_CODE=137
-    export XDG_RUNTIME_DIR=$(mktemp -d)         # empty: no leftover state file
+    # No state file is seeded → RUNNER_STATE_FILE does not exist (empty leftover case).
 
     run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
     [ "$status" -eq 0 ]
     [[ "$output" == *"Resuming post-upgrade checks"* ]]
     # No file → must not touch runners we never paused (e.g. admin-paused ones).
     [[ "$output" != *"Resumed previously paused runners"* ]]
-
-    rm -rf "$XDG_RUNTIME_DIR"
 }
 
 # ---------- Test 31b: recovery starts a stopped container before version detection ----------
@@ -575,8 +571,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_RUNNER_COUNT=2                    # active runners 1,2 get paused
     export MOCK_PSQL_STATS_FAIL=1                 # route to the simple (bouncing-bar) backup branch
     export MOCK_BACKUP_SLEEP=5                    # hold inside backup so we can signal mid-backup
-    export XDG_RUNTIME_DIR=$(mktemp -d)
-    sf="$XDG_RUNTIME_DIR/upgrade-gitlab-gitlab.paused-runners"
+    sf="$RUNNER_STATE_FILE"                        # persistent-first state path (see test_helper)
 
     bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock > "$MOCK_STATE_DIR/out.log" 2>&1 &
     pid=$!
@@ -597,8 +592,6 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     grep -q "Resumed previously paused runners: 1,2" "$MOCK_STATE_DIR/out.log"
     ! grep -q "Entering critical section" "$MOCK_STATE_DIR/out.log"  # stopped in backup, before the upgrade
     [ ! -f "$sf" ]                                                 # state file consumed by resume
-
-    rm -rf "$XDG_RUNTIME_DIR"
 }
 
 # ---------- Test 31d: non-signal abort before the critical zone resumes paused runners ----------
@@ -610,8 +603,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_RUNNER_COUNT=2                    # active runners 1,2 get paused
     export MOCK_SECRETS=bad                       # pre-upgrade secrets integrity check fails
-    export XDG_RUNTIME_DIR=$(mktemp -d)
-    sf="$XDG_RUNTIME_DIR/upgrade-gitlab-gitlab.paused-runners"
+    sf="$RUNNER_STATE_FILE"                        # persistent-first state path (see test_helper)
 
     run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
     [ "$status" -eq 1 ]                                            # aborted on secrets failure
@@ -619,8 +611,6 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     [[ "$output" == *"Resumed previously paused runners: 1,2"* ]]  # EXIT trap caught the abort
     ! [[ "$output" == *"Entering critical section"* ]]             # aborted before the upgrade
     [ ! -f "$sf" ]                                                 # state file consumed by resume
-
-    rm -rf "$XDG_RUNTIME_DIR"
 }
 
 # ---------- Test 32: pause merges leftover IDs with newly paused runners (union) ----------
@@ -628,8 +618,8 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"   # 1-step upgrade
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_RUNNER_COUNT=2                   # SELECT id ... active=true → 1,2
-    export XDG_RUNTIME_DIR=$(mktemp -d)
-    sf="$XDG_RUNTIME_DIR/upgrade-gitlab-gitlab.paused-runners"
+    sf="$RUNNER_STATE_FILE"                       # persistent-first state path (see test_helper)
+    mkdir -p "$(dirname "$sf")"
     printf '9\n' > "$sf"                         # leftover from a prior aborted run
 
     run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
@@ -638,6 +628,4 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     # (the in-memory fallback alone would yield only 1,2).
     [[ "$output" == *"Resumed previously paused runners: 1,2,9"* ]]
     [ ! -f "$sf" ]
-
-    rm -rf "$XDG_RUNTIME_DIR"
 }

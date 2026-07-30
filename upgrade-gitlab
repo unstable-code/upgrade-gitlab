@@ -434,15 +434,31 @@ echo "Detected gitlab container: $CONTAINER_NAME"
 # 영속 러너 일시정지 상태 파일 — 업그레이드가 중간에 실패해도(스크립트 종료/컨테이너 사망)
 # 다음 실행이 "우리가 일시정지한" 러너를 정확히 되살릴 수 있도록 ID를 기록한다.
 # 메모리 변수 PAUSED_RUNNER_IDS는 프로세스가 죽으면 사라지므로 이 파일이 source of truth다.
-# 런타임 디렉터리(/var/run/user/$UID)를 우선 쓰고, 없거나 쓸 수 없으면 /var/run → /tmp로 폴백한다.
-# 모두 이미 존재하는 디렉터리라 별도 생성이 필요 없고 부수효과도 없다(dry-run에서도 무해).
-_runner_state_dir=/tmp
-for _d in "${XDG_RUNTIME_DIR:-/var/run/user/$UID}" /var/run /tmp; do
-    if [ -d "$_d" ] && [ -w "$_d" ]; then
+# 이 파일의 목적은 "실행 간 지속"이며, 업그레이드 도중 재부팅/크래시를 넘어 살아남아야
+# orphan된 paused 러너를 다음 실행이 재개할 수 있다. 따라서 영속 경로를 우선하고,
+# tmpfs(/run/user, /var/run, /tmp)는 최후 폴백으로만 쓴다 — tmpfs에 두면 재부팅 시
+# 기록이 증발해 러너가 paused로 방치된다.
+# 우선순위: XDG_STATE_HOME(~/.local/state) → 스크립트 디렉터리 → 런타임 tmpfs.
+_runner_state_dir=""
+_persist_base="${XDG_STATE_HOME:-${HOME:+$HOME/.local/state}}"
+for _d in "${_persist_base:+$_persist_base/upgrade-gitlab}" "$SCRIPT_DIR"; do
+    [ -n "$_d" ] || continue
+    # 영속 후보는 존재하지 않을 수 있으므로 생성 시도(idempotent, dry-run에서도 무해).
+    if mkdir -p "$_d" 2>/dev/null && [ -w "$_d" ]; then
         _runner_state_dir="$_d"
         break
     fi
 done
+# 영속 경로 확보 실패($HOME 미설정 등) 시에만 tmpfs로 폴백(기존 동작 보존).
+if [ -z "$_runner_state_dir" ]; then
+    _runner_state_dir=/tmp
+    for _d in "${XDG_RUNTIME_DIR:-/var/run/user/$UID}" /var/run /tmp; do
+        if [ -d "$_d" ] && [ -w "$_d" ]; then
+            _runner_state_dir="$_d"
+            break
+        fi
+    done
+fi
 _runner_state_file="$_runner_state_dir/upgrade-gitlab-${CONTAINER_NAME}.paused-runners"
 
 # --------------------------
