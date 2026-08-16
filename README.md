@@ -1,7 +1,7 @@
 # upgrade-gitlab
 
-[![pipeline status](https://gitlab.com/gitlab-useful-scripts/upgrade-gitlab/badges/master/pipeline.svg)](https://gitlab.com/gitlab-useful-scripts/upgrade-gitlab/-/commits/master)
-[![coverage report](https://gitlab.com/gitlab-useful-scripts/upgrade-gitlab/badges/master/coverage.svg?job=integration-test)](https://gitlab.com/gitlab-useful-scripts/upgrade-gitlab/-/commits/master)
+[![pipeline status](https://gitlab.gggames.synology.me/unstable-code/upgrade-gitlab/badges/master/pipeline.svg)](https://gitlab.gggames.synology.me/unstable-code/upgrade-gitlab/-/commits/master)
+[![coverage report](https://gitlab.gggames.synology.me/unstable-code/upgrade-gitlab/badges/master/coverage.svg?job=logic-test)](https://gitlab.gggames.synology.me/unstable-code/upgrade-gitlab/-/commits/master)
 
 An automated upgrade script for Docker-based GitLab instances. Supports both CE and EE editions with safe, step-by-step version upgrades following the [official upgrade path](https://gitlab-com.gitlab.io/support/toolbox/upgrade-path/).
 
@@ -153,16 +153,12 @@ bats tests/upgrade_path.bats   # arg parsing + path resolution via --dry-run
 bats tests/full_flow.bats      # full upgrade flow against stateful mocks (incl. stuck-migration scenarios)
 ```
 
-### Integration test (CI only)
-
-Runs a real GitLab upgrade via Docker-in-Docker. Triggered by scheduled or manual pipeline in GitLab CI.
-
 ## Wiki
 
-For detailed guides, see the [project wiki](https://gitlab.com/gitlab-useful-scripts/upgrade-gitlab/-/wikis/home):
+For detailed guides, see the [project wiki](https://gitlab.gggames.synology.me/unstable-code/upgrade-gitlab/-/wikis/home):
 
-- [Pre-upgrade Checklist](https://gitlab.com/gitlab-useful-scripts/upgrade-gitlab/-/wikis/Pre-upgrade-Checklist) — Manual steps to complete before running the script
-- [Troubleshooting](https://gitlab.com/gitlab-useful-scripts/upgrade-gitlab/-/wikis/Troubleshooting) — Solutions for DB migration failures and debugging tips
+- [Pre-upgrade Checklist](https://gitlab.gggames.synology.me/unstable-code/upgrade-gitlab/-/wikis/Pre-upgrade-Checklist) — Manual steps to complete before running the script
+- [Troubleshooting](https://gitlab.gggames.synology.me/unstable-code/upgrade-gitlab/-/wikis/Troubleshooting) — Solutions for DB migration failures and debugging tips
 
 ## License
 
