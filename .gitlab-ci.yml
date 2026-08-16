@@ -22,6 +22,7 @@ logic-test:
     - kcov --include-pattern=/upgrade-gitlab/upgrade-gitlab coverage_output bats tests/
     - coverage_pct=$(jq -r '.percent_covered' coverage_output/bats/coverage.json 2>/dev/null || echo "0.0")
     - echo "Coverage:${coverage_pct}%"
+  coverage: '/Coverage:(\d+(?:\.\d+)?)%/'
   artifacts:
     reports:
       coverage_report:
