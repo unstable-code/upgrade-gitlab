@@ -60,7 +60,7 @@ All `docker stop` calls pass `-t $STOP_TIMEOUT` (300s). The 10s default SIGKILLs
 5. Post-upgrade: final health check, resume paused runners
 
 ### Recovery Path
-When `UPGRADE_POINTS_ARRAY` is empty (already at target) AND `_prev_exit != 0` (previous container exit was abnormal), the script skips backup and re-runs health/migration/secrets checks only. This is also the entry point exercised by integration-test's stuck-injection scenarios via `docker kill` (which sets ExitCode=137 so the next invocation enters the recovery path without a fresh backup).
+When `UPGRADE_POINTS_ARRAY` is empty (already at target) AND `_prev_exit != 0` (previous container exit was abnormal), the script skips backup and re-runs health/migration/secrets checks only. `docker kill` sets ExitCode=137, so an invocation following a killed container enters this path without taking a fresh backup — the handle used to reach it manually when reproducing stuck-migration scenarios against a real PostgreSQL.
 
 ### Backup Progress Tracking
 A background `_size_poller` runs `docker exec` in a loop and writes per-tick lines to a tempfile: sizes of `*.tar.gz` staging files, size of the assembled `*_gitlab_backup.tar`, and total non-loopback `tx_bytes` from `/sys/class/net/*/statistics`. `run_with_progress_bar` consumes these to compute per-stage percentages:
@@ -111,8 +111,11 @@ Stages: `lint` → `test` → `promote`
 
 - **shellcheck**: Lints on develop, master, MRs
 - **logic-test**: Runs `bats tests/` with kcov coverage on develop, master, MRs
-- **integration-test**: Spins up real GitLab container, runs full upgrade, then impersonates stuck batched_background_migrations (status=4 / status=5) to validate real-PG detection against the recovery path triggered via `docker kill`. Schedule/manual only, self-hosted runner, 6h timeout.
-- **promote-to-master**: Auto-pushes develop → master (official project only, uses `PUSH_TOKEN`)
+- **promote-to-master**: Auto-pushes develop → master (canonical project only, uses `PUSH_TOKEN`)
+
+There is no integration job. One existed — a real GitLab container upgraded end to end, then `batched_background_migrations` rows rewritten to status=4/5 to check stuck detection against a real PostgreSQL — but it had been failing continuously and was removed. Reviving it needs a privileged runner (it drove `docker:dind`) and a runner `maximum_timeout` above the default hour; a multi-hop upgrade of a real instance exceeds that.
+
+It also could not cross GitLab 19.0, which is worth knowing independently of CI: 19.0 dropped bundled Mattermost and its reconfigure hard-aborts with `Removed configurations found in gitlab.rb. Aborting reconfigure` when a `mattermost` key is present. On a stock install it *is* present — 18.x auto-generates a mattermost section in `gitlab-secrets.json` (salts, `sql_at_rest_encrypt_key`) even when Mattermost is unused, and regenerates it on every reconfigure, so each intermediate 18.x hop re-adds it. Crossing 19.0 cleanly would require editing secrets automatically, which is unsafe for real Mattermost users. This is an upstream GitLab issue, not a tool bug; users hit it as actionable output from `print_stacktrace_errors`' "Removed configurations found" branch (covered by a bats test).
 
 ## Key Flags
 
