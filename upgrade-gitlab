@@ -6,6 +6,10 @@ GITLAB_EDITION=
 PULL_PID=
 config_backup_hook=${UPGRADE_GITLAB_CONFIG_HOOK:-}
 LOG_DRIVER_OVERRIDE=${UPGRADE_GITLAB_LOG_DRIVER:-}
+# `docker stop`의 기본 유예는 10초라 GitLab(실측 32~55초)은 매번 SIGKILL(137)로 죽는다.
+# PostgreSQL/Gitaly가 정리 없이 종료되면 다음 부팅이 crash recovery로 들어간다.
+# -t 는 상한이지 고정 대기가 아니므로(종료 즉시 반환) 넉넉히 잡아도 손해가 없다.
+STOP_TIMEOUT=300
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || SCRIPT_DIR=""
 
 skip_latest=0
@@ -2733,12 +2737,12 @@ if [ "$DETECTED_EDITION" != "$GITLAB_EDITION" ]; then
     if docker ps --format "{{.Names}}" | grep -q "^$CONTAINER_NAME$"; then
         echo "stopping $CURRENT_VERSION container..."
         if [ "${CI:-}" = "true" ]; then
-            run_with_bouncing_bar "Stopping" docker stop "$CONTAINER_NAME"
+            run_with_bouncing_bar "Stopping" docker stop -t "$STOP_TIMEOUT" "$CONTAINER_NAME"
         else
             run_with_bouncing_bar "Stopping" bash -c "
                 docker logs --follow --tail 0 \"$CONTAINER_NAME\" &
                 logs_pid=\$!
-                docker stop \"$CONTAINER_NAME\" 2>&1
+                docker stop -t $STOP_TIMEOUT \"$CONTAINER_NAME\" 2>&1
                 kill \$logs_pid 2>/dev/null
                 wait \$logs_pid 2>/dev/null
             "
@@ -2817,12 +2821,12 @@ for ver in "${UPGRADE_POINTS_ARRAY[@]}"; do
     if docker ps --format "{{.Names}}" | grep -q "^$CONTAINER_NAME$"; then
         echo "stopping $CNT_VERSION container..."
         if [ "${CI:-}" = "true" ]; then
-            run_with_bouncing_bar "Stopping" docker stop "$CONTAINER_NAME"
+            run_with_bouncing_bar "Stopping" docker stop -t "$STOP_TIMEOUT" "$CONTAINER_NAME"
         else
             run_with_bouncing_bar "Stopping" bash -c "
                 docker logs --follow --tail 0 \"$CONTAINER_NAME\" &
                 logs_pid=\$!
-                docker stop \"$CONTAINER_NAME\" 2>&1
+                docker stop -t $STOP_TIMEOUT \"$CONTAINER_NAME\" 2>&1
                 kill \$logs_pid 2>/dev/null
                 wait \$logs_pid 2>/dev/null
             "

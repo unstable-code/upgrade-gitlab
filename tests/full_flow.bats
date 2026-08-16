@@ -671,3 +671,14 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     grep -q -- '--log-driver db' "$MOCK_STATE_DIR/run_args"
     ! grep -q -- '--log-driver json-file' "$MOCK_STATE_DIR/run_args"
 }
+
+# ---------- Test 36: container stop uses a grace period long enough for GitLab ----------
+@test "full-flow: docker stop passes an explicit grace period" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"   # 1-step upgrade
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    # The 10s default SIGKILLs GitLab (ExitCode 137); a real shutdown measures 32-55s.
+    grep -q -- 'stop -t 300' "$MOCK_STATE_DIR/stop_args"
+}

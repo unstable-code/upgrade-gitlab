@@ -303,6 +303,10 @@ case "$args" in
         exit 0
         ;;
     *"stop"*)
+        # Record `docker stop` invocations so tests can assert on the grace period.
+        if [ -n "$MOCK_STATE_DIR" ]; then
+            printf '%s\n' "$args" >> "$MOCK_STATE_DIR/stop_args"
+        fi
         exit 0
         ;;
     *"rm"*)

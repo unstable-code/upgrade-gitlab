@@ -55,6 +55,8 @@ The whole post-confirmation flow (after pre-upgrade secrets check, through runne
 2. Backup (gitlab-backup or gitlab-rake for <12.2)
 3. Optional edition switch (CE→EE)
 4. Version upgrade loop: for each stop → pre-pull next image → wait for background migrations → swap container → health check → verify migrations
+
+All `docker stop` calls pass `-t $STOP_TIMEOUT` (300s). The 10s default SIGKILLs GitLab — a real shutdown measures 32-55s — leaving PostgreSQL/Gitaly to crash-recover on the next boot. `-t` is a ceiling, not a fixed wait, so a generous value costs nothing when shutdown is clean.
 5. Post-upgrade: final health check, resume paused runners
 
 ### Recovery Path
