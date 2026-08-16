@@ -5,6 +5,7 @@ DISCORD_URL=${DISCORD_URL:-}
 GITLAB_EDITION=
 PULL_PID=
 config_backup_hook=${UPGRADE_GITLAB_CONFIG_HOOK:-}
+LOG_DRIVER_OVERRIDE=${UPGRADE_GITLAB_LOG_DRIVER:-}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || SCRIPT_DIR=""
 
 skip_latest=0
@@ -279,6 +280,7 @@ if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
     echo -e "TARGET_URL=http\t\tSame as --target-url flag."
     echo -e "DISCORD_URL=http\tSame as --discord-url flag."
     echo -e "UPGRADE_GITLAB_CONFIG_HOOK=PATH\tExecutable run after gitlab.rb / gitlab-secrets.json copies are created and pruned. If unset, an executable file named 'upload-config.hook' next to this script is auto-detected. Receives env vars UPGRADE_GITLAB_BACKUP_DIR (container-side path; use 'docker cp' to extract), UPGRADE_GITLAB_VERSION, UPGRADE_GITLAB_CONTAINER, UPGRADE_GITLAB_SCRIPT_DIR. Hook failure logs a warning but does not abort the upgrade. See upload-config.hook.example."
+    echo -e "UPGRADE_GITLAB_LOG_DRIVER=NAME\tLog driver for the recreated container. By default the current container's driver and options are preserved, except Synology ContainerManager's 'db' driver which is replaced with json-file (max-size=50m, max-file=3) because it deadlocks dockerd when a container is stopped while 'docker logs --follow' is attached. Set to 'db' to keep it anyway."
     exit 0
 else
     params=("${@}")
@@ -540,6 +542,36 @@ PORTS=$(docker inspect "$CONTAINER_NAME" --format='{{range $p, $conf := .HostCon
     | sed '/^$/d' \
     | sed 's/\/tcp//g' \
     | awk -F: '{printf "-p %s:%s ", $2, $1}')
+
+# --------------------------
+# 3️⃣ 로그 드라이버 결정
+# --------------------------
+# 컨테이너 재생성 시 로그 설정을 넘겨주지 않으면 데몬 기본값으로 조용히 되돌아가므로 보존한다.
+# 단 Synology ContainerManager의 자체 드라이버(db)만은 예외로 json-file로 교체한다.
+# db 드라이버는 종료 중인 컨테이너에 `docker logs --follow`가 붙어 있으면 dockerd를 데드락시킨다:
+#   logdb.tail 이 logdb 뮤텍스에서 멈춤 → 그 리더가 쥔 broadcaster 뮤텍스를
+#   handleContainerExit 의 CloseStreams 가 영원히 기다림 → 컨테이너 State 락이 풀리지 않아
+#   stop/kill/inspect 가 모두 무한 대기. 복구 수단은 dockerd 재시작뿐이다.
+# json-file 은 pkg/logdb 경로를 아예 타지 않으므로 이 데드락이 구조적으로 불가능하다.
+CURRENT_LOG_DRIVER=$(docker inspect "$CONTAINER_NAME" --format='{{.HostConfig.LogConfig.Type}}' 2>/dev/null)
+LOG_ARGS=
+
+if [ -n "$LOG_DRIVER_OVERRIDE" ]; then
+    LOG_ARGS="--log-driver $LOG_DRIVER_OVERRIDE"
+elif [ "$CURRENT_LOG_DRIVER" = 'db' ]; then
+    LOG_ARGS='--log-driver json-file --log-opt max-size=50m --log-opt max-file=3'
+    echo "Notice: the Synology 'db' log driver deadlocks dockerd when a container is stopped" >&2
+    echo "        while 'docker logs --follow' is attached. This container will be recreated with json-file." >&2
+    echo "        Logs stay available via 'docker logs' but no longer appear in the DSM UI." >&2
+    echo "        Set UPGRADE_GITLAB_LOG_DRIVER=db to keep the original driver." >&2
+elif [ -n "$CURRENT_LOG_DRIVER" ]; then
+    LOG_ARGS="--log-driver $CURRENT_LOG_DRIVER"
+    log_opts=$(docker inspect "$CONTAINER_NAME" \
+        --format='{{range $k, $v := .HostConfig.LogConfig.Config}}--log-opt {{$k}}={{$v}} {{end}}' 2>/dev/null)
+    if [ -n "$log_opts" ]; then
+        LOG_ARGS="$LOG_ARGS $log_opts"
+    fi
+fi
 
 send_discord_webhook() {
     if [ -z "$DISCORD_URL" ] || [ $# -ne 3 ]; then
@@ -2724,7 +2756,7 @@ if [ "$DETECTED_EDITION" != "$GITLAB_EDITION" ]; then
     pull_with_retry "$GITLAB_IMAGE:$EDITION_SWITCH_TAG"
 
     # shellcheck disable=SC2086
-    docker run -d --name "$CONTAINER_NAME" $VOLUMES $PORTS "$GITLAB_IMAGE:$EDITION_SWITCH_TAG"
+    docker run -d --name "$CONTAINER_NAME" $LOG_ARGS $VOLUMES $PORTS "$GITLAB_IMAGE:$EDITION_SWITCH_TAG"
 
     wait_for_http_ready "$GITLAB_IMAGE:$EDITION_SWITCH_TAG"
     wait_for_healthy "$GITLAB_IMAGE:$EDITION_SWITCH_TAG"
@@ -2814,7 +2846,7 @@ for ver in "${UPGRADE_POINTS_ARRAY[@]}"; do
     pull_with_retry "$GITLAB_IMAGE:$ver"
 
     # shellcheck disable=SC2086
-    docker run -d --name "$CONTAINER_NAME" $VOLUMES $PORTS "$GITLAB_IMAGE:$ver"
+    docker run -d --name "$CONTAINER_NAME" $LOG_ARGS $VOLUMES $PORTS "$GITLAB_IMAGE:$ver"
 
     wait_for_http_ready "$GITLAB_IMAGE:$ver"
     wait_for_healthy "$GITLAB_IMAGE:$ver"

@@ -49,6 +49,13 @@ case "$args" in
     *"inspect"*"PortBindings"*)
         echo "443/tcp:443 80/tcp:80 22/tcp:22"
         ;;
+    *"inspect"*"LogConfig.Type"*)
+        # MOCK_LOG_DRIVER lets tests exercise the Synology 'db' replacement branch.
+        echo "${MOCK_LOG_DRIVER:-json-file}"
+        ;;
+    *"inspect"*"LogConfig.Config"*)
+        printf '%s\n' "${MOCK_LOG_OPTS:-}"
+        ;;
     *"inspect"*"RestartPolicy"*)
         echo "unless-stopped"
         ;;
@@ -270,6 +277,10 @@ case "$args" in
     *"run"*)
         # Update state file with new version tag for full-flow simulation
         if [ -n "$MOCK_STATE_DIR" ]; then
+            # Record `docker run` invocations so tests can assert on the flags passed.
+            case "$args" in
+                "run "*) printf '%s\n' "$args" >> "$MOCK_STATE_DIR/run_args" ;;
+            esac
             _tag=$(echo "$args" | sed -n 's/.*gitlab\/gitlab-[^:]*:\([^ ]*\).*/\1/p')
             if [ -n "$_tag" ]; then
                 echo "$_tag" > "$MOCK_STATE_DIR/current_version"

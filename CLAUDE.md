@@ -77,6 +77,13 @@ After GitLab's `.tar` backup (which GitLab handles + uploads itself if `backup_u
 2. Prunes old copies using `gitlab.rb`'s `backup_keep_time` (parsed with the same simple grep+awk+sed pattern as `backup_path`; missing/0 = keep forever, mirroring GitLab's own retention semantics for `.tar`).
 3. Optionally invokes a user hook (see `UPGRADE_GITLAB_CONFIG_HOOK` below). The hook receives the container-side `BACKUP_DIR` (host-path translation is intentionally left to the hook via `docker cp`, so the feature works regardless of mount topology). Hook failures warn but never abort the upgrade.
 
+### Container Log Driver
+The container is recreated on every hop, so log settings must be passed explicitly or they silently revert to the daemon default. `LOG_ARGS` (derived next to `VOLUMES`/`PORTS`) preserves the current container's `LogConfig.Type` and its `--log-opt`s, with one deliberate exception: Synology ContainerManager's proprietary `db` driver is replaced with `json-file` (`max-size=50m`, `max-file=3`).
+
+`db` deadlocks dockerd whenever a container is stopped while `docker logs --follow` is attached — which is exactly what the non-CI stop path does. Confirmed by goroutine dump (`kill -USR1 <dockerd>`): `dblog.readLogs` → `logdb.tail` blocks on the logdb mutex; the stalled reader still holds the broadcaster mutex that `handleContainerExit` → `CloseStreams` → `broadcaster.Clean` needs; `handleContainerExit` holds the container State lock, so `ContainerStop` → `Daemon.Kill` → `State.GetPID`, `docker kill`, and `docker inspect` all block forever. containerd delivers the exit event correctly — the deadlock is entirely inside dockerd, which is why killing the shim does nothing and only a daemon restart recovers. `json-file` never enters `pkg/logdb`, making the deadlock structurally impossible.
+
+Reproduces only under log-DB contention (a busy multi-container host with accumulated log history); a quiet 2-container host runs the identical code without wedging. `UPGRADE_GITLAB_LOG_DRIVER` overrides the choice in both directions. Trade-off: json-file logs do not appear in the DSM Container Manager UI (`docker logs` is unaffected).
+
 ### TTY-Aware Output
 Terminal detected → animated spinners, progress bars with ETA. No terminal (CI) → plain text status.
 
@@ -110,3 +117,5 @@ Stages: `lint` → `test` → `promote`
 `-y` auto-confirm (requires `DISCORD_URL` unless `CI=true`) | `--dry-run` compute path only | `--version=X[.Y[.Z]]` target version | `--skip-latest`/`--n-1` previous minor | `--no-step-limit` (CI only) | `--skip-lfs` skip LFS in backup | `--skip-object-storage` skip every resource offloaded to object storage (detected via `gitlab-rails runner` reading `Gitlab.config.<type>.object_store.enabled`; merges into the same `SKIP=` list as `--skip-lfs`) | `--edition=ce|ee` | `--reset-stuck-finalizing` auto-reset status=5 zombies | `--max-tier=core|starter|premium|ultimate` what's-new URL tier | `--target-url` health check URL | `--discord-url` webhook
 
 Env-only: `UPGRADE_GITLAB_CONFIG_HOOK=PATH` runs an executable after gitlab.rb/secrets.json copies are made and pruned. If unset, an executable `upload-config.hook` next to the script is auto-detected. Hook receives `UPGRADE_GITLAB_SCRIPT_DIR` so it can locate sibling files (rclone.conf, etc.). Template at `upload-config.hook.example`.
+
+`UPGRADE_GITLAB_LOG_DRIVER=NAME` forces the log driver of the recreated container (see Container Log Driver below).

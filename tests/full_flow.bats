@@ -629,3 +629,45 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     [[ "$output" == *"Resumed previously paused runners: 1,2,9"* ]]
     [ ! -f "$sf" ]
 }
+
+# ---------- Test 33: Synology 'db' log driver is replaced with json-file ----------
+@test "full-flow: Synology db log driver is replaced with json-file on recreate" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"   # 1-step upgrade
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_LOG_DRIVER=db                    # Synology ContainerManager default
+
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"recreated with json-file"* ]]
+    # db deadlocks dockerd when stop races an attached `docker logs --follow`, so it must not survive.
+    grep -q -- '--log-driver json-file' "$MOCK_STATE_DIR/run_args"
+    grep -q -- '--log-opt max-size=50m' "$MOCK_STATE_DIR/run_args"
+    ! grep -q -- '--log-driver db' "$MOCK_STATE_DIR/run_args"
+}
+
+# ---------- Test 34: non-Synology log driver is preserved as-is ----------
+@test "full-flow: existing log driver and options are preserved on recreate" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_LOG_DRIVER=syslog
+    export MOCK_LOG_OPTS="--log-opt syslog-address=udp://1.2.3.4:514 "
+
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    # Previously the recreate dropped log settings, silently reverting to the daemon default.
+    grep -q -- '--log-driver syslog' "$MOCK_STATE_DIR/run_args"
+    grep -q -- 'syslog-address=udp://1.2.3.4:514' "$MOCK_STATE_DIR/run_args"
+}
+
+# ---------- Test 35: UPGRADE_GITLAB_LOG_DRIVER overrides the db replacement ----------
+@test "full-flow: UPGRADE_GITLAB_LOG_DRIVER overrides driver selection" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_LOG_DRIVER=db
+    export UPGRADE_GITLAB_LOG_DRIVER=db          # opt back in despite the deadlock risk
+
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    grep -q -- '--log-driver db' "$MOCK_STATE_DIR/run_args"
+    ! grep -q -- '--log-driver json-file' "$MOCK_STATE_DIR/run_args"
+}
