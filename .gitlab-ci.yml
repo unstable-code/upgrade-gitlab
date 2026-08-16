@@ -44,7 +44,7 @@ promote-to-master:
     - git remote set-url origin "https://oauth2:${PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
     - git push origin HEAD:master
   rules:
-    - if: $CI_COMMIT_BRANCH == "develop" && $CI_PROJECT_PATH == "gitlab-useful-scripts/upgrade-gitlab"
+    - if: $CI_COMMIT_BRANCH == "develop" && $CI_PROJECT_PATH == "unstable-code/upgrade-gitlab"
 
 integration-test:
   stage: test

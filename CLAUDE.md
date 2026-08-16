@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **upgrade-gitlab** is an automated, Docker-based GitLab upgrade tool that performs safe, step-by-step version upgrades following the official GitLab upgrade path. Single bash script (`upgrade-gitlab`, ~2150 lines) supporting CE/EE editions with background migration tracking, stuck-migration detection, signal safety, and Discord notifications.
 
-Repository: `gitlab.com/gitlab-useful-scripts/upgrade-gitlab` (GitLab, not GitHub — use `glab` instead of `gh`)
+Repository: `gitlab.gggames.synology.me/unstable-code/upgrade-gitlab` (GitLab, not GitHub — use `glab` instead of `gh`). The former `gitlab.com/gitlab-useful-scripts/upgrade-gitlab` is being retired; its CI can no longer create jobs (GitLab.com requires account identity verification).
 
 ## Common Commands
 
