@@ -1,7 +1,7 @@
 # upgrade-gitlab
 
-[![pipeline status](https://gitlab.gggames.synology.me/unstable-code/upgrade-gitlab/badges/master/pipeline.svg)](https://gitlab.gggames.synology.me/unstable-code/upgrade-gitlab/-/commits/master)
-[![coverage report](https://gitlab.gggames.synology.me/unstable-code/upgrade-gitlab/badges/master/coverage.svg?job=logic-test)](https://gitlab.gggames.synology.me/unstable-code/upgrade-gitlab/-/commits/master)
+[![pipeline status](https://gitlab.gggames.synology.me/peter/gitlab/upgrade-gitlab/badges/master/pipeline.svg)](https://gitlab.gggames.synology.me/peter/gitlab/upgrade-gitlab/-/commits/master)
+[![coverage report](https://gitlab.gggames.synology.me/peter/gitlab/upgrade-gitlab/badges/master/coverage.svg?job=logic-test)](https://gitlab.gggames.synology.me/peter/gitlab/upgrade-gitlab/-/commits/master)
 
 An automated upgrade script for Docker-based GitLab instances. Supports both CE and EE editions with safe, step-by-step version upgrades following the [official upgrade path](https://gitlab-com.gitlab.io/support/toolbox/upgrade-path/).
 
@@ -155,10 +155,10 @@ bats tests/full_flow.bats      # full upgrade flow against stateful mocks (incl.
 
 ## Wiki
 
-For detailed guides, see the [project wiki](https://gitlab.gggames.synology.me/unstable-code/upgrade-gitlab/-/wikis/home):
+For detailed guides, see the [project wiki](https://gitlab.gggames.synology.me/peter/gitlab/upgrade-gitlab/-/wikis/home):
 
-- [Pre-upgrade Checklist](https://gitlab.gggames.synology.me/unstable-code/upgrade-gitlab/-/wikis/Pre-upgrade-Checklist) — Manual steps to complete before running the script
-- [Troubleshooting](https://gitlab.gggames.synology.me/unstable-code/upgrade-gitlab/-/wikis/Troubleshooting) — Solutions for DB migration failures and debugging tips
+- [Pre-upgrade Checklist](https://gitlab.gggames.synology.me/peter/gitlab/upgrade-gitlab/-/wikis/Pre-upgrade-Checklist) — Manual steps to complete before running the script
+- [Troubleshooting](https://gitlab.gggames.synology.me/peter/gitlab/upgrade-gitlab/-/wikis/Troubleshooting) — Solutions for DB migration failures and debugging tips
 
 ## License
 

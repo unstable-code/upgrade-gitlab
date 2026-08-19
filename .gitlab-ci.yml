@@ -45,4 +45,7 @@ promote-to-master:
     - git remote set-url origin "https://oauth2:${PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
     - git push origin HEAD:master
   rules:
-    - if: $CI_COMMIT_BRANCH == "develop" && $CI_PROJECT_PATH == "unstable-code/upgrade-gitlab"
+    # Guards on the host, not the project path: the path has already changed three times
+    # (gitlab-useful-scripts -> unstable-code -> peter/gitlab) and each rename silently
+    # disabled promotion until someone noticed master had stopped moving.
+    - if: $CI_COMMIT_BRANCH == "develop" && $CI_SERVER_HOST == "gitlab.gggames.synology.me"
