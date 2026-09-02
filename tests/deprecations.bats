@@ -28,7 +28,7 @@ nginx['listen_port'] has been deprecated. Please use gitlab_rails['nginx']['list
 
 Running handlers complete
 EOF
-    out=$(_extract_deprecations "$LOG")
+    out=$(_extract_deprecations < "$LOG")
     [ "$(echo "$out" | wc -l)" -eq 2 ]
     [[ "$out" == *"nginx['listen_https'] has been deprecated"* ]]
     [[ "$out" != *"Running handlers"* ]]
@@ -42,19 +42,19 @@ foo['a'] has been deprecated.
 Running handlers complete
 Chef Infra Client finished, 3/912 resources updated
 EOF
-    out=$(_extract_deprecations "$LOG")
+    out=$(_extract_deprecations < "$LOG")
     [ "$out" = "foo['a'] has been deprecated." ]
 }
 
 @test "_extract_deprecations: trims surrounding whitespace on entries" {
     printf 'Deprecations:\n    indented["x"] has been deprecated.   \n\n' > "$LOG"
-    out=$(_extract_deprecations "$LOG")
+    out=$(_extract_deprecations < "$LOG")
     [ "$out" = 'indented["x"] has been deprecated.' ]
 }
 
 @test "_extract_deprecations: empty output when no Deprecations header is present" {
     printf 'Recipe: gitlab::default\nRunning handlers complete\n' > "$LOG"
-    out=$(_extract_deprecations "$LOG")
+    out=$(_extract_deprecations < "$LOG")
     [ -z "$out" ]
 }
 
