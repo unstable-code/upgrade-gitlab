@@ -167,6 +167,31 @@ teardown() {
     ! grep -qE "lfs,lfs|lfs,uploads,lfs" "$MOCK_STATE_DIR/backup_args"
 }
 
+# ---------- --skip-object-storage: agent_plan_content survives the whitelist ----------
+@test "full-flow: --skip-object-storage skips agent_plan_content" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    # agent_plan_content is both a gitlab-backup target and an object storage type,
+    # so detection must let it through to SKIP= instead of dropping it.
+    export MOCK_OBJECT_STORAGE="artifacts agent_plan_content"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock --skip-object-storage
+    [ "$status" -eq 0 ]
+    grep -q "SKIP=artifacts,agent_plan_content" "$MOCK_STATE_DIR/backup_args"
+}
+
+# ---------- --skip-object-storage: non-backup-target types never reach SKIP= ----------
+@test "full-flow: --skip-object-storage drops types that are not backup targets" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    # dependency_proxy uses object storage but has no lib/backup/tasks/ entry, so
+    # SKIP=dependency_proxy would be meaningless; the whitelist must filter it out.
+    export MOCK_OBJECT_STORAGE="dependency_proxy lfs"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock --skip-object-storage
+    [ "$status" -eq 0 ]
+    grep -q "SKIP=lfs" "$MOCK_STATE_DIR/backup_args"
+    ! grep -q "dependency_proxy" "$MOCK_STATE_DIR/backup_args"
+}
+
 # ---------- no skip flags: backup receives no SKIP= ----------
 @test "full-flow: backup passes no SKIP when no skip flags are given" {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"

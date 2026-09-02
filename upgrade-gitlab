@@ -1253,22 +1253,42 @@ _size_poller_file=
 _pack_probe_pid=
 _pack_probe_file=
 
+# --skip-object-storage 감지 대상 타입. gitlab-backup의 백업 타깃 id와 1:1로 대응하는
+# 것만 담는다 — SKIP=에 넣어 의미가 있는 이름이어야 하기 때문이다. dependency_proxy는
+# consolidated object storage가 지원하는 타입이지만 lib/backup/tasks/에 대응 태스크가
+# 없어(19.2.5 확인) 의도적으로 제외한다. 반대로 agent_plan_content는 백업 타깃이면서
+# object storage 대상이므로 포함한다.
+# 이 목록은 ruby 스니펫과 출력 화이트리스트 양쪽에서 쓰이므로 한 곳에서만 정의한다.
+_OBJECT_STORAGE_TYPES='artifacts external_diffs lfs uploads packages terraform_state pages ci_secure_files agent_plan_content'
+
 # object storage로 오프로드된(그래서 --skip-object-storage 시 백업 tar에서 제외할)
-# 자원 컴포넌트를 개행 구분으로 출력한다. gitlab.rb를 grep하지 않고 렌더된
-# Gitlab.config를 직접 읽어 consolidated object storage의 기본-enabled 타입까지 잡는다.
+# 자원 컴포넌트를 개행 구분으로 출력한다. gitlab.rb도, 렌더된 gitlab.yml도 아닌 부팅 후
+# Gitlab.config를 읽는다: consolidated 설정(gitlab_rails['object_store'])은 omnibus가
+# gitlab.yml을 쓸 때가 아니라 rails 부팅 시 config/object_store_settings.rb가 각 타입
+# 섹션에 병합한다. 렌더된 yml에는 여전히 object_store.enabled=false로 남아 있으므로,
+# 런타임 config를 읽는 이 방식만이 legacy 개별 플래그와 consolidated를 함께 잡는다.
+#
+# enabled만으로는 부족하다. 병합 로직은 타입 섹션의 enabled가 참일 때만 bucket 누락을
+# 잡아내므로(object_store_settings.rb의 missing_bucket_for), 섹션 enabled가 비어 있는
+# 타입은 bucket 없이도 object_store.enabled=true로 끝난다. 이 상태는 실제로는 오프로드가
+# 안 된(데이터가 디스크에 남은) 상태라 백업에서 빼면 어느 쪽에도 없게 된다. 그래서
+# bucket까지 확인한다 — 병합 시 bucket 키는 remote_directory로 옮겨지고 삭제되므로
+# (split_bucket_prefix) 런타임에서 볼 이름은 remote_directory다. legacy 경로에서는
+# omnibus가 remote_directory 기본값을 렌더하므로 이 조건이 추가로 걸러내지 않는다.
+#
 # 각 config 섹션은 GitLab 버전에 따라 없을 수 있으므로 루프 내에서 개별 rescue한다.
 # 실패 시(구버전/rails 미탑재/권한) 빈 출력 → skip_components 변화 없음(안전).
 _detect_object_storage_skips() {
     local runner_script
-    runner_script='%w[artifacts external_diffs lfs uploads packages terraform_state pages ci_secure_files].each do |t|
+    runner_script="%w[$_OBJECT_STORAGE_TYPES].each do |t|
   begin
-    os = Gitlab.config.public_send(t)["object_store"]
-    puts t if os && os["enabled"]
+    os = Gitlab.config.public_send(t)['object_store']
+    puts t if os && os['enabled'] && !os['remote_directory'].to_s.empty?
   rescue StandardError
   end
-end'
+end"
     docker exec "$CONTAINER_NAME" gitlab-rails runner "$runner_script" 2>/dev/null \
-        | grep -Ex 'artifacts|external_diffs|lfs|uploads|packages|terraform_state|pages|ci_secure_files'
+        | grep -Ex "${_OBJECT_STORAGE_TYPES// /|}"
 }
 
 _query_backup_stats() {
