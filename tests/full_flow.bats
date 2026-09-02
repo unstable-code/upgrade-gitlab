@@ -167,6 +167,29 @@ teardown() {
     ! grep -qE "lfs,lfs|lfs,uploads,lfs" "$MOCK_STATE_DIR/backup_args"
 }
 
+# ---------- reconfigure deprecations are summarized at the end of the run ----------
+@test "full-flow: reconfigure deprecations are re-printed as an end-of-run summary" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_DEPRECATIONS="nginx['listen_port'] has been deprecated. Please use gitlab_rails['nginx']['listen_port'] instead."
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Deprecations reported by gitlab-ctl reconfigure (1)"* ]]
+    [[ "$output" == *"[17.11.3-ce.0] nginx['listen_port'] has been deprecated."* ]]
+    # reconfigure runs once per hop and streams the same warning every time; the
+    # summary must collapse those into a single entry.
+    [ "$(grep -c "^  \[17.11.3-ce.0\] nginx" <<< "$output")" -eq 1 ]
+}
+
+@test "full-flow: no deprecation summary when reconfigure reports none" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    unset MOCK_DEPRECATIONS
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"Deprecations reported by gitlab-ctl reconfigure"* ]]
+}
+
 # ---------- --skip-object-storage: agent_plan_content survives the whitelist ----------
 @test "full-flow: --skip-object-storage skips agent_plan_content" {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"

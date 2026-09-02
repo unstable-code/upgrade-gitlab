@@ -196,6 +196,17 @@ case "$args" in
         exit 0
         ;;
     *"exec"*"gitlab-ctl reconfigure"*)
+        echo "Recipe: gitlab::default"
+        echo "  * execute[reload nginx] action run (skipped due to only_if)"
+        # MOCK_DEPRECATIONS (newline-separated) reproduces Chef's trailing
+        # "Deprecations:" block so the end-of-run summary can be asserted on.
+        if [ -n "${MOCK_DEPRECATIONS:-}" ]; then
+            echo ''
+            echo 'Deprecations:'
+            printf '%s\n' "$MOCK_DEPRECATIONS"
+            echo ''
+        fi
+        echo 'Running handlers complete'
         exit 0
         ;;
     *"exec"*"gitlab-ctl restart"*)

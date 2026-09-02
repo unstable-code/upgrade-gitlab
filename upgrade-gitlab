@@ -27,6 +27,7 @@ max_tier_flag=
 _interrupted=0
 _trap_active=0
 _pull_pid=
+_bar_capture_file=
 _tty=/dev/tty
 if ! (: > /dev/tty) 2>/dev/null; then
     _tty=/dev/null
@@ -1171,6 +1172,84 @@ wait_for_healthy() {
     echo 'done'
 }
 
+# --- reconfigure deprecation 수집 ---
+# gitlab-ctl reconfigure가 마지막에 찍는 Chef "Deprecations:" 블록은 원래도 화면에
+# 흘러가지만, reconfigure 한 번의 출력이 수백~수천 줄이고 hop마다 반복되므로 실제로는
+# 스크롤 버퍼 밖으로 밀려나 아무도 못 본다. 그런데 이 경고들이야말로 다음 메이저에서
+# reconfigure를 하드 abort시키는 예고편이다(19.0 번들 Mattermost 제거가 그 경로).
+# 그래서 hop마다 블록을 모아 두었다가 업그레이드 종료 시점에 한 번 요약해 다시 띄운다.
+#
+# 스트리밍 출력 동작은 건드리지 않는다 — 수집은 run_with_bouncing_bar가 이미 갖고 있는
+# 전체 출력 복사본(_bar_capture_file 훅)을 사후 파싱하는 방식이다.
+declare -A _deprecation_first_seen=()   # 문구 -> 처음 관측된 버전
+_deprecation_order=()                   # 관측 순서 보존
+
+# _extract_deprecations <file>
+# "Deprecations:" 헤더 다음 줄부터 블록 끝까지를 trim해서 출력한다. 블록 끝은 빈 줄
+# 또는 chef의 다음 최상위 섹션이다. deprecation 문구 자체는 콜론으로 끝나지 않으므로
+# 헤더 패턴(줄 전체가 "Deprecations:")과 충돌하지 않는다.
+_extract_deprecations() {
+    awk '
+        /^[[:space:]]*Deprecations:[[:space:]]*$/ { in_block = 1; next }
+        in_block {
+            if ($0 ~ /^[[:space:]]*$/) { in_block = 0; next }
+            if ($0 ~ /^[[:space:]]*(Running handlers|Chef (Infra )?Client|gitlab Reconfigured!)/) { in_block = 0; next }
+            sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+$/, "")
+            if (length($0)) print
+        }
+    ' "$1" 2>/dev/null
+}
+
+# _record_deprecations <version> <file>
+# 파싱 실패/빈 블록은 조용히 no-op. deprecation 수집이 업그레이드를 막아선 안 된다.
+_record_deprecations() {
+    local ver=$1 file=$2 line
+    [ -f "$file" ] || return 0
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        # deprecation 문구에는 ']'가 흔히 들어간다(nginx['listen_port'] ...). 연관배열
+        # 첨자는 반드시 인용해 첫 ']'에서 잘리지 않게 한다.
+        if [ -z "${_deprecation_first_seen["$line"]:-}" ]; then
+            _deprecation_first_seen["$line"]=$ver
+            _deprecation_order+=("$line")
+        fi
+    done < <(_extract_deprecations "$file")
+    return 0
+}
+
+# 수집된 deprecation을 종료 직전에 한 번 요약한다. 같은 문구가 hop마다 반복 관측되므로
+# 유니크한 것만, 처음 본 버전을 함께 남긴다. 비어 있으면 섹션 자체를 생략.
+print_deprecation_summary() {
+    [ ${#_deprecation_order[@]} -gt 0 ] || return 0
+    local hdr='' rst='' line
+    if [ "$_tty" != /dev/null ]; then
+        hdr='\e[1;33m'
+        rst='\e[0m'
+    fi
+    echo ''
+    echo -e "${hdr}Deprecations reported by gitlab-ctl reconfigure (${#_deprecation_order[@]}):${rst}"
+    echo 'These are not errors, but removed keys abort reconfigure in a later major version.'
+    for line in "${_deprecation_order[@]}"; do
+        echo "  [${_deprecation_first_seen["$line"]}] $line"
+    done
+    echo 'Fix them in gitlab.rb before the next major upgrade.'
+    return 0
+}
+
+# Discord 알림용 요약: 개수 + 앞의 몇 건만. 전체를 실으면 webhook 길이 제한에 걸린다.
+_deprecation_discord_note() {
+    [ ${#_deprecation_order[@]} -gt 0 ] || return 0
+    local shown=3 i out=''
+    [ ${#_deprecation_order[@]} -lt "$shown" ] && shown=${#_deprecation_order[@]}
+    for (( i = 0; i < shown; i++ )); do
+        out="$out\n- ${_deprecation_order[$i]}"
+    done
+    if [ ${#_deprecation_order[@]} -gt "$shown" ]; then
+        out="$out\n- ...and $(( ${#_deprecation_order[@]} - shown )) more"
+    fi
+    printf '%b' "reconfigure reported ${#_deprecation_order[@]} deprecation(s):$out"
+}
+
 check_gitlab_server_healthy() {
     local skip_reconfigure=${1:-0}
     # caller (main flow / recovery branch)가 outer critical로 감싸고 있음.
@@ -1190,7 +1269,15 @@ check_gitlab_server_healthy() {
     done
 
     if [ "$skip_reconfigure" -eq 0 ]; then
+        # reconfigure 출력 전체를 따로 받아 Deprecations 블록만 수집한다(요약은 종료 직전).
+        local recon_out
+        recon_out=$(mktemp)
+        _TMPFILES+=("$recon_out")
+        _bar_capture_file=$recon_out
         run_with_bouncing_bar "Reconfigure" docker exec "$CONTAINER_NAME" gitlab-ctl reconfigure
+        _bar_capture_file=
+        _record_deprecations "${CNT_VERSION:-$CURRENT_VERSION}" "$recon_out"
+        rm -f "$recon_out"
     else
         run_with_bouncing_bar "Restart" docker exec "$CONTAINER_NAME" gitlab-ctl restart
     fi
@@ -1689,6 +1776,13 @@ run_with_bouncing_bar() {
     # 종료 코드 수집
     _wait_reap "$cmd_pid"
     local rc=$?
+    # _bar_capture_file이 설정돼 있으면 명령의 전체 출력을 그쪽으로 복사한다. tmpfile은
+    # 바로 아래에서 사라지므로, 스트리밍된 출력을 사후 파싱하려는 호출자에게는 이 훅이
+    # 유일한 경로다(_detect_object_storage_skips처럼 출력을 직접 받는 것과 달리
+    # 여기서는 진행 바를 그리느라 stdout이 이미 소비된다).
+    if [ -n "${_bar_capture_file:-}" ]; then
+        cat "$tmpfile" >> "$_bar_capture_file" 2>/dev/null
+    fi
     rm -f "$tmpfile"
     return $rc
 }
@@ -2512,6 +2606,9 @@ if [ ${#UPGRADE_POINTS_ARRAY[@]} -eq 0 ]; then
         # end-of-upgrade 복원 지점에 도달하지 않으므로 여기서 명시적으로 되살린다.
         _resume_paused_runners
         exit_critical
+        # 이 경로는 restart(=skip_reconfigure)라 보통 비어 있지만, 향후 reconfigure를
+        # 타게 되더라도 요약이 누락되지 않도록 같이 호출한다(비면 no-op).
+        print_deprecation_summary
         if [ "$_interrupted" -eq 1 ]; then
             echo "Recovery interrupted by signal before finishing (it had started because the previous run exited with code $_prev_exit)." >&2
             exit 130
@@ -2903,6 +3000,10 @@ _resume_paused_runners
 
 exit_critical
 
+# hop마다 흘러가 버린 reconfigure deprecation을 여기서 한 번 모아 보여준다.
+# 인터럽트 종료에서도 지금까지 관측한 것은 남겨야 하므로 분기 앞에 둔다.
+print_deprecation_summary
+
 # Interrupted 종료 처리 (RestartPolicy 변경, Discord NOTE는 정상 완료 시에만)
 if [ "$_interrupted" -eq 1 ]; then
     echo "Upgrade was interrupted by user signal. Post-upgrade verification completed." >&2
@@ -2946,5 +3047,11 @@ else
 fi
 whats_new_url="https://gitlab-com.gitlab.io/cs-tools/gitlab-cs-tools/what-is-new-since/?tab=features&minVersion=${CURRENT_VERSION%%-*}&selectedMinTier=core&selectedMaxTier=${max_tier}&selectedSaaS=self-managed+only"
 send_discord_webhook "NOTE" "Successfully upgraded GitLab server!" "GitLab version changed from [$CURRENT_VERSION to ${UPGRADE_POINTS_ARRAY[-1]}]($whats_new_url)"
+
+# 터미널 요약은 스크롤로 사라지지만 webhook은 남는다 — 다음 메이저 전에 손봐야 할
+# 항목이므로 별도 알림으로 한 번 더 보낸다. 개수가 많을 수 있어 앞 몇 건만 싣는다.
+if [ ${#_deprecation_order[@]} -gt 0 ]; then
+    send_discord_webhook "WARN" "Configuration deprecations detected" "$(_deprecation_discord_note)"
+fi
 
 exit 0

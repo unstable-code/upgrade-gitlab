@@ -94,6 +94,16 @@ The container is recreated on every hop, so log settings must be passed explicit
 
 Reproduces only under log-DB contention (a busy multi-container host with accumulated log history); a quiet 2-container host runs the identical code without wedging. `UPGRADE_GITLAB_LOG_DRIVER` overrides the choice in both directions. Trade-off: json-file logs do not appear in the DSM Container Manager UI (`docker logs` is unaffected).
 
+### Reconfigure Deprecation Summary
+
+Chef's trailing `Deprecations:` block from `gitlab-ctl reconfigure` was always streamed to stdout — `run_with_bouncing_bar` prints every new line of the command's output as it appears. It was simply unreadable: one reconfigure emits hundreds to thousands of lines, and reconfigure runs once per hop, so the block scrolls out of the buffer and repeats. Those warnings are the advance notice for the next major's hard abort (`print_stacktrace_errors`' "Removed configurations found" branch), so they are worth surfacing where they can be read.
+
+`_record_deprecations` collects the block per hop; `print_deprecation_summary` re-prints the unique entries after `exit_critical`, tagged with the version each was first seen at. It sits before the interrupt branch so an interrupted run still reports what it saw. A non-empty summary also fires a `WARN` webhook carrying the count plus the first three entries.
+
+The streaming loop is deliberately untouched. Collection instead uses `_bar_capture_file`: when set, `run_with_bouncing_bar` copies the command's full output there just before deleting its tempfile. Parsing stdout at the call site is not an option — the progress bar has already consumed it.
+
+Block boundaries: the header is a line that is exactly `Deprecations:`; entries run until a blank line or the next top-level Chef section (`Running handlers`, `Chef Infra Client`, `gitlab Reconfigured!`). Deprecation text never ends in a colon, so it cannot be mistaken for the header. Parse failures are silent no-ops — a missed summary must never abort an upgrade. Associative-array subscripts are quoted throughout because the entries routinely contain `]` (`nginx['listen_port'] has been deprecated.`).
+
 ### TTY-Aware Output
 Terminal detected → animated spinners, progress bars with ETA. No terminal (CI) → plain text status.
 
@@ -104,6 +114,7 @@ Tests use [BATS](https://github.com/bats-core/bats-core) (Bash Automated Testing
 ### Test Structure
 - `tests/upgrade_path.bats` — Logic tests using `--dry-run` (path resolution, `--skip-latest`, `--version`, `--max-tier` validation)
 - `tests/full_flow.bats` — Integration tests simulating full upgrade loops via mocks (includes stuck-migration scenarios)
+- `tests/deprecations.bats` — Unit tests for the reconfigure deprecation collector; helpers are source-extracted with `sed` (the `preflight.bats` pattern) and the collector globals re-seeded per test
 - `tests/test_helper.bash` — Shared setup; prepends `tests/mocks/` to PATH, sets default version `16.11.0-ce.0`, and defaults `CI=true` so local bats bypasses `-y` mode's `DISCORD_URL` requirement. Tests that need to exercise non-CI paths explicitly `unset CI`.
 
 ### Mock System
