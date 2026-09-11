@@ -2232,7 +2232,7 @@ release_preflight() {
 
     echo
     echo "Release preflight for upgrade path:"
-    local prev_major prev_minor prev_patch stop core maj min patch blog_url blog titles notes feats cves line is_major is_patch
+    local prev_major prev_minor prev_patch stop core maj min patch blog_url blog_disp blog titles notes feats cves line is_major is_patch
     local idx=0 fcount=0
     prev_major=${CURRENT_VERSION%%.*}
     prev_minor=$(echo "$CURRENT_VERSION" | awk -F'[.-]' '{print $2}')
@@ -2260,13 +2260,16 @@ release_preflight() {
         if [ "$is_patch" -eq 1 ]; then
             # 패치 hop: CVE/버그픽스 페이지로 라우팅. 합본 묶임 케이스(18.10.6 in 18.11.3 announcement)
             # 때문에 URL은 _find_patch_url로 본문 검색해서 찾는다.
-            blog_url=$(_find_patch_url "${maj}.${min}.${patch}" "$feed")
+            blog_url=$(_find_patch_url "$core" "$feed")
             if [ -z "$blog_url" ]; then
                 echo "    (patch release announcement not found in feed)"
                 prev_major=$maj; prev_minor=$min; prev_patch=$patch; continue
             fi
+            # 합본 페이지 URL은 최상위 패치 이름으로 지어져(19.2.6 → 19-3-2 페이지) 어느 버전 때문에
+            # 열었는지가 남지 않는다. 표시용으로만 ?nav=를 붙인다 (서버는 이 파라미터를 무시).
+            blog_disp="${blog_url}?nav=${core}"
             blog=$(curl -sfL "$blog_url") || {
-                echo "    Warning: patch page fetch failed; full notes: $blog_url" >&2
+                echo "    Warning: patch page fetch failed; full notes: $blog_disp" >&2
                 prev_major=$maj; prev_minor=$min; prev_patch=$patch; continue
             }
             cves=$(printf '%s' "$blog" | _extract_cves)
@@ -2281,7 +2284,7 @@ release_preflight() {
                 done <<< "$cves"
                 [ "$fcount" -gt 5 ] && echo "      + $((fcount-5)) more CVE(s)"
             fi
-            echo "    Full notes: $blog_url"
+            echo "    Full notes: $blog_disp"
             prev_major=$maj; prev_minor=$min; prev_patch=$patch
             continue
         fi
