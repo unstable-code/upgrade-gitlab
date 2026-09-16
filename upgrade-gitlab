@@ -22,6 +22,8 @@ dry_run=0
 no_step_limit=0
 skip_components=""
 skip_object_storage=0
+use_maintenance_mode=1
+_maintenance_enabled_by_us=0
 reset_stuck_finalizing=0
 max_tier_flag=
 _interrupted=0
@@ -178,10 +180,13 @@ _cleanup_on_exit() {
     #    맡긴다(_resume_paused_runners가 실패 시 상태파일을 보존하므로 복구가 가능하다).
     #  - 정상 완료/정상 인터럽트는 이미 _resume_paused_runners로 재개하며 파일을 제거했으므로 -f 가드로 no-op.
     #  - command -v 가드: 시그널이 함수 정의 이전에 도착해도 'command not found'가 나지 않게 한다.
-    if [ "${_trap_active:-0}" != 1 ] \
-       && command -v _resume_paused_runners >/dev/null 2>&1 \
-       && [ -n "${_runner_state_file:-}" ] && [ -f "$_runner_state_file" ]; then
-        _resume_paused_runners
+    #  - --dry-run은 경로만 계산하고 아무것도 바꾸지 않겠다는 약속이므로, 이전 실행이 남긴
+    #    상태(paused 러너 / maintenance mode)도 건드리지 않는다. 해제는 실제 실행에 맡긴다.
+    #  - 상태 파일 경로가 정해지기 전(컨테이너 감지 실패 등)에 종료하면 해제할 것도 없다.
+    if [ "${dry_run:-0}" != 1 ] && [ "${_trap_active:-0}" != 1 ] \
+       && command -v _release_upgrade_holds >/dev/null 2>&1 \
+       && [ -n "${_runner_state_file:-}" ]; then
+        _release_upgrade_holds
     fi
     return 0
 }
@@ -254,6 +259,9 @@ _resume_paused_runners() {
             echo "Resumed previously paused runners: $id_list"
             send_discord_webhook "NOTE" "Runners resumed" "IDs: $id_list"
             rm -f "$_runner_state_file"
+            # 메모리 폴백도 비워 두 번째 호출(명시적 호출 후 EXIT 트랩)이 같은 러너를
+            # 다시 재개하고 다시 보고하는 일을 막는다 — 이 함수는 멱등해야 한다.
+            PAUSED_RUNNER_IDS=""
         else
             echo "Warning: could not resume paused runners ($id_list) — container unreachable; state file kept for the next run." >&2
         fi
@@ -262,8 +270,75 @@ _resume_paused_runners() {
     fi
 }
 
+# --- maintenance mode (#15) ---
+# 사용 가능 여부는 DB만으로 판정할 수 없다: 실측(19.2 EE)에서 License.current&.plan이 nil인데도
+# feature_available?(:maintenance_mode)는 true였다. 그래서 rails 안에서 판정하고, CE(License
+# 미정의)와 컬럼이 없는 구버전(<13.9)은 NameError(NoMethodError 포함)로 "unavailable"에 흡수한다.
+# 그 밖의 예외(설정 검증 실패 등)는 "error"로 구분해 원인을 숨기지 않는다.
+# psql UPDATE는 설정 캐시(프로세스 메모리 + Redis)를 무효화하지 않으므로 update!를 쓴다.
+# current는 캐시된 사본을 줄 수 있어 current_without_cache로 읽는다.
+# 원래 켜져 있었으면(already) 사용자 의도이므로 끝나고 끄지 않는다.
+_MAINTENANCE_ENABLE_RUBY="begin
+  if License.feature_available?(:maintenance_mode)
+    s = ApplicationSetting.current_without_cache
+    if s.maintenance_mode
+      puts 'maintenance_mode=already'
+    else
+      s.update!(maintenance_mode: true)
+      puts 'maintenance_mode=enabled'
+    end
+  else
+    puts 'maintenance_mode=unavailable'
+  end
+rescue NameError
+  puts 'maintenance_mode=unavailable'
+rescue StandardError
+  puts 'maintenance_mode=error'
+end"
+_MAINTENANCE_DISABLE_RUBY="ApplicationSetting.current_without_cache.update!(maintenance_mode: false)
+puts 'maintenance_mode=disabled'"
+
+# 이번(또는 이전) 실행이 켠 maintenance mode를 끈다. _resume_paused_runners와 같은 규칙:
+# 영속 상태 파일이 source of truth이고, 파일 기록이 실패했던 경우에만 메모리 플래그로 폴백하며,
+# 끄기에 성공해야만 파일을 제거한다(실패 시 다음 실행이 다시 시도).
+# 멱등하다 — 켠 기록이 없으면 rails를 부팅하지 않고 바로 반환한다.
+# shellcheck disable=SC2329
+_disable_maintenance_mode() {
+    if [ ! -f "$_maintenance_state_file" ] && [ "${_maintenance_enabled_by_us:-0}" != 1 ]; then
+        return 0
+    fi
+    # 실패해도 상태 파일이 남아 EXIT 트랩이 곧바로 한 번 더 부르게 되는데, 몇 초 사이에
+    # 결과가 달라질 이유가 없다. 재시도는 다음 실행에 맡기고 이번 프로세스에서는 한 번만
+    # 시도한다 — 러너 재개(psql, 1초 미만)와 달리 rails 부팅은 시도당 ~30초다.
+    if [ "${_maintenance_release_attempted:-0}" = 1 ]; then
+        return 0
+    fi
+    _maintenance_release_attempted=1
+    echo "Disabling maintenance mode via gitlab-rails (this can take ~30s)..."
+    if docker exec "$CONTAINER_NAME" gitlab-rails runner "$_MAINTENANCE_DISABLE_RUBY" 2>/dev/null \
+        | grep -qx 'maintenance_mode=disabled'; then
+        echo "Maintenance mode disabled."
+        _maintenance_enabled_by_us=0
+        rm -f "$_maintenance_state_file"
+    else
+        echo "Warning: could not disable maintenance mode — non-admin users remain read-only. Disable it in Admin > Settings > General > Maintenance mode; state file kept for the next run." >&2
+        # 상태 파일 경로 확정(아래) ~ webhook 정의 사이의 조기 종료에서도 EXIT 트랩이 여기로 올 수 있다.
+        command -v send_discord_webhook >/dev/null 2>&1 \
+            && send_discord_webhook "WARN" "Maintenance mode is still enabled" "Disable it in Admin > Settings > General > Maintenance mode"
+    fi
+}
+
+# 업그레이드를 위해 잡아 둔 hold를 한 번에 해제한다: 일시정지한 러너, 켜 둔 maintenance mode.
+# 해제 지점이 여러 곳(정상 종료, recovery, 이미 최신, EXIT 트랩)이라 개별 호출을 늘어놓으면
+# hold가 하나 늘 때마다 누락될 자리가 그만큼 늘어난다. 두 함수 모두 멱등하다.
+# shellcheck disable=SC2329
+_release_upgrade_holds() {
+    _resume_paused_runners
+    _disable_maintenance_mode
+}
+
 if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
-    echo "Usage: $0 [-y] [--edition=ce|ee] [--target-url=http] [--discord-url=http] [--version=0.0.0] [--skip-latest] [--skip-lfs] [--skip-object-storage] [--no-step-limit] [--dry-run] [--reset-stuck-finalizing] [--max-tier=core|starter|premium|ultimate]"
+    echo "Usage: $0 [-y] [--edition=ce|ee] [--target-url=http] [--discord-url=http] [--version=0.0.0] [--skip-latest] [--skip-lfs] [--skip-object-storage] [--no-maintenance-mode] [--no-step-limit] [--dry-run] [--reset-stuck-finalizing] [--max-tier=core|starter|premium|ultimate]"
 
     echo -e '\n\e[0;1mOPTIONS\e[m'
     echo -e "-y, --yes\t\tAuto-confirm prompts for unattended/cron usage. Aborts on safety warnings and if upgrade path >= 3 steps. Requires DISCORD_URL unless CI=true."
@@ -276,6 +351,7 @@ if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
     echo -e "--target-url=http\tPerform a simple connection test for your GitLab server."
     echo -e "--skip-lfs\t\tSkip LFS objects during backup (passes SKIP=lfs to gitlab-backup)."
     echo -e "--skip-object-storage\tSkip every resource already offloaded to object storage (detected via gitlab-rails) from the backup. Assumes the bucket is backed up separately; prints exactly what it skips."
+    echo -e "--no-maintenance-mode\tDo not enable GitLab maintenance mode for the upgrade. By default it is enabled right before the backup when the instance supports it (checked at runtime; CE/unlicensed instances are skipped silently) and disabled when the run ends. A mode that was already on is left on."
     echo -e "--reset-stuck-finalizing\tReset batched_background_migrations rows stuck in status=finalizing(5) for >7 days back to active(1) so GitLab can re-finalize them. Does NOT execute the finalize rake task itself."
     echo -e "--max-tier=TIER\t\tUpper tier bound for the 'What is new since' link in the completion webhook. One of core/starter/premium/ultimate. Default: core for CE, ultimate for EE."
     echo -e "--discord-url=http\tNotify via Discord webhook."
@@ -313,6 +389,8 @@ else
                 skip_components="${skip_components:+$skip_components,}lfs"
             elif [ "${params[$i]}" == "--skip-object-storage" ]; then
                 skip_object_storage=1
+            elif [ "${params[$i]}" == "--no-maintenance-mode" ]; then
+                use_maintenance_mode=0
             elif [ "${params[$i]}" == "--reset-stuck-finalizing" ]; then
                 reset_stuck_finalizing=1
             elif [[ "${params[$i]}" == "--max-tier"* ]]; then
@@ -466,6 +544,8 @@ if [ -z "$_runner_state_dir" ]; then
     done
 fi
 _runner_state_file="$_runner_state_dir/upgrade-gitlab-${CONTAINER_NAME}.paused-runners"
+# 같은 이유(실행 간 지속)로 maintenance mode를 "우리가" 켰다는 기록도 나란히 둔다.
+_maintenance_state_file="$_runner_state_dir/upgrade-gitlab-${CONTAINER_NAME}.maintenance-mode"
 
 # --------------------------
 # 에디션 자동 감지 (CE/EE)
@@ -1366,17 +1446,19 @@ _OBJECT_STORAGE_TYPES='artifacts external_diffs lfs uploads packages terraform_s
 #
 # 각 config 섹션은 GitLab 버전에 따라 없을 수 있으므로 루프 내에서 개별 rescue한다.
 # 실패 시(구버전/rails 미탑재/권한) 빈 출력 → skip_components 변화 없음(안전).
-_detect_object_storage_skips() {
-    local runner_script
-    runner_script="%w[$_OBJECT_STORAGE_TYPES].each do |t|
+#
+# rails 부팅(~30초)을 maintenance mode 켜기와 한 번으로 합치기 위해 스니펫과 판정을 나눈다.
+# _detect_object_storage_skips는 runner 출력(stdin)에서 타입 이름만 추린다 — 같은 부팅의
+# 다른 스니펫이 찍은 줄(maintenance_mode=...)은 화이트리스트에 걸러진다.
+_OBJECT_STORAGE_RUBY="%w[$_OBJECT_STORAGE_TYPES].each do |t|
   begin
     os = Gitlab.config.public_send(t)['object_store']
     puts t if os && os['enabled'] && !os['remote_directory'].to_s.empty?
   rescue StandardError
   end
 end"
-    docker exec "$CONTAINER_NAME" gitlab-rails runner "$runner_script" 2>/dev/null \
-        | grep -Ex "${_OBJECT_STORAGE_TYPES// /|}"
+_detect_object_storage_skips() {
+    grep -Ex "${_OBJECT_STORAGE_TYPES// /|}"
 }
 
 _query_backup_stats() {
@@ -2601,7 +2683,7 @@ if [ ${#UPGRADE_POINTS_ARRAY[@]} -eq 0 ]; then
         check_secrets_integrity "post-upgrade"
         # 이전 실행이 일시정지한 러너가 방치되지 않도록 복원 — 이 recovery 경로는 정상
         # end-of-upgrade 복원 지점에 도달하지 않으므로 여기서 명시적으로 되살린다.
-        _resume_paused_runners
+        _release_upgrade_holds
         exit_critical
         print_deprecation_summary
         if [ "$_interrupted" -eq 1 ]; then
@@ -2613,8 +2695,8 @@ if [ ${#UPGRADE_POINTS_ARRAY[@]} -eq 0 ]; then
     else
         echo "Requirements already satisfied: v$CURRENT_VERSION"
         if curl -sf -o /dev/null "$TARGET_URL/users/sign_in"; then
-            # 이전 실행이 일시정지한 러너가 남아 있으면 복원 (멱등; 파일 없으면 no-op)
-            _resume_paused_runners
+            # 이전 실행이 남긴 hold가 있으면 해제 (멱등; 상태 파일이 없으면 no-op)
+            _release_upgrade_holds
         else
             echo "NOTE: If your GitLab server does not work properly, please edit $(docker inspect "$CONTAINER_NAME" --format='{{range .Mounts}}{{.Source}}:{{.Destination}} {{end}}' | tr ' ' '\n' | grep /etc/gitlab | awk -F ':' '{ print $1 }')/gitlab.rb file or 'docker exec -it $CONTAINER_NAME /bin/bash && vi /etc/gitlab/gitlab.rb'"
         fi
@@ -2720,12 +2802,47 @@ PULL_PID=
 docker pull "$GITLAB_IMAGE:${UPGRADE_POINTS_ARRAY[0]}" &> /dev/null &
 PULL_PID=$!
 
-# --skip-object-storage: object storage로 오프로드된 자원을 감지해 skip_components에 합류.
-# gitlab.rb grep은 consolidated object storage의 기본-enabled 타입을 놓치므로
-# source of truth인 Gitlab.config를 직접 읽는다(rails 로드에 ~30초). 위 docker pull과 겹쳐 돈다.
+# 백업 직전 gitlab-rails 작업을 한 번의 부팅(~30초)으로 모은다. 위 docker pull과 겹쳐 돈다.
+#  - --skip-object-storage: gitlab.rb grep은 consolidated object storage의 기본-enabled 타입을
+#    놓치므로 source of truth인 Gitlab.config를 직접 읽는다.
+#  - maintenance mode(#15): 백업 중 쓰기를 막아 DB 덤프와 저장소 덤프의 시점을 맞춘다.
+#    판정 결과와 무관하게 업그레이드는 계속한다 — 켜지 못했다는 이유로 막을 일이 아니다.
+_prebackup_snippets=()
+_prebackup_out=""
+[ "$skip_object_storage" -eq 1 ] && _prebackup_snippets+=("$_OBJECT_STORAGE_RUBY")
+[ "$use_maintenance_mode" -eq 1 ] && _prebackup_snippets+=("$_MAINTENANCE_ENABLE_RUBY")
+if [ ${#_prebackup_snippets[@]} -gt 0 ]; then
+    echo "Querying GitLab runtime settings via gitlab-rails (this can take ~30s)..."
+    _prebackup_out=$(docker exec "$CONTAINER_NAME" gitlab-rails runner \
+        "$(printf '%s\n' "${_prebackup_snippets[@]}")" 2>/dev/null)
+fi
+
+if [ "$use_maintenance_mode" -eq 1 ]; then
+    case "$(grep -m1 -Ex 'maintenance_mode=[a-z]+' <<< "$_prebackup_out")" in
+        maintenance_mode=enabled)
+            _maintenance_enabled_by_us=1
+            if ! : > "$_maintenance_state_file" 2>/dev/null; then
+                echo "Warning: could not persist maintenance-mode state to $_maintenance_state_file; disabling it will rely on this run staying alive." >&2
+            fi
+            echo "Maintenance mode enabled: non-admin users are read-only until the upgrade finishes."
+            ;;
+        maintenance_mode=already)
+            # 상태 파일이 있으면 이전 실행이 켜고 해제하지 못한 것이라 여전히 우리 몫이고,
+            # 없으면 사용자가 켠 것이라 끝나도 그대로 둔다 — 그 판단은 _disable_maintenance_mode의
+            # 상태 파일 검사가 이미 하므로 여기서 다시 분기하지 않는다.
+            echo "Maintenance mode is already enabled."
+            ;;
+        maintenance_mode=unavailable)
+            echo "Maintenance mode is not available on this instance (CE, unlicensed, or too old); continuing without it."
+            ;;
+        *)
+            echo "Warning: could not enable maintenance mode (gitlab-rails failed); continuing without it." >&2
+            ;;
+    esac
+fi
+
 if [ "$skip_object_storage" -eq 1 ]; then
-    echo "Detecting object-storage-backed resources via gitlab-rails (this can take ~30s)..."
-    _os_skips=$(_detect_object_storage_skips)
+    _os_skips=$(_detect_object_storage_skips <<< "$_prebackup_out")
     for _c in $_os_skips; do
         case ",$skip_components," in
             *",$_c,"*) ;;  # 이미 --skip-lfs 등으로 포함된 컴포넌트는 건너뜀
@@ -2990,8 +3107,9 @@ check_gitlab_server_healthy 1
 # 최종 시크릿 무결성 확인
 check_secrets_integrity "post-upgrade"
 
-# 업그레이드 전 비활성화한 러너 복원 (영속 상태 파일이 기준; 메모리 변수는 폴백)
-_resume_paused_runners
+# 업그레이드 전 잡아 둔 hold 해제: 러너 재개 + maintenance mode 해제
+# (영속 상태 파일이 기준이며, maintenance mode 해제는 업그레이드된 버전에서 수행된다)
+_release_upgrade_holds
 
 exit_critical
 

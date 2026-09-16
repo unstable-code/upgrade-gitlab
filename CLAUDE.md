@@ -87,6 +87,20 @@ Detection requires `enabled` **and** a non-empty `remote_directory`. `enabled` a
 
 `_OBJECT_STORAGE_TYPES` holds the type list in one place — the Ruby snippet and the output whitelist both derive from it, since a list duplicated across the two drifts silently. Membership is decided by *backup targets*, not by object storage support: a name only belongs there if `lib/backup/tasks/` has a matching `self.id`, because the result becomes `SKIP=`. `dependency_proxy` supports consolidated object storage but has no backup task, so it is deliberately excluded; `agent_plan_content` has both, so it is included. Backup target ids as of 19.2.5: `agent_plan_content artifacts builds ci_secure_files db external_diffs lfs packages pages registry repositories terraform_state uploads`.
 
+### Maintenance Mode
+
+Enabled by default right before the backup, disabled at the end; `--no-maintenance-mode` opts out. The purpose is backup consistency: no non-admin writes between the DB dump and the repository dumps.
+
+Availability is decided inside `gitlab-rails runner` (`_MAINTENANCE_ENABLE_RUBY`), never from the DB. On a real 19.2 EE instance `License.current&.plan` was `nil` while `License.feature_available?(:maintenance_mode)` was `true` and the Admin UI section was present, so a DB-side license check would give the wrong answer. CE (`License` undefined) and pre-13.9 schemas (no column) both surface as `NameError` → `unavailable`; any other exception → `error`. Neither blocks the upgrade.
+
+Writes go through `ApplicationSetting.current_without_cache.update!`, not psql: an SQL `UPDATE` leaves the settings cache (process memory + Redis) stale.
+
+When `--skip-object-storage` is also set, both snippets run in one rails boot; `_detect_object_storage_skips` filters runner output from stdin with the type whitelist, which is what keeps the `maintenance_mode=` line out of `SKIP=`.
+
+Release goes through `_release_upgrade_holds`, which resumes paused runners and disables maintenance mode together — every exit path (normal end, recovery, already-satisfied, EXIT trap) calls that one function, so a third pre-upgrade hold does not have to be threaded through four call sites again. Both halves are idempotent: `_resume_paused_runners` clears `PAUSED_RUNNER_IDS` after a successful resume so a second call cannot re-resume from the memory fallback.
+
+A persistent `.maintenance-mode` state file next to the runner state file is the source of truth, it is removed only after a successful disable, and a leftover file is released by the next run. `already` (the admin turned it on) writes no state file, so it is never turned off by the script. A failed disable is not retried inside the same process (`_maintenance_release_attempted`): the state file already carries the retry to the next run, and a rails boot costs ~30s per attempt, unlike the sub-second psql UPDATE behind runner resume. The EXIT trap skips the whole release under `--dry-run` — that flag promises to compute the path and change nothing, including holds left by another run.
+
 ### Container Log Driver
 The container is recreated on every hop, so log settings must be passed explicitly or they silently revert to the daemon default. `LOG_ARGS` (derived next to `VOLUMES`/`PORTS`) preserves the current container's `LogConfig.Type` and its `--log-opt`s, with one deliberate exception: Synology ContainerManager's proprietary `db` driver is replaced with `json-file` (`max-size=50m`, `max-file=3`).
 
@@ -138,7 +152,7 @@ It also could not cross GitLab 19.0, which is worth knowing independently of CI:
 
 ## Key Flags
 
-`-y` auto-confirm (requires `DISCORD_URL` unless `CI=true`) | `--dry-run` compute path only | `--version=X[.Y[.Z]]` target version | `--skip-latest`/`--n-1` previous minor | `--no-step-limit` (CI only) | `--skip-lfs` skip LFS in backup | `--skip-object-storage` skip every resource offloaded to object storage (detected via `gitlab-rails runner` reading `Gitlab.config.<type>.object_store` — both `enabled` *and* a non-empty `remote_directory`; merges into the same `SKIP=` list as `--skip-lfs`. See Object Storage Detection below) | `--edition=ce|ee` | `--reset-stuck-finalizing` auto-reset status=5 zombies | `--max-tier=core|starter|premium|ultimate` what's-new URL tier | `--target-url` health check URL | `--discord-url` webhook
+`-y` auto-confirm (requires `DISCORD_URL` unless `CI=true`) | `--dry-run` compute path only | `--version=X[.Y[.Z]]` target version | `--skip-latest`/`--n-1` previous minor | `--no-step-limit` (CI only) | `--skip-lfs` skip LFS in backup | `--skip-object-storage` skip every resource offloaded to object storage (detected via `gitlab-rails runner` reading `Gitlab.config.<type>.object_store` — both `enabled` *and* a non-empty `remote_directory`; merges into the same `SKIP=` list as `--skip-lfs`. See Object Storage Detection below) | `--no-maintenance-mode` do not enable maintenance mode for the run (see Maintenance Mode below) | `--edition=ce|ee` | `--reset-stuck-finalizing` auto-reset status=5 zombies | `--max-tier=core|starter|premium|ultimate` what's-new URL tier | `--target-url` health check URL | `--discord-url` webhook
 
 Env-only: `UPGRADE_GITLAB_CONFIG_HOOK=PATH` runs an executable after gitlab.rb/secrets.json copies are made and pruned. If unset, an executable `upload-config.hook` next to the script is auto-detected. Hook receives `UPGRADE_GITLAB_SCRIPT_DIR` so it can locate sibling files (rclone.conf, etc.). Template at `upload-config.hook.example`.
 

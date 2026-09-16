@@ -159,10 +159,33 @@ case "$args" in
         exit 0
         ;;
     *"exec"*"gitlab-rails runner"*)
+        # One line per rails boot, so tests can assert that snippets share a boot.
+        [ -n "$MOCK_STATE_DIR" ] && echo x >> "$MOCK_STATE_DIR/rails_runner_calls"
+        case "$args" in
+            *"maintenance_mode: false"*)
+                # Disable snippet. MOCK_MAINTENANCE_DISABLE_FAIL=1 → rails fails (no result line).
+                [ -n "$MOCK_STATE_DIR" ] && touch "$MOCK_STATE_DIR/maintenance_disabled"
+                if [ "${MOCK_MAINTENANCE_DISABLE_FAIL:-0}" -eq 1 ]; then exit 1; fi
+                echo "maintenance_mode=disabled"
+                exit 0
+                ;;
+        esac
         # --skip-object-storage detection: emit the object-storage-enabled resource
         # types from MOCK_OBJECT_STORAGE (space-separated), one per line, mimicking the
         # Gitlab.config probe. Empty/unset → no output → nothing gets skipped.
-        for _t in ${MOCK_OBJECT_STORAGE:-}; do echo "$_t"; done
+        case "$args" in
+            *"object_store"*)
+                for _t in ${MOCK_OBJECT_STORAGE:-}; do echo "$_t"; done
+                ;;
+        esac
+        # Enable snippet. MOCK_MAINTENANCE: enabled | already | unavailable (default) | error;
+        # "fail" prints nothing, as when rails cannot boot.
+        case "$args" in
+            *"maintenance_mode: true"*)
+                [ -n "$MOCK_STATE_DIR" ] && touch "$MOCK_STATE_DIR/maintenance_probe"
+                [ "${MOCK_MAINTENANCE:-}" = fail ] || echo "maintenance_mode=${MOCK_MAINTENANCE:-unavailable}"
+                ;;
+        esac
         exit 0
         ;;
     *"exec"*"-t"*"gitlab-backup"*)

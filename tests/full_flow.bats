@@ -678,6 +678,135 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     [ ! -f "$sf" ]
 }
 
+# ---------- maintenance mode (#15) ----------
+@test "full-flow: maintenance mode is enabled before backup and disabled at the end" {
+    export MOCK_GITLAB_VERSION="17.11.3-ee.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_MAINTENANCE=enabled
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Maintenance mode enabled"* ]]
+    [[ "$output" == *"Maintenance mode disabled."* ]]
+    # enabled before the backup runs, not somewhere later in the run
+    enable_line=$(grep -n "Maintenance mode enabled" <<< "$output" | cut -d: -f1)
+    backup_line=$(grep -n "Dumping repositories" <<< "$output" | head -n1 | cut -d: -f1)
+    [ "$enable_line" -lt "$backup_line" ]
+    [ -f "$MOCK_STATE_DIR/maintenance_disabled" ]
+    [ ! -f "$MAINTENANCE_STATE_FILE" ]
+}
+
+@test "full-flow: maintenance mode that was already on is left on" {
+    export MOCK_GITLAB_VERSION="17.11.3-ee.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_MAINTENANCE=already
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Maintenance mode is already enabled."* ]]
+    [ ! -f "$MOCK_STATE_DIR/maintenance_disabled" ]
+}
+
+@test "full-flow: unavailable maintenance mode does not block the upgrade" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_MAINTENANCE=unavailable
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Maintenance mode is not available"* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+    [ ! -f "$MOCK_STATE_DIR/maintenance_disabled" ]
+}
+
+@test "full-flow: rails failure while enabling maintenance mode warns and continues" {
+    export MOCK_GITLAB_VERSION="17.11.3-ee.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_MAINTENANCE=fail
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"could not enable maintenance mode"* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+}
+
+@test "full-flow: --no-maintenance-mode skips the probe entirely" {
+    export MOCK_GITLAB_VERSION="17.11.3-ee.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_MAINTENANCE=enabled
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock --no-maintenance-mode
+    [ "$status" -eq 0 ]
+    [ ! -f "$MOCK_STATE_DIR/maintenance_probe" ]
+    [ ! -f "$MOCK_STATE_DIR/rails_runner_calls" ]   # no flag needs rails → no boot at all
+    [[ "$output" != *"Maintenance mode"* ]]
+}
+
+@test "full-flow: maintenance mode shares the rails boot with --skip-object-storage" {
+    export MOCK_GITLAB_VERSION="17.11.3-ee.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_MAINTENANCE=enabled
+    export MOCK_OBJECT_STORAGE="lfs artifacts"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock --skip-object-storage
+    [ "$status" -eq 0 ]
+    # the maintenance_mode= result line must not leak into SKIP=
+    grep -q "SKIP=lfs,artifacts" "$MOCK_STATE_DIR/backup_args"
+    ! grep -q "maintenance" "$MOCK_STATE_DIR/backup_args"
+    # one boot before the backup (both snippets) + one to disable at the end
+    [ "$(wc -l < "$MOCK_STATE_DIR/rails_runner_calls")" -eq 2 ]
+}
+
+@test "full-flow: abort before the critical zone disables maintenance mode (EXIT trap)" {
+    export MOCK_GITLAB_VERSION="17.11.3-ee.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_MAINTENANCE=enabled
+    export MOCK_SECRETS=bad                       # pre-upgrade secrets check fails after the backup
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"secrets integrity check failure"* ]]
+    [[ "$output" == *"Maintenance mode disabled."* ]]
+    [ ! -f "$MAINTENANCE_STATE_FILE" ]
+}
+
+@test "full-flow: leftover maintenance-mode state from a prior run is released" {
+    export MOCK_GITLAB_VERSION="18.0.1-ee.0"     # already at target, previous exit clean
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    mkdir -p "$(dirname "$MAINTENANCE_STATE_FILE")"
+    : > "$MAINTENANCE_STATE_FILE"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Requirements already satisfied"* ]]
+    [[ "$output" == *"Maintenance mode disabled."* ]]
+    [ ! -f "$MAINTENANCE_STATE_FILE" ]
+}
+
+@test "full-flow: --dry-run leaves leftover runner and maintenance state untouched" {
+    # --dry-run only computes the path; releasing another run's holds would be a side effect.
+    export MOCK_GITLAB_VERSION="17.11.3-ee.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    mkdir -p "$(dirname "$MAINTENANCE_STATE_FILE")"
+    : > "$MAINTENANCE_STATE_FILE"
+    printf '5\n' > "$RUNNER_STATE_FILE"
+
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"DRY-RUN: Upgrade Path"* ]]
+    [ -f "$MAINTENANCE_STATE_FILE" ]
+    [ -f "$RUNNER_STATE_FILE" ]
+    [ ! -f "$MOCK_STATE_DIR/maintenance_disabled" ]
+    [[ "$output" != *"Resumed previously paused runners"* ]]
+}
+
+@test "full-flow: failing to disable maintenance mode keeps the state file for the next run" {
+    export MOCK_GITLAB_VERSION="17.11.3-ee.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_MAINTENANCE=enabled
+    export MOCK_MAINTENANCE_DISABLE_FAIL=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [[ "$output" == *"could not disable maintenance mode"* ]]
+    [ -f "$MAINTENANCE_STATE_FILE" ]
+    # The kept state file would otherwise make the EXIT trap retry immediately; a second
+    # ~30s rails boot cannot succeed where the first just failed, so the retry waits for
+    # the next run. Boots: one to enable, exactly one to disable.
+    [ "$(wc -l < "$MOCK_STATE_DIR/rails_runner_calls")" -eq 2 ]
+    [ "$(grep -c "could not disable maintenance mode" <<< "$output")" -eq 1 ]
+}
+
 # ---------- Test 33: Synology 'db' log driver is replaced with json-file ----------
 @test "full-flow: Synology db log driver is replaced with json-file on recreate" {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"   # 1-step upgrade
