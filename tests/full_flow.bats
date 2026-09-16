@@ -801,7 +801,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     [[ "$output" == *"could not disable maintenance mode"* ]]
     [ -f "$MAINTENANCE_STATE_FILE" ]
     # The kept state file would otherwise make the EXIT trap retry immediately; a second
-    # ~30s rails boot cannot succeed where the first just failed, so the retry waits for
+    # multi-minute rails boot cannot succeed where the first just failed, so the retry waits for
     # the next run. Boots: one to enable, exactly one to disable.
     [ "$(wc -l < "$MOCK_STATE_DIR/rails_runner_calls")" -eq 2 ]
     [ "$(grep -c "could not disable maintenance mode" <<< "$output")" -eq 1 ]
