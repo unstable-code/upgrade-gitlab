@@ -101,7 +101,26 @@ Release goes through `_release_upgrade_holds`, which resumes paused runners and 
 
 A persistent `.maintenance-mode` state file next to the runner state file is the source of truth, it is removed only after a successful disable, and a leftover file is released by the next run. `already` (the admin turned it on) writes no state file, so it is never turned off by the script. A failed disable is not retried inside the same process (`_maintenance_release_attempted`): the state file already carries the retry to the next run, and a rails boot costs around 5 minutes per attempt (measured on 19.2.6: 2m22s CE, 3m52s EE; a larger or busier instance takes longer), unlike the sub-second psql UPDATE behind runner resume. That cost is also why the enable snippet shares the pre-backup boot with `--skip-object-storage` rather than taking its own, and why the feature adds roughly ten minutes per run in total (one boot before the backup, one to release at the end) — accepted because a real upgrade spends far longer in backup and hops. The EXIT trap skips the whole release under `--dry-run` — that flag promises to compute the path and change nothing, including holds left by another run.
 
-Every `gitlab-rails runner` call goes through `_rails_runner`, because a terminal Ctrl+C signals the whole foreground process group: it kills the `docker exec` client, but the runner inside the container carries on regardless (reproduced on docker 29.8 — the in-container side effect happened while the client returned empty output). Pressed during the enable boot, that meant the script exited without the `enabled` result and so without a state file, and minutes later the orphaned runner turned maintenance mode on with nothing left to turn it off. `_rails_runner` starts the client under `set -m` so it gets its own process group and the terminal's signal never reaches it (pure bash — `setsid` is not guaranteed on DSM), and defers signals like a critical zone while it waits via `_wait_reap`. The caller acts on the deferred `_interrupted` only after the result is recorded; before the backup that is an `exit 130`, which the EXIT trap turns into a proper release. Results come back through the `_rails_out` global rather than command substitution, since traps revert to their defaults inside a `$(...)` subshell and the deferral would silently stop working. The cost is that Ctrl+C now waits out the in-flight boot — the container was going to run it to completion either way. Ctrl+\\ (SIGQUIT) still forces an immediate exit, and with it the old orphan risk.
+Every `gitlab-rails runner` call goes through `_rails_runner` (a thin wrapper over `_exec_isolated`, which serves any side-effecting `docker exec` whose result the script needs; output lands in `_exec_out`), because a terminal Ctrl+C signals the whole foreground process group: it kills the `docker exec` client, but the runner inside the container carries on regardless (reproduced on docker 29.8 — the in-container side effect happened while the client returned empty output). Pressed during the enable boot, that meant the script exited without the `enabled` result and so without a state file, and minutes later the orphaned runner turned maintenance mode on with nothing left to turn it off. `_rails_runner` starts the client under `set -m` so it gets its own process group and the terminal's signal never reaches it (pure bash — `setsid` is not guaranteed on DSM), and defers signals like a critical zone while it waits via `_wait_reap`. The caller acts on the deferred `_interrupted` only after the result is recorded; before the backup that is an `exit 130`, which the EXIT trap turns into a proper release. Results come back through the `_exec_out` global rather than command substitution, since traps revert to their defaults inside a `$(...)` subshell and the deferral would silently stop working. The cost is that Ctrl+C now waits out the in-flight boot — the container was going to run it to completion either way. Ctrl+\\ (SIGQUIT) still forces an immediate exit, and with it the old orphan risk.
+
+### Backup Failure and Cancellation
+
+Two failure modes combined into "an irreversible upgrade with no backup of the current version" (#16), and both are now closed.
+
+**A failed backup aborts.** The backup's exit code used to be ignored, so a failure went straight on to config copies, the critical zone and the container swap. Upstream (checked at `v19.2.6-ee`): `Backup::Manager#create` returns `create_task_result.all?` and the task does `exit 1 unless success`; DB/file-target errors (`DatabaseBackupError`/`FileBackupError`) are logged and the remaining targets still run, while a repository failure raises plain `Backup::Error` and aborts at once. Either way the code is non-zero, and nothing exits non-zero on a mere warning, so non-zero means incomplete. It always aborts, interactive or not. Unlike the pre-upgrade secrets check there is deliberately no "continue anyway" prompt: this tool cannot roll back, and an incomplete backup is not a backup. The way forward is to fix the cause, or to exclude a target explicitly with `--skip-*`.
+
+**Cancelling a backup stops the one inside the container.** The client dies on Ctrl+C but `gitlab-backup` does not, and it would carry on through `pack` → `upload` → `remove_old` after the holds were released. Worse, 16.0+ serializes backups through `Rails.root/tmp/backup_restore.pid` (`lock_backup`, MR !119004), so re-running right away failed the new backup on the lock, and that failure used to be ignored. `_backup_in_progress` brackets the backup call, and the EXIT trap calls `_stop_container_backup` *before* `_release_upgrade_holds` — releasing maintenance mode while the dump is still running would defeat it. The stop sends SIGTERM, not SIGKILL: the backup code has no signal handling, so Ruby raises `SignalException` and the `ensure` blocks clean staging and delete the PID file. The target is `pgrep -f "$_BACKUP_PROC_PATTERN"` (`gitlab[:]backup[:]create`), which matches the rake ruby process and not the `gitlab-backup create` bash wrapper, and covers the <12.2 `gitlab-rake` path too. The pattern is defined once because it is used in three places: the first liveness check, the in-container wait, and the size poller. The bracket form matches the real process but not an `sh` loop that carries the pattern as an argument; the plain string would make such a loop match itself forever. The rake process's direct children (`tar`/`gzip`, `pg_dump`, `gitaly-backup`) get SIGTERM as well, rake first. With rake alone, the exception only fires once the in-flight pipeline returns, so the current target is dumped to the end anyway. The wait is for exit, not completion, capped by `STOP_TIMEOUT`. The SIGTERM and the wait run as a single in-container `sh -c`, which exits 124 on timeout so that a timeout stays distinguishable from a failed `docker exec`; polling with one `docker exec` per check would cost up to 150 round-trips. Past the timeout it prints the PID and a `pgrep` command to watch, and still releases the holds. Signals are deferred during the wait, because a second Ctrl+C exiting inside the EXIT trap would skip the release entirely.
+
+Measured on a disposable 19.2.6 EE container with a 3GB file in uploads, interrupting during `Dumping uploads`:
+
+| SIGTERM sent to | exit after | next target started? | cleanup |
+|---|---|---|---|
+| rake only | 43s (after the uploads `tar \| gzip` finished) | no | staging, `backups/tmp`, PID file all removed; no processes left |
+| rake, then its children | 1s | no — the pending `SignalException` wins over the target's failure path | same |
+
+The risk the second row rules out: that a killed `tar` would surface as a `FileBackupError`, which `run_create_task` rescues, and let the run continue to the next target.
+
+The progress bar's `_size_poller` had the same orphan problem in its own right. Its in-container `while true` loop outlives the local `docker exec` client that `_stop_size_poller` and `_handle_signal` kill. On a run that goes on to upgrade, the container swap removed it; after a cancel or an aborted backup it kept polling every 0.5s until the container restarted (found by the 19.2.6 E2E). The loop now ends itself: once the backup process has been seen and is gone, or after ~10 minutes if it never appears. It takes `_BACKUP_PROC_PATTERN` as a positional argument, which is exactly the self-match case the bracket form exists for.
 
 ### Container Log Driver
 The container is recreated on every hop, so log settings must be passed explicitly or they silently revert to the daemon default. `LOG_ARGS` (derived next to `VOLUMES`/`PORTS`) preserves the current container's `LogConfig.Type` and its `--log-opt`s, with one deliberate exception: Synology ContainerManager's proprietary `db` driver is replaced with `json-file` (`max-size=50m`, `max-file=3`).
@@ -140,6 +159,40 @@ Stateful mock binaries in `tests/mocks/` (curl, docker, df, du, id) shadow real 
 - `tests/fixtures/path.json` — Pre-computed upgrade path waypoints (major.minor stops)
 - `tests/fixtures/dockerhub_*.json` — Docker Hub API response fixtures per major version
 
+### Integration Testing Against a Disposable GitLab (local Docker)
+
+There is no integration job in CI (see CI Pipeline below). Anything the mocks cannot prove — how GitLab itself reacts to a signal, a lock, a real exit code, real cleanup — is verified by starting a throwaway GitLab in Docker on the work machine and running the real script against it. Needs about 4-5GB of RAM; a fresh container turned healthy in ~70s on a 32-core workstation.
+
+```bash
+docker run -d --name ugtest-gitlab --shm-size 256m \
+  -p 127.0.0.1:18080:80 \
+  -v ugtest-gitlab-config:/etc/gitlab \
+  -v ugtest-gitlab-logs:/var/log/gitlab \
+  -v ugtest-gitlab-data:/var/opt/gitlab \
+  -e GITLAB_OMNIBUS_CONFIG="external_url 'http://localhost:18080'; puma['worker_processes'] = 0; sidekiq['concurrency'] = 5; prometheus_monitoring['enable'] = false; gitlab_rails['backup_path'] = '/var/opt/gitlab/backups'" \
+  gitlab/gitlab-ee:19.2.6-ee.0
+
+# run the script against it (CI=true lifts -y's DISCORD_URL requirement)
+CI=true ./upgrade-gitlab -y --no-step-limit --target-url=http://localhost:18080
+
+# cleanup; volumes too, since they cannot be reused at an older version
+docker rm -f ugtest-gitlab && docker volume rm ugtest-gitlab-config ugtest-gitlab-logs ugtest-gitlab-data
+```
+
+Things that bit when this was first done:
+
+- **An uninterrupted run really upgrades the container.** Once a run crosses a hop, the volumes hold a newer schema and cannot go back; to test at the old version again, remove the container *and* the volumes and start over. The script also deletes the previous image after a hop, so expect a re-pull.
+- **Only one `gitlab/gitlab-ce|ee` container may exist on the host**, because the script auto-detects its target by image.
+- **Rootless Docker fails the script's permission check.** The check greps `id` output for `docker`, and rootless Docker (`DOCKER_HOST=unix:///run/user/$UID/docker.sock`) needs no docker group. That is a limitation of the script, not of the host. For testing, put a shim `id` first on `PATH` that appends a marker when called without arguments and `exec`s the real `id` otherwise.
+- **Make the backup slow enough to interrupt.** An empty instance backs up in seconds. A 3GB random file in uploads stretches the uploads stage to ~45s: `docker exec ugtest-gitlab sh -c 'dd if=/dev/urandom of=/var/opt/gitlab/gitlab-rails/uploads/big.bin bs=1M count=3000 && chown git:git /var/opt/gitlab/gitlab-rails/uploads/big.bin'`. Poll for `pgrep -f 'directory=/var/opt/gitlab/gitlab-rails/uploads'` inside the container to know when the dump is running.
+- **A real Ctrl+C needs a real terminal, in the foreground.** Drive the script through `script(1)` and write `\003` into its stdin: the pty line discipline turns that into SIGINT for the foreground process group, exactly like a keypress. Keep `script(1)` in the foreground of a pipeline (`{ wait; printf '\003'; ... } | env --default-signal=INT script -q -e -f -c "..." log`) and never background it with `&`. A background job of a non-interactive shell starts with SIGINT ignored (`SigIgn: 0x6` in `/proc/<pid>/status`), and bash cannot trap a signal that was ignored on entry. The script then never sees ^C, while the docker client, whose Go runtime re-enables SIGINT, dies alone. In that state the first attempt carried on and upgraded the test container instead of cancelling. `env --default-signal=INT` makes the driver immune to how it was itself launched.
+
+Scenarios verified this way on 19.2.6 EE (unlicensed: maintenance mode reports `unavailable`):
+
+- Ctrl+C during the uploads dump: exit 130, the in-container backup stopped in ~1s, staging and PID file removed, no processes left, no upgrade.
+- A backup already running (holding the 16.0+ lock) when the script starts: the script's backup fails with `Backup and restore in progress`, the run aborts with exit 1 and no upgrade, and the other backup is left alone to finish with `exit=0`.
+- An uninterrupted run: a full 19.2.6 → 19.4.0 upgrade succeeded.
+
 ## CI Pipeline (.gitlab-ci.yml)
 
 Stages: `lint` → `test` → `promote`
@@ -148,7 +201,7 @@ Stages: `lint` → `test` → `promote`
 - **logic-test**: Runs `bats tests/` with kcov coverage on develop, master, MRs
 - **promote-to-master**: Auto-pushes develop → master (canonical project only, uses `PUSH_TOKEN`)
 
-There is no integration job. One existed — a real GitLab container upgraded end to end, then `batched_background_migrations` rows rewritten to status=4/5 to check stuck detection against a real PostgreSQL — but it had been failing continuously and was removed. Reviving it needs a privileged runner (it drove `docker:dind`) and a runner `maximum_timeout` above the default hour; a multi-hop upgrade of a real instance exceeds that.
+There is no integration job. One existed — a real GitLab container upgraded end to end, then `batched_background_migrations` rows rewritten to status=4/5 to check stuck detection against a real PostgreSQL — but it had been failing continuously and was removed. Reviving it needs a privileged runner (it drove `docker:dind`) and a runner `maximum_timeout` above the default hour; a multi-hop upgrade of a real instance exceeds that. Real-GitLab verification is done locally instead — see "Integration Testing Against a Disposable GitLab" under Testing.
 
 It also could not cross GitLab 19.0, which is worth knowing independently of CI: 19.0 dropped bundled Mattermost and its reconfigure hard-aborts with `Removed configurations found in gitlab.rb. Aborting reconfigure` when a `mattermost` key is present. On a stock install it *is* present — 18.x auto-generates a mattermost section in `gitlab-secrets.json` (salts, `sql_at_rest_encrypt_key`) even when Mattermost is unused, and regenerates it on every reconfigure, so each intermediate 18.x hop re-adds it. Crossing 19.0 cleanly would require editing secrets automatically, which is unsafe for real Mattermost users. This is an upstream GitLab issue, not a tool bug; users hit it as actionable output from `print_stacktrace_errors`' "Removed configurations found" branch (covered by a bats test).
 

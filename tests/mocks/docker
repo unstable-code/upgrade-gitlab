@@ -71,6 +71,24 @@ case "$args" in
     *"exec"*"dpkg -l"*)
         echo "ii  gitlab-${MOCK_EDITION}  ${MOCK_GITLAB_VERSION}  amd64  GitLab ${MOCK_EDITION^^}"
         ;;
+    # In-container backup liveness/stop for the cancel path. Placed early: "pgrep" contains
+    # "grep", which the gitlab.rb grep patterns below would otherwise catch.
+    *"exec"*"kill -TERM"*)
+        # _stop_container_backup's single in-container stop-and-wait. MOCK_BACKUP_IGNORES_TERM=1
+        # keeps the backup "running", which that loop reports as a timeout (exit 124).
+        [ -n "$MOCK_STATE_DIR" ] && touch "$MOCK_STATE_DIR/backup_term_sent"
+        if [ "${MOCK_BACKUP_IGNORES_TERM:-0}" -eq 1 ]; then exit 124; fi
+        [ -n "$MOCK_STATE_DIR" ] && rm -f "$MOCK_STATE_DIR/backup_running"
+        exit 0
+        ;;
+    *"exec"*"pgrep -f gitlab[:]backup[:]create"*)
+        # "Running" while the held gitlab-backup mock (MOCK_BACKUP_SLEEP) has its marker.
+        if [ -n "$MOCK_STATE_DIR" ] && [ -f "$MOCK_STATE_DIR/backup_running" ]; then
+            echo 4242
+        else
+            exit 1
+        fi
+        ;;
     *"exec"*"cat /etc/gitlab/gitlab.rb"*)
         echo "# gitlab.rb"
         ;;
@@ -208,6 +226,11 @@ case "$args" in
         # polling loop actually samples it (otherwise the mock exits before a tick).
         echo "2026-01-01 00:00:00 UTC -- Creating backup archive: ${MOCK_BACKUP_TAR_NAME:-1700000000_2026_01_01_16.11.0-ce_gitlab_backup.tar} ... "
         [ -n "${MOCK_PACK_SLEEP:-}" ] && sleep "$MOCK_PACK_SLEEP"
+        # MOCK_BACKUP_FAIL=1: a target failed — gitlab-backup finishes the rest, then exits 1.
+        if [ "${MOCK_BACKUP_FAIL:-0}" -eq 1 ]; then
+            echo "2026-01-01 00:00:00 UTC -- Dumping uploads failed: mock failure"
+            exit 1
+        fi
         echo "2026-01-01 00:00:00 UTC -- Creating backup archive: ${MOCK_BACKUP_TAR_NAME:-1700000000_2026_01_01_16.11.0-ce_gitlab_backup.tar} ... done"
         exit 0
         ;;
@@ -215,10 +238,13 @@ case "$args" in
         # MOCK_BACKUP_SLEEP: hold inside the backup so a test can deliver a signal
         # mid-backup (after runners are paused, before the critical zone). The marker
         # file lets the test wait deterministically instead of racing on a fixed sleep.
+        # backup_running mirrors the in-container process that pgrep would find.
         if [ -n "${MOCK_BACKUP_SLEEP:-}" ]; then
-            [ -n "$MOCK_STATE_DIR" ] && touch "$MOCK_STATE_DIR/backup_started"
+            [ -n "$MOCK_STATE_DIR" ] && touch "$MOCK_STATE_DIR/backup_started" "$MOCK_STATE_DIR/backup_running"
             sleep "$MOCK_BACKUP_SLEEP"
+            [ -n "$MOCK_STATE_DIR" ] && rm -f "$MOCK_STATE_DIR/backup_running"
         fi
+        if [ "${MOCK_BACKUP_FAIL:-0}" -eq 1 ]; then exit 1; fi
         exit 0
         ;;
     *"exec"*"gitlab-ctl reconfigure"*)

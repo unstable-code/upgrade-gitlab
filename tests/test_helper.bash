@@ -41,6 +41,17 @@ setup_mock_state() {
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
 }
 
+# wait_for_marker <file> — poll up to ~20s for a mock state marker; fails if it never shows.
+# Used to signal a backgrounded run at a deterministic point instead of a fixed sleep.
+wait_for_marker() {
+    local _
+    for _ in $(seq 1 200); do
+        [ -f "$1" ] && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
 teardown_mock_state() {
     [ -n "$MOCK_STATE_DIR" ] && rm -rf "$MOCK_STATE_DIR"
     unset MOCK_STATE_DIR

@@ -624,8 +624,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock > "$MOCK_STATE_DIR/out.log" 2>&1 &
     pid=$!
     # wait deterministically until the backup has started (runners are already paused by now)
-    for _ in $(seq 1 200); do [ -f "$MOCK_STATE_DIR/backup_started" ] && break; sleep 0.1; done
-    [ -f "$MOCK_STATE_DIR/backup_started" ]       # sanity: execution reached the backup
+    wait_for_marker "$MOCK_STATE_DIR/backup_started"   # sanity: execution reached the backup
     [ -f "$sf" ]                                  # sanity: runners were paused (state file written)
 
     # Use SIGTERM, not SIGINT: a non-interactive shell sets background jobs to ignore
@@ -640,6 +639,77 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     grep -q "Resumed previously paused runners: 1,2" "$MOCK_STATE_DIR/out.log"
     ! grep -q "Entering critical section" "$MOCK_STATE_DIR/out.log"  # stopped in backup, before the upgrade
     [ ! -f "$sf" ]                                                 # state file consumed by resume
+}
+
+# ---------- #16: cancelling the backup stops the one inside the container too ----------
+@test "full-flow: SIGTERM during backup stops the in-container backup before releasing holds" {
+    # The docker exec client dies with the script, but gitlab-backup inside the container
+    # does not — it would keep dumping, uploading and pruning after the holds were
+    # released. It must be stopped first, and the holds released only afterwards.
+    export MOCK_GITLAB_VERSION="17.11.3-ee.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_RUNNER_COUNT=2
+    export MOCK_MAINTENANCE=enabled
+    export MOCK_PSQL_STATS_FAIL=1                 # simple (bouncing-bar) backup branch
+    export MOCK_BACKUP_SLEEP=2                    # only needs to outlast the signal below
+
+    bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock > "$MOCK_STATE_DIR/out.log" 2>&1 &
+    pid=$!
+    wait_for_marker "$MOCK_STATE_DIR/backup_started"
+    kill -TERM "$pid"
+    status=0
+    wait "$pid" || status=$?
+
+    [ "$status" -eq 130 ]
+    [ -f "$MOCK_STATE_DIR/backup_term_sent" ]
+    grep -q "Backup stopped." "$MOCK_STATE_DIR/out.log"
+    # stop first, release second: a backup still running while holds are released
+    # would dump the very writes maintenance mode and the runner pause kept out
+    stop_line=$(grep -n "Stopping the backup still running" "$MOCK_STATE_DIR/out.log" | cut -d: -f1)
+    resume_line=$(grep -n "Resumed previously paused runners: 1,2" "$MOCK_STATE_DIR/out.log" | cut -d: -f1)
+    disable_line=$(grep -n "Maintenance mode disabled." "$MOCK_STATE_DIR/out.log" | cut -d: -f1)
+    [ "$stop_line" -lt "$resume_line" ]
+    [ "$stop_line" -lt "$disable_line" ]
+}
+
+@test "full-flow: a backup that ignores SIGTERM times out with guidance, holds still released" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_RUNNER_COUNT=2
+    export MOCK_PSQL_STATS_FAIL=1
+    export MOCK_BACKUP_SLEEP=3                    # still "running" when the stop is attempted
+    export MOCK_BACKUP_IGNORES_TERM=1
+    export _BACKUP_STOP_TIMEOUT=2
+
+    bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock > "$MOCK_STATE_DIR/out.log" 2>&1 &
+    pid=$!
+    wait_for_marker "$MOCK_STATE_DIR/backup_started"
+    kill -TERM "$pid"
+    status=0
+    wait "$pid" || status=$?
+
+    [ "$status" -eq 130 ]
+    grep -q "still running after 2s (PID 4242)" "$MOCK_STATE_DIR/out.log"
+    grep -q "do not re-run this script until" "$MOCK_STATE_DIR/out.log"
+    grep -q "Resumed previously paused runners: 1,2" "$MOCK_STATE_DIR/out.log"
+}
+
+@test "full-flow: a failed backup aborts the upgrade and releases holds" {
+    # Previously the exit code was ignored and the run went on to swap the container —
+    # an irreversible upgrade with no complete backup of the current version.
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_RUNNER_COUNT=2
+    export MOCK_BACKUP_FAIL=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"backup failed (exit code 1)"* ]]
+    [[ "$output" == *"not upgrading without a complete backup"* ]]
+    [[ "$output" != *"Entering critical section"* ]]
+    [[ "$output" == *"Resumed previously paused runners: 1,2"* ]]
+    [ ! -f "$MOCK_STATE_DIR/run_args" ]           # the container was never recreated
+    # the backup had already returned, so there is nothing inside the container to stop
+    [ ! -f "$MOCK_STATE_DIR/backup_term_sent" ]
 }
 
 # ---------- Test 31d: non-signal abort before the critical zone resumes paused runners ----------
@@ -791,8 +861,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock > "$MOCK_STATE_DIR/out.log" 2>&1 &
     pid=$!
     set +m
-    for _ in $(seq 1 200); do [ -f "$MOCK_STATE_DIR/maintenance_probe" ] && break; sleep 0.1; done
-    [ -f "$MOCK_STATE_DIR/maintenance_probe" ]    # sanity: the enable is in flight
+    wait_for_marker "$MOCK_STATE_DIR/maintenance_probe"   # sanity: the enable is in flight
 
     # Signal the whole group, as a terminal does. SIGTERM stands in for SIGINT for the
     # reason given in the SIGINT-during-backup test; _handle_signal traps both.

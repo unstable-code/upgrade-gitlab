@@ -10,6 +10,13 @@ LOG_DRIVER_OVERRIDE=${UPGRADE_GITLAB_LOG_DRIVER:-}
 # PostgreSQL/Gitaly가 정리 없이 종료되면 다음 부팅이 crash recovery로 들어간다.
 # -t 는 상한이지 고정 대기가 아니므로(종료 즉시 반환) 넉넉히 잡아도 손해가 없다.
 STOP_TIMEOUT=300
+
+# 컨테이너 안 백업(rake gitlab:backup:create) 프로세스를 찾는 pgrep -f 정규식(#16).
+# 대괄호 표기는 실제 프로세스와는 일치하되, 이 문자열을 인자로 받아 도는 sh 루프의 명령줄
+# ("gitlab[:]backup[:]create" 그대로)와는 일치하지 않는다 — 평문으로 쓰면 그런 루프가 자기
+# 자신을 영원히 "백업 중"으로 보고, 정지 대상 검색에도 걸린다. 한 곳에서만 정의해, GitLab이
+# 태스크 이름을 바꾸는 날 한 곳만 고치면 되게 한다.
+_BACKUP_PROC_PATTERN='gitlab[:]backup[:]create'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || SCRIPT_DIR=""
 
 skip_latest=0
@@ -183,9 +190,12 @@ _cleanup_on_exit() {
     #  - --dry-run은 경로만 계산하고 아무것도 바꾸지 않겠다는 약속이므로, 이전 실행이 남긴
     #    상태(paused 러너 / maintenance mode)도 건드리지 않는다. 해제는 실제 실행에 맡긴다.
     #  - 상태 파일 경로가 정해지기 전(컨테이너 감지 실패 등)에 종료하면 해제할 것도 없다.
+    #  - 백업 도중 종료됐다면 컨테이너 안 백업을 먼저 멈춘다(#16). 백업이 도는 채로 hold를 풀면
+    #    maintenance mode와 러너 일시정지가 막으려던 쓰기가 덤프에 섞인다.
     if [ "${dry_run:-0}" != 1 ] && [ "${_trap_active:-0}" != 1 ] \
        && command -v _release_upgrade_holds >/dev/null 2>&1 \
        && [ -n "${_runner_state_file:-}" ]; then
+        [ "${_backup_in_progress:-0}" = 1 ] && _stop_container_backup
         _release_upgrade_holds
     fi
     return 0
@@ -270,11 +280,12 @@ _resume_paused_runners() {
     fi
 }
 
-# _rails_runner <ruby> — gitlab-rails runner를 실행해 stdout을 전역 _rails_out에 담는다.
+# _exec_isolated <docker exec 인자...> — 컨테이너에서 명령을 실행해 stdout을 전역 _exec_out에 담는다.
 # 터미널 Ctrl+C는 포그라운드 프로세스 그룹 전체에 가므로 docker exec 클라이언트도 함께 죽지만,
-# 컨테이너 안의 runner는 클라이언트와 무관하게 끝까지 돈다(docker 29.8에서 재현). 그러면
-# 스크립트는 결과를 잃고 종료하고, 몇 분 뒤 고아 runner가 maintenance mode를 켜서 상태 파일
-# 없이(=아무도 끄지 않는 채) 인스턴스가 읽기 전용으로 남는다. 그래서:
+# 컨테이너 안의 명령은 클라이언트와 무관하게 끝까지 돈다(docker 29.8에서 재현, tty 할당 시도 동일).
+# 그러면 스크립트는 결과를 잃는다: maintenance mode를 켜는 runner라면 몇 분 뒤 고아 runner가
+# 상태 파일 없이(=아무도 끄지 않는 채) 켜 버리고, 백업 생존 확인이라면 빈 출력을 "이미
+# 끝났다"로 오판한다. 결과가 필요한 부작용 있는 호출은 이 함수를 거친다:
 #  - set -m으로 클라이언트를 별도 프로세스 그룹에 띄워 Ctrl+C가 닿지 않게 하고
 #    (setsid는 DSM에 있다는 보장이 없어 순수 bash로 한다)
 #  - 그동안은 critical zone처럼 시그널을 미뤄(_interrupted만 세움) 결과를 끝까지 회수한다.
@@ -283,22 +294,27 @@ _resume_paused_runners() {
 #    끝내 버린다.
 # 미룬 시그널의 처리는 호출부 몫이다. $(...) 안에서 부르면 서브셸에서 트랩이 기본값으로
 # 돌아가 미루기가 무력해지므로, 결과는 명령 치환이 아니라 전역으로 넘긴다.
-_rails_out=""
-_rails_runner() {
+_exec_out=""
+_exec_isolated() {
     local tmp pid rc prev_trap=$_trap_active
     tmp=$(mktemp)
     _TMPFILES+=("$tmp")
     _trap_active=1
     set -m
-    docker exec "$CONTAINER_NAME" gitlab-rails runner "$1" > "$tmp" 2>/dev/null &
+    docker exec "$CONTAINER_NAME" "$@" > "$tmp" 2>/dev/null &
     pid=$!
     set +m
     _wait_reap "$pid"
     rc=$?
     _trap_active=$prev_trap
-    _rails_out=$(<"$tmp")
+    _exec_out=$(<"$tmp")
     rm -f "$tmp"
     return "$rc"
+}
+
+# _rails_runner <ruby> — gitlab-rails runner 한 번(부팅 5분 내외). 결과는 _exec_out.
+_rails_runner() {
+    _exec_isolated gitlab-rails runner "$1"
 }
 
 # --- maintenance mode (#15) ---
@@ -348,7 +364,7 @@ _disable_maintenance_mode() {
     _maintenance_release_attempted=1
     echo "Disabling maintenance mode via gitlab-rails (a rails boot; expect around 5 minutes. Ctrl+C waits for it to finish)..."
     _rails_runner "$_MAINTENANCE_DISABLE_RUBY"
-    if grep -qx 'maintenance_mode=disabled' <<< "$_rails_out"; then
+    if grep -qx 'maintenance_mode=disabled' <<< "$_exec_out"; then
         echo "Maintenance mode disabled."
         _maintenance_enabled_by_us=0
         rm -f "$_maintenance_state_file"
@@ -363,6 +379,65 @@ _disable_maintenance_mode() {
 # 업그레이드를 위해 잡아 둔 hold를 한 번에 해제한다: 일시정지한 러너, 켜 둔 maintenance mode.
 # 해제 지점이 여러 곳(정상 종료, recovery, 이미 최신, EXIT 트랩)이라 개별 호출을 늘어놓으면
 # hold가 하나 늘 때마다 누락될 자리가 그만큼 늘어난다. 두 함수 모두 멱등하다.
+# 백업 도중 스크립트가 종료되면(Ctrl+C 등) 컨테이너 안의 백업도 멈춘다(#16). 클라이언트만 죽은
+# 백업은 hold가 풀린 뒤에도 덤프, 원격 업로드, backup_keep_time 정리까지 이어 가고, 16.0+의
+# 잠금(backup_restore.pid) 때문에 곧바로 다시 실행한 백업을 실패시킨다.
+#  - SIGKILL이 아니라 SIGTERM: 백업 코드에 신호 처리가 없어 Ruby 기본 동작으로 SignalException이
+#    나고 ensure 블록(스테이징 정리, PID 파일 삭제)이 실행된다.
+#  - 대상은 rake를 돌리는 ruby 프로세스다. 'gitlab:backup:create'는 그 명령줄에만 있고 bash 래퍼
+#    ("gitlab-backup create")에는 없으며, <12.2의 gitlab-rake 경로도 같은 문자열로 잡힌다.
+#  - rake의 직계 하위 프로세스(tar/gzip, pg_dump, gitaly-backup)에도 보낸다. rake만 받으면 예외는
+#    진행 중인 파이프라인이 끝난 뒤에야 나서 그 단계를 끝까지 덤프한다. 19.2.6 실측(3GB uploads):
+#    rake만 43초, 하위까지 1초. 하위 실패가 "그 대상만 실패"로 처리돼 다음 대상으로 넘어가지
+#    않을까 했지만, 대기 중이던 SignalException이 먼저 나서 uploads에서 바로 중단됐고 정리도 됐다.
+#  - 기다리는 것은 백업 완료가 아니라 종료이고, STOP_TIMEOUT이 상한이다(docker stop과 같은 의미).
+#  - 기다리는 동안 시그널을 미룬다. EXIT 트랩 안에서 두 번째 Ctrl+C로 exit하면 뒤따르는 hold 해제가
+#    통째로 건너뛰어지기 때문이다. 확인용 exec는 _exec_isolated로 불러 빈 출력 오판을 막는다.
+# hold 해제보다 먼저 호출해야 한다 — 백업이 도는 동안 maintenance mode를 끄면 의미가 없다.
+# shellcheck disable=SC2329
+_stop_container_backup() {
+    local pids rc timeout=${_BACKUP_STOP_TIMEOUT:-$STOP_TIMEOUT} prev_trap=$_trap_active
+    # 첫 확인과 아래 정지 호출 사이의 Ctrl+C도 미룬다. 그 틈에 EXIT 트랩 안에서 종료되면
+    # 뒤따르는 hold 해제가 건너뛰어진다(_exec_isolated는 호출 한 번만 감싼다).
+    _trap_active=1
+    _exec_isolated pgrep -f "$_BACKUP_PROC_PATTERN"
+    pids=$(grep -Ex '[0-9]+' <<< "$_exec_out" | tr '\n' ' ')
+    pids=${pids% }
+    if [ -z "$pids" ]; then
+        _trap_active=$prev_trap
+        return 0
+    fi
+    echo "Stopping the backup still running inside the container (PID $pids); waiting up to ${timeout}s for it to clean up..."
+    # 정지와 대기를 컨테이너 안 한 번의 호출로 한다. 2초마다 docker exec로 확인하면 최악 150회
+    # 왕복이다. rake가 먼저 받아 SignalException을 대기시킨 뒤 하위를 끊어야 다음 대상으로
+    # 넘어가지 않는다. 시간 초과는 timeout(1) 관례대로 124로 알려 docker 자체 실패와 구분한다.
+    # shellcheck disable=SC2016  # $1..$3은 컨테이너 쪽 sh가 확장한다
+    _exec_isolated sh -c '
+        kill -TERM $2
+        for p in $2; do pkill -TERM -P "$p"; done
+        i=0
+        while pgrep -f "$1" >/dev/null 2>&1; do
+            [ "$i" -ge "$3" ] && exit 124
+            sleep 2; i=$((i + 2))
+        done' sh "$_BACKUP_PROC_PATTERN" "$pids" "$timeout"
+    rc=$?
+    _trap_active=$prev_trap
+    case $rc in
+        0)
+            echo "Backup stopped."
+            ;;
+        124)
+            echo "Warning: the backup inside the container is still running after ${timeout}s (PID $pids). It has already been sent SIGTERM; do not re-run this script until 'docker exec $CONTAINER_NAME pgrep -f gitlab:backup:create' prints nothing." >&2
+            send_discord_webhook "WARN" "Cancelled backup is still running" "PID $pids in $CONTAINER_NAME did not exit within ${timeout}s"
+            return 1
+            ;;
+        *)
+            echo "Warning: could not confirm that the backup inside the container stopped (docker exec exit $rc). Check with 'docker exec $CONTAINER_NAME pgrep -af gitlab:backup:create' before re-running this script." >&2
+            return 1
+            ;;
+    esac
+}
+
 # shellcheck disable=SC2329
 _release_upgrade_holds() {
     _resume_paused_runners
@@ -1646,11 +1721,24 @@ _draw_bouncing_frame() {
     printf '\r\033[K%s' "$bar_line" > "$_tty"
 }
 
+# 컨테이너 안 루프는 스스로 끝나야 한다. _stop_size_poller와 _handle_signal은 로컬 docker exec
+# 클라이언트만 죽이고, 컨테이너 쪽 명령은 클라이언트와 무관하게 계속 돈다(#16과 같은 원인).
+# 예전 `while true`는 업그레이드가 진행되면 컨테이너 교체와 함께 사라졌지만, 취소나 백업 실패로
+# 중단된 실행에서는 컨테이너가 재시작될 때까지 0.5초마다 돌았다(19.2.6 E2E에서 확인). 그래서
+# 백업 프로세스를 한 번 본 뒤 사라지면 끝내고, 끝내 나타나지 않으면 ~10분 뒤 끝낸다.
+# 패턴은 _BACKUP_PROC_PATTERN을 위치 인자로 받는다(대괄호 표기인 이유는 그 정의 참고).
 _start_size_poller() {
     _size_poller_file=$(mktemp)
     _TMPFILES+=("$_size_poller_file")
     docker exec "$CONTAINER_NAME" sh -c '
+        seen=0; idle=0
         while true; do
+            if pgrep -f "$1" >/dev/null 2>&1; then
+                seen=1; idle=0
+            else
+                [ "$seen" = 1 ] && exit 0
+                idle=$((idle + 1)); [ "$idle" -gt 1200 ] && exit 0
+            fi
             stat -c "%s %n" /var/opt/gitlab/backups/*.tar.gz 2>/dev/null
             stat -c "%s %n" /var/opt/gitlab/backups/*_gitlab_backup.tar 2>/dev/null
             sum=0
@@ -1666,7 +1754,7 @@ _start_size_poller() {
             echo ---
             sleep 0.5
         done
-    ' >> "$_size_poller_file" 2>/dev/null &
+    ' sh "$_BACKUP_PROC_PATTERN" >> "$_size_poller_file" 2>/dev/null &
     _size_poller_pid=$!
 }
 
@@ -2850,7 +2938,7 @@ if [ ${#_prebackup_snippets[@]} -gt 0 ]; then
 fi
 
 if [ "$use_maintenance_mode" -eq 1 ]; then
-    case "$(grep -m1 -Ex 'maintenance_mode=[a-z]+' <<< "$_rails_out")" in
+    case "$(grep -m1 -Ex 'maintenance_mode=[a-z]+' <<< "$_exec_out")" in
         maintenance_mode=enabled)
             _maintenance_enabled_by_us=1
             if ! : > "$_maintenance_state_file" 2>/dev/null; then
@@ -2874,7 +2962,7 @@ if [ "$use_maintenance_mode" -eq 1 ]; then
 fi
 
 if [ "$skip_object_storage" -eq 1 ]; then
-    _os_skips=$(_detect_object_storage_skips <<< "$_rails_out")
+    _os_skips=$(_detect_object_storage_skips <<< "$_exec_out")
     for _c in $_os_skips; do
         case ",$skip_components," in
             *",$_c,"*) ;;  # 이미 --skip-lfs 등으로 포함된 컴포넌트는 건너뜀
@@ -2902,18 +2990,37 @@ if [ -n "$skip_components" ]; then
 fi
 
 _query_backup_stats
+# 백업 명령(gitlab-backup, <12.2는 gitlab-rake)은 한 번 조립하고, 표시 방식(진행률 바는
+# -t로 tty가 필요)만 나눈다. 실행기를 변수로 간접 호출하지 않는 이유: shellcheck가 호출
+# 관계를 못 보고 run_with_progress_bar 이하 헬퍼 전체를 미사용으로 표시한다.
 if docker exec "$CONTAINER_NAME" which gitlab-backup &>/dev/null; then
-    if [ "$_backup_stats_available" -eq 1 ]; then
-        run_with_progress_bar "Backup" docker exec -t -e TERM=dumb "${backup_skip_env[@]}" "$CONTAINER_NAME" gitlab-backup create
-    else
-        run_with_bouncing_bar "Backup" docker exec "${backup_skip_env[@]}" "$CONTAINER_NAME" gitlab-backup create
-    fi
+    _backup_cmd=("${backup_skip_env[@]}" "$CONTAINER_NAME" gitlab-backup create)
 else
-    if [ "$_backup_stats_available" -eq 1 ]; then
-        run_with_progress_bar "Backup" docker exec -t -e TERM=dumb "$CONTAINER_NAME" gitlab-rake gitlab:backup:create "${backup_skip_rake[@]}"
-    else
-        run_with_bouncing_bar "Backup" docker exec "$CONTAINER_NAME" gitlab-rake gitlab:backup:create "${backup_skip_rake[@]}"
-    fi
+    _backup_cmd=("$CONTAINER_NAME" gitlab-rake gitlab:backup:create "${backup_skip_rake[@]}")
+fi
+# 백업 도중 종료되면 EXIT 트랩이 컨테이너 안 백업을 멈추도록 진행 중임을 표시해 둔다(#16).
+_backup_rc=0
+_backup_in_progress=1
+if [ "$_backup_stats_available" -eq 1 ]; then
+    run_with_progress_bar "Backup" docker exec -t -e TERM=dumb "${_backup_cmd[@]}" || _backup_rc=$?
+else
+    run_with_bouncing_bar "Backup" docker exec "${_backup_cmd[@]}" || _backup_rc=$?
+fi
+_backup_in_progress=0
+
+# 백업 실패를 그냥 넘기면 설정 복사, critical zone 진입, 컨테이너 교체까지 진행되어 현재 버전의
+# 새 백업 없이 되돌릴 수 없는 업그레이드가 된다(#16). gitlab-backup은 어떤 대상이든 실패하면
+# 0이 아닌 코드로 끝나고(19.2.6: DB/파일 대상 실패는 나머지를 마친 뒤 exit 1, 저장소 실패는 즉시
+# 중단), 경고만으로 0이 아닌 경우는 없으므로 0이 아니면 백업이 불완전하다고 본다. 고아 백업이
+# 남은 채 곧바로 재실행해 16.0+ 잠금에 걸린 경우도 여기서 멈춘다.
+# 시크릿 검사와 달리 대화형에서도 "그래도 진행"을 묻지 않고 항상 중단한다 — 롤백을 지원하지
+# 않는 도구에서 불완전한 백업은 백업이 아니다. 원인을 고친 뒤(또는 --skip-* 로 대상을 명시적으로
+# 뺀 뒤) 다시 실행하면 된다.
+if [ "$_backup_rc" -ne 0 ]; then
+    echo "Error: backup failed (exit code $_backup_rc); there is no complete backup of $CURRENT_VERSION." >&2
+    echo "Aborted: not upgrading without a complete backup. Fix the cause and re-run." >&2
+    send_discord_webhook "ERR" "Backup failed (exit code $_backup_rc)" "Upgrade aborted: no complete backup of $CURRENT_VERSION"
+    exit 1
 fi
 BACKUP_DIR=$(docker exec "$CONTAINER_NAME" grep "'backup_path'" /etc/gitlab/gitlab.rb 2>/dev/null | awk -F"=" '{ print $2 }' | sed 's/\"//g' | sed 's/^ //')
 if [ -z "$BACKUP_DIR" ]; then
