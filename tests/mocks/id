@@ -1,3 +1,0 @@
-#!/usr/bin/env bash
-# Mock id command — pretend we're root in docker group
-echo "uid=0(root) gid=0(root) groups=0(root),999(docker)"

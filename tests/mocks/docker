@@ -46,6 +46,12 @@ _mock_running_jobs_now() {
 args="$*"
 
 case "$args" in
+    "version --format {{.Server.Version}}")
+        if [ -n "${MOCK_DOCKER_UNREACHABLE:-}" ]; then
+            echo "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock" >&2
+            exit 1
+        fi
+        ;;
     "ps -a --format {{.Image}}"*"{{.Names}}"*)
         echo -e "${MOCK_IMAGE}\t${MOCK_CONTAINER}"
         ;;
@@ -396,9 +402,6 @@ case "$args" in
         if [ -n "$MOCK_STATE_DIR" ]; then
             printf '%s\n' "$args" >> "$MOCK_STATE_DIR/stop_args"
         fi
-        exit 0
-        ;;
-    *"rm"*)
         exit 0
         ;;
     *"pull"*)

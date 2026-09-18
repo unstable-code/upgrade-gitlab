@@ -737,8 +737,12 @@ if ! which docker &> /dev/null; then
     exit 1
 fi
 
-if ! id | grep docker &> /dev/null && [ $UID -ne 0 ]; then
-    echo "The $USER user does not have enough docker.sock permissions." >&2
+# Ask the daemon itself rather than guessing from group names: rootless Docker and
+# DOCKER_HOST need no docker group, and a group merely named like one grants nothing.
+if ! _docker_err=$(docker version --format '{{.Server.Version}}' 2>&1 >/dev/null); then
+    echo "Cannot reach the Docker daemon as $USER:" >&2
+    echo "  ${_docker_err//$'\n'/$'\n'  }" >&2
+    echo 'Check that the daemon is running and that this user can access its socket (docker group, root, or DOCKER_HOST).' >&2
     exit 1
 fi
 

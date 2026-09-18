@@ -225,3 +225,12 @@ setup() {
     [ "$status" -eq 1 ]
     [[ "$output" == *"--max-tier must be one of"* ]]
 }
+
+# ---------- Unreachable Docker daemon: the startup probe reports docker's own error (#18) ----------
+@test "unreachable docker daemon fails with the docker error" {
+    export MOCK_DOCKER_UNREACHABLE=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Cannot reach the Docker daemon as"* ]]
+    [[ "$output" == *"  permission denied while trying to connect"* ]]
+}

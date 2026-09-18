@@ -38,7 +38,7 @@ EOS (end-of-support) versions are checked via GitLab releases API but not exhaus
   - <=12.1: auto-fallback from `gitlab-backup create` to `gitlab-rake gitlab:backup:create`
 - Docker (Engine or Desktop)
 - `bash`, `curl`, `jq`, `sort` (with `-V` flag)
-- Root access or Docker group membership
+- Access to the Docker daemon (root, Docker group membership, or rootless Docker via `DOCKER_HOST`)
 
 ## Usage
 
