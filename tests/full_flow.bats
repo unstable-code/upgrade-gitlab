@@ -775,6 +775,40 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     [ ! -f "$MAINTENANCE_STATE_FILE" ]
 }
 
+@test "full-flow: Ctrl+C while maintenance mode is being enabled still disables it" {
+    # A terminal Ctrl+C signals the whole foreground process group, so the docker exec
+    # client dies with the script — but the rails runner inside the container does not.
+    # It went on to enable maintenance mode minutes after the script had exited, with no
+    # state file behind it, leaving the instance read-only. The client must be shielded
+    # from the group signal and the signal deferred until the result is recorded.
+    export MOCK_GITLAB_VERSION="17.11.3-ee.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_RUNNER_COUNT=2
+    export MOCK_MAINTENANCE=enabled
+    export MOCK_RAILS_SLEEP=3                     # hold inside the enable boot
+
+    set -m                                        # own process group: pgid == pid
+    bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock > "$MOCK_STATE_DIR/out.log" 2>&1 &
+    pid=$!
+    set +m
+    for _ in $(seq 1 200); do [ -f "$MOCK_STATE_DIR/maintenance_probe" ] && break; sleep 0.1; done
+    [ -f "$MOCK_STATE_DIR/maintenance_probe" ]    # sanity: the enable is in flight
+
+    # Signal the whole group, as a terminal does. SIGTERM stands in for SIGINT for the
+    # reason given in the SIGINT-during-backup test; _handle_signal traps both.
+    kill -TERM -- "-$pid"
+    status=0
+    wait "$pid" || status=$?
+
+    [ "$status" -eq 130 ]
+    grep -q "Maintenance mode enabled" "$MOCK_STATE_DIR/out.log"     # the result was not lost...
+    grep -q "Maintenance mode disabled." "$MOCK_STATE_DIR/out.log"   # ...so it could be undone
+    grep -q "Resumed previously paused runners: 1,2" "$MOCK_STATE_DIR/out.log"
+    [ -f "$MOCK_STATE_DIR/maintenance_disabled" ]
+    [ ! -f "$MAINTENANCE_STATE_FILE" ]
+    [ ! -f "$MOCK_STATE_DIR/backup_args" ]        # stopped before the backup started
+}
+
 @test "full-flow: --dry-run leaves leftover runner and maintenance state untouched" {
     # --dry-run only computes the path; releasing another run's holds would be a side effect.
     export MOCK_GITLAB_VERSION="17.11.3-ee.0"

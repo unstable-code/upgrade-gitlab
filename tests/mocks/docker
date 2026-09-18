@@ -183,6 +183,9 @@ case "$args" in
         case "$args" in
             *"maintenance_mode: true"*)
                 [ -n "$MOCK_STATE_DIR" ] && touch "$MOCK_STATE_DIR/maintenance_probe"
+                # MOCK_RAILS_SLEEP: hold inside the boot (minutes in reality) so a test can
+                # deliver a signal while the enable is still in flight.
+                if [ -n "${MOCK_RAILS_SLEEP:-}" ]; then sleep "$MOCK_RAILS_SLEEP"; fi
                 [ "${MOCK_MAINTENANCE:-}" = fail ] || echo "maintenance_mode=${MOCK_MAINTENANCE:-unavailable}"
                 ;;
         esac

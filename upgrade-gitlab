@@ -270,6 +270,37 @@ _resume_paused_runners() {
     fi
 }
 
+# _rails_runner <ruby> — gitlab-rails runner를 실행해 stdout을 전역 _rails_out에 담는다.
+# 터미널 Ctrl+C는 포그라운드 프로세스 그룹 전체에 가므로 docker exec 클라이언트도 함께 죽지만,
+# 컨테이너 안의 runner는 클라이언트와 무관하게 끝까지 돈다(docker 29.8에서 재현). 그러면
+# 스크립트는 결과를 잃고 종료하고, 몇 분 뒤 고아 runner가 maintenance mode를 켜서 상태 파일
+# 없이(=아무도 끄지 않는 채) 인스턴스가 읽기 전용으로 남는다. 그래서:
+#  - set -m으로 클라이언트를 별도 프로세스 그룹에 띄워 Ctrl+C가 닿지 않게 하고
+#    (setsid는 DSM에 있다는 보장이 없어 순수 bash로 한다)
+#  - 그동안은 critical zone처럼 시그널을 미뤄(_interrupted만 세움) 결과를 끝까지 회수한다.
+#    enter_critical이 아니라 _trap_active를 저장·복원하는 이유: enter/exit_critical은 재진입이
+#    안 되므로, recovery 경로처럼 이미 critical zone 안에서 불리면 exit_critical이 바깥 zone까지
+#    끝내 버린다.
+# 미룬 시그널의 처리는 호출부 몫이다. $(...) 안에서 부르면 서브셸에서 트랩이 기본값으로
+# 돌아가 미루기가 무력해지므로, 결과는 명령 치환이 아니라 전역으로 넘긴다.
+_rails_out=""
+_rails_runner() {
+    local tmp pid rc prev_trap=$_trap_active
+    tmp=$(mktemp)
+    _TMPFILES+=("$tmp")
+    _trap_active=1
+    set -m
+    docker exec "$CONTAINER_NAME" gitlab-rails runner "$1" > "$tmp" 2>/dev/null &
+    pid=$!
+    set +m
+    _wait_reap "$pid"
+    rc=$?
+    _trap_active=$prev_trap
+    _rails_out=$(<"$tmp")
+    rm -f "$tmp"
+    return "$rc"
+}
+
 # --- maintenance mode (#15) ---
 # 사용 가능 여부는 DB만으로 판정할 수 없다: 실측(19.2 EE)에서 License.current&.plan이 nil인데도
 # feature_available?(:maintenance_mode)는 true였다. 그래서 rails 안에서 판정하고, CE(License
@@ -315,9 +346,9 @@ _disable_maintenance_mode() {
         return 0
     fi
     _maintenance_release_attempted=1
-    echo "Disabling maintenance mode via gitlab-rails (a rails boot; expect around 5 minutes)..."
-    if docker exec "$CONTAINER_NAME" gitlab-rails runner "$_MAINTENANCE_DISABLE_RUBY" 2>/dev/null \
-        | grep -qx 'maintenance_mode=disabled'; then
+    echo "Disabling maintenance mode via gitlab-rails (a rails boot; expect around 5 minutes. Ctrl+C waits for it to finish)..."
+    _rails_runner "$_MAINTENANCE_DISABLE_RUBY"
+    if grep -qx 'maintenance_mode=disabled' <<< "$_rails_out"; then
         echo "Maintenance mode disabled."
         _maintenance_enabled_by_us=0
         rm -f "$_maintenance_state_file"
@@ -2811,17 +2842,15 @@ PULL_PID=$!
 #  - maintenance mode(#15): 백업 중 쓰기를 막아 DB 덤프와 저장소 덤프의 시점을 맞춘다.
 #    판정 결과와 무관하게 업그레이드는 계속한다 — 켜지 못했다는 이유로 막을 일이 아니다.
 _prebackup_snippets=()
-_prebackup_out=""
 [ "$skip_object_storage" -eq 1 ] && _prebackup_snippets+=("$_OBJECT_STORAGE_RUBY")
 [ "$use_maintenance_mode" -eq 1 ] && _prebackup_snippets+=("$_MAINTENANCE_ENABLE_RUBY")
 if [ ${#_prebackup_snippets[@]} -gt 0 ]; then
-    echo "Querying GitLab runtime settings via gitlab-rails (a rails boot; expect around 5 minutes)..."
-    _prebackup_out=$(docker exec "$CONTAINER_NAME" gitlab-rails runner \
-        "$(printf '%s\n' "${_prebackup_snippets[@]}")" 2>/dev/null)
+    echo "Querying GitLab runtime settings via gitlab-rails (a rails boot; expect around 5 minutes. Ctrl+C waits for it to finish)..."
+    _rails_runner "$(printf '%s\n' "${_prebackup_snippets[@]}")"
 fi
 
 if [ "$use_maintenance_mode" -eq 1 ]; then
-    case "$(grep -m1 -Ex 'maintenance_mode=[a-z]+' <<< "$_prebackup_out")" in
+    case "$(grep -m1 -Ex 'maintenance_mode=[a-z]+' <<< "$_rails_out")" in
         maintenance_mode=enabled)
             _maintenance_enabled_by_us=1
             if ! : > "$_maintenance_state_file" 2>/dev/null; then
@@ -2845,13 +2874,20 @@ if [ "$use_maintenance_mode" -eq 1 ]; then
 fi
 
 if [ "$skip_object_storage" -eq 1 ]; then
-    _os_skips=$(_detect_object_storage_skips <<< "$_prebackup_out")
+    _os_skips=$(_detect_object_storage_skips <<< "$_rails_out")
     for _c in $_os_skips; do
         case ",$skip_components," in
             *",$_c,"*) ;;  # 이미 --skip-lfs 등으로 포함된 컴포넌트는 건너뜀
             *) skip_components="${skip_components:+$skip_components,}$_c" ;;
         esac
     done
+fi
+
+# _rails_runner가 미뤄 둔 시그널은 결과(maintenance mode 상태 파일)를 기록한 지금 처리한다.
+# 아직 critical zone 전이므로 EXIT 트랩이 러너와 maintenance mode를 함께 해제한다.
+if [ "$_interrupted" -eq 1 ]; then
+    echo "Interrupted before the backup; releasing runners and maintenance mode." >&2
+    _handle_signal    # critical zone 밖이므로 백그라운드 작업을 정리하고 exit 130
 fi
 
 # SKIP 컴포넌트를 두 호출 규약에 맞춰 한 번만 조립한다:
