@@ -641,6 +641,78 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     [ ! -f "$sf" ]                                                 # state file consumed by resume
 }
 
+# ---------- #17: CI jobs still running when the upgrade starts ----------
+@test "full-flow: running CI jobs are waited for (default) before the backup" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_RUNNER_COUNT=2
+    export MOCK_RUNNING_JOBS=2
+    export MOCK_RUNNING_JOBS_FINISH_AFTER=3      # notice, post-pause recount, one wait poll
+    export _RUNNING_JOBS_POLL=0
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"2 CI job(s) are running right now (--running-jobs=wait"* ]]
+    [[ "$output" == *"group/app"* ]]                                   # the job list is shown
+    [[ "$output" == *"Running CI jobs: [2 running]"* ]]
+    [[ "$output" == *"Running CI jobs: all finished"* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+    # waiting must end before the backup — and so before maintenance mode is enabled
+    done_line=$(grep -n "Running CI jobs: all finished" <<< "$output" | cut -d: -f1)
+    backup_line=$(grep -n "Creating backups" <<< "$output" | cut -d: -f1)
+    [ "$done_line" -lt "$backup_line" ]
+}
+
+@test "full-flow: --running-jobs-timeout aborts the upgrade and resumes the runners" {
+    export MOCK_GITLAB_VERSION="17.11.3-ee.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_RUNNER_COUNT=2
+    export MOCK_RUNNING_JOBS=1                    # never finishes
+    export MOCK_MAINTENANCE=enabled
+    export _RUNNING_JOBS_POLL=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock --running-jobs-timeout=1
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Aborted: 1 CI job(s) still running (not finished within --running-jobs-timeout=1s)"* ]]
+    [[ "$output" == *"Resumed previously paused runners: 1,2"* ]]
+    [ ! -f "$MOCK_STATE_DIR/backup_args" ]        # never reached the backup
+    [ ! -f "$MOCK_STATE_DIR/maintenance_probe" ]  # nor the maintenance-mode boot
+}
+
+@test "full-flow: --running-jobs=abort leaves running jobs alone and does not upgrade" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_RUNNER_COUNT=2
+    export MOCK_RUNNING_JOBS=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock --running-jobs=abort
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Aborted: 1 CI job(s) still running (--running-jobs=abort)"* ]]
+    [[ "$output" != *"Running CI jobs: ["* ]]
+    [[ "$output" == *"Resumed previously paused runners: 1,2"* ]]
+    [ ! -f "$MOCK_STATE_DIR/backup_args" ]
+    # counted twice (notice + post-pause recount) and never polled
+    [ "$(cat "$MOCK_STATE_DIR/running_jobs_polls")" -eq 2 ]
+}
+
+@test "full-flow: jobs that finish before the runners are paused need no wait" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_RUNNING_JOBS=1
+    export MOCK_RUNNING_JOBS_FINISH_AFTER=1       # only the notice sees it
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"1 CI job(s) are running right now"* ]]
+    [[ "$output" != *"Running CI jobs: ["* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+}
+
+@test "full-flow: invalid --running-jobs values are rejected" {
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock --running-jobs=cancel
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"--running-jobs must be 'wait' or 'abort'"* ]]
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock --running-jobs-timeout=30m
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"--running-jobs-timeout must be a whole number of seconds"* ]]
+}
+
 # ---------- #16: cancelling the backup stops the one inside the container too ----------
 @test "full-flow: SIGTERM during backup stops the in-container backup before releasing holds" {
     # The docker exec client dies with the script, but gitlab-backup inside the container

@@ -58,6 +58,8 @@ EOS (end-of-support) versions are checked via GitLab releases API but not exhaus
 | `--dry-run` | Compute and display upgrade path without executing. Implies `-y`. |
 | `--skip-lfs` | Skip LFS objects during backup |
 | `--no-maintenance-mode` | Do not enable [maintenance mode](https://docs.gitlab.com/administration/maintenance_mode/). By default it is enabled right before the backup when the instance supports it (checked at runtime, so CE/unlicensed instances are skipped silently) and disabled when the run ends. A mode that was already on is left on. |
+| `--running-jobs=wait\|abort` | What to do with CI jobs still running once the runners are paused: `wait` (default) until they finish, or `abort` the upgrade without touching them. Interactive runs ask, with this as the default. CI jobs are never cancelled by the script. |
+| `--running-jobs-timeout=SECONDS` | Upper bound for `wait`. `0` (default) waits indefinitely so a deployment job is never cut off; when exceeded, the upgrade is aborted before the backup. |
 | `--no-step-limit` | Disable the 3-step safety limit for `-y` mode. Requires `CI=true`. |
 | `--reset-stuck-finalizing` | Reset batched_background_migrations rows stuck in `finalizing(5)` state for >7 days back to `active(1)` so GitLab can re-finalize them. Does NOT execute the finalize rake task itself. |
 | `--max-tier=TIER` | Upper tier bound (`core`/`starter`/`premium`/`ultimate`) for the "What is new since" link in the completion webhook. Default: `core` for CE, `ultimate` for EE. |

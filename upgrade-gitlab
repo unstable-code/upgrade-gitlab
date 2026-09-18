@@ -31,6 +31,8 @@ skip_components=""
 skip_object_storage=0
 use_maintenance_mode=1
 _maintenance_enabled_by_us=0
+running_jobs_mode="wait"
+running_jobs_timeout=0
 reset_stuck_finalizing=0
 max_tier_flag=
 _interrupted=0
@@ -444,8 +446,137 @@ _release_upgrade_holds() {
     _disable_maintenance_mode
 }
 
+# --- 실행 중인 CI 작업(#17) ---
+# 러너 일시정지는 새 작업 할당만 막으므로, 이미 도는 작업은 백업과 업그레이드 도중에도 계속
+# 쓴다. 이 스크립트는 작업을 끊지 않는다 — 끝날 때까지 기다리거나(wait), 업그레이드를
+# 시작하지 않는다(abort). 어느 쪽이든 maintenance mode를 켜기 전에 결정돼야 한다: 켠 뒤에는
+# 작업이 끝나도 running으로 남아(공식 문서) 기다림이 끝나지 않는다.
+#
+# 조회 테이블: 19.2.6에는 ci_builds가 아예 없고 파티션 부모 p_ci_builds만 있다(실제 행은
+# gitlab_partitions_dynamic.ci_builds_NNN). 구버전은 ci_builds뿐이다. p_ci_builds가 있으면
+# 항상 전체를 포함하므로 우선한다. canceling은 러너가 취소를 마무리하는 중이라 아직 도는
+# 것으로 센다(없는 구버전에서는 일치하는 행이 없을 뿐이다).
+_ci_builds_table=""
+_RUNNING_JOBS_WHERE="type = 'Ci::Build' AND status IN ('running', 'canceling')"
+_resolve_ci_builds_table() {
+    [ -n "$_ci_builds_table" ] && return 0
+    _ci_builds_table=$(docker exec "$CONTAINER_NAME" gitlab-psql -tAc \
+        "SELECT COALESCE(to_regclass('p_ci_builds'), to_regclass('ci_builds'));" 2>/dev/null | tr -d '[:space:]')
+    [ -n "$_ci_builds_table" ]
+}
+
+# 업그레이드를 시작하지 않고 끝낸다. critical zone 전이므로 EXIT 트랩이 러너를 재개한다.
+# 의도된 건너뛰기라 ERR가 아니라 WARN으로 알린다.
+_abort_for_running_jobs() {  # <count> <reason>
+    echo "Aborted: $1 CI job(s) still running ($2). The upgrade was not started; paused runners will be resumed. Re-run once the jobs have finished." >&2
+    send_discord_webhook "WARN" "Upgrade not started: CI jobs still running" "$1 job(s) running ($2)"
+    exit 1
+}
+
+# 실행 중인 작업을 한 줄씩 출력한다: id|project|pipeline|name|status|running_seconds.
+# 빈 출력은 "실행 중인 작업 없음"이고, 조회 실패는 반환값 1로 구분한다. 개수(줄 수)와 두 화면의
+# 표시가 모두 이 한 조회에서 나온다. 프로젝트 경로는 버전과 무관하게 안정적인 routes에서,
+# 파이프라인 ID는 commit_id에서 바로 얻는다.
+_list_running_jobs() {
+    _resolve_ci_builds_table || return 1
+    docker exec "$CONTAINER_NAME" gitlab-psql -tAc \
+        "SELECT b.id || '|' || COALESCE(r.path, '?') || '|' || b.commit_id || '|' || b.name || '|' || b.status || '|' ||
+                COALESCE(EXTRACT(EPOCH FROM now() - b.started_at)::bigint, 0)
+           FROM $_ci_builds_table b
+           LEFT JOIN routes r ON r.source_type = 'Project' AND r.source_id = b.project_id
+          WHERE $_RUNNING_JOBS_WHERE
+          ORDER BY b.started_at;" 2>/dev/null
+}
+
+# _list_running_jobs의 출력을 사람이 읽는 줄로 바꾼다. 확인 화면과 대기 화면이 같은 형식을 쓴다.
+_format_running_jobs() {  # <list>
+    local id path pipeline name status secs
+    while IFS='|' read -r id path pipeline name status secs; do
+        [ -n "$id" ] || continue
+        printf '  #%s %s › %s (pipeline %s): %s %s\n' \
+            "$id" "$path" "$name" "$pipeline" "$status" "$(_fmt_duration "${secs:-0}")"
+    done <<< "$1"
+}
+
+# 실행 중인 작업이 끝날 때까지 기다린다. running_jobs_timeout 0은 무제한이다 — 배포 작업을
+# 중간에 끊지 않는 것이 기본이다. 러너가 일시정지돼 있어 수는 줄기만 한다. 대기는 psql 확인뿐이라
+# 부하가 없고, Ctrl+C는 critical zone 밖이라 즉시 종료되며 EXIT 트랩이 러너를 재개한다.
+#
+# 표시는 wait_for_background_migrations와 같은 틀이다: tty면 헤더(+스피너)와 작업별 줄을 제자리에서
+# 다시 그리고, 아니면 요약 한 줄. 다만 tty가 아닐 때는 폴링마다가 아니라 수가 바뀔 때와 5분마다만
+# 남긴다 — 배포 작업은 수십 분 걸릴 수 있어 15초마다 한 줄이면 CI 로그가 묻힌다.
+_wait_for_running_jobs() {
+    local list rc n="" header start elapsed s line
+    local poll=${_RUNNING_JOBS_POLL:-15} spinner='/-\|' spin_idx=0 prev_lines=0 last_n="" reported=0
+    echo "Waiting for running CI jobs to finish..."
+    # 경과 시간은 bash 내장 SECONDS로 잰다 — 매초 다시 그리므로 date를 띄우면 1시간에 3600번이다.
+    start=$SECONDS
+    while :; do
+        elapsed=$((SECONDS - start))
+        list=$(_list_running_jobs)
+        rc=$?
+
+        # 이전 출력 지우기
+        if [ "$prev_lines" -gt 1 ]; then
+            printf '\033[%dA' "$((prev_lines - 1))"
+        fi
+        if [ "$prev_lines" -gt 0 ]; then
+            printf '\r\033[J'
+        fi
+        prev_lines=0
+
+        if [ "$rc" -ne 0 ]; then
+            header="Running CI jobs: waiting for response..."
+        else
+            n=$(grep -c . <<< "$list")
+            if [ "$n" -eq 0 ]; then
+                echo "Running CI jobs: all finished"
+                return 0
+            fi
+            header="Running CI jobs: [$n running] ($(_fmt_duration "$elapsed") waited)"
+        fi
+
+        if [ -e /dev/tty ]; then
+            printf "%s %s" "$header" "${spinner:spin_idx++%${#spinner}:1}"
+            prev_lines=1
+            if [ "$rc" -eq 0 ]; then
+                while IFS= read -r line; do
+                    printf "\n%s" "$line"
+                    prev_lines=$((prev_lines + 1))
+                done <<< "$(_format_running_jobs "$list")"
+            fi
+        elif [ "$n" != "$last_n" ] || [ $((elapsed - reported)) -ge 300 ]; then
+            echo "$header"
+            last_n=$n
+            reported=$elapsed
+        fi
+
+        if [ "$running_jobs_timeout" -gt 0 ] && [ "$elapsed" -ge "$running_jobs_timeout" ]; then
+            [ "$prev_lines" -gt 0 ] && echo
+            _abort_for_running_jobs "${n:-some}" "not finished within --running-jobs-timeout=${running_jobs_timeout}s"
+        fi
+
+        if [ "$prev_lines" -gt 0 ]; then
+            for ((s=0; s<poll; s++)); do
+                sleep 1
+                if [ "$prev_lines" -gt 1 ]; then
+                    printf '\033[%dA' "$((prev_lines - 1))"
+                fi
+                # 경과 시간은 조회 주기(15초)가 아니라 매초 갱신한다.
+                [ "$rc" -eq 0 ] && header="Running CI jobs: [$n running] ($(_fmt_duration $((SECONDS - start))) waited)"
+                printf '\r%s %s' "$header" "${spinner:spin_idx++%${#spinner}:1}"
+                if [ "$prev_lines" -gt 1 ]; then
+                    printf '\033[%dB' "$((prev_lines - 1))"
+                fi
+            done
+        else
+            sleep "$poll"
+        fi
+    done
+}
+
 if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
-    echo "Usage: $0 [-y] [--edition=ce|ee] [--target-url=http] [--discord-url=http] [--version=0.0.0] [--skip-latest] [--skip-lfs] [--skip-object-storage] [--no-maintenance-mode] [--no-step-limit] [--dry-run] [--reset-stuck-finalizing] [--max-tier=core|starter|premium|ultimate]"
+    echo "Usage: $0 [-y] [--edition=ce|ee] [--target-url=http] [--discord-url=http] [--version=0.0.0] [--skip-latest] [--skip-lfs] [--skip-object-storage] [--no-maintenance-mode] [--running-jobs=wait|abort] [--running-jobs-timeout=SECONDS] [--no-step-limit] [--dry-run] [--reset-stuck-finalizing] [--max-tier=core|starter|premium|ultimate]"
 
     echo -e '\n\e[0;1mOPTIONS\e[m'
     echo -e "-y, --yes\t\tAuto-confirm prompts for unattended/cron usage. Aborts on safety warnings and if upgrade path >= 3 steps. Requires DISCORD_URL unless CI=true."
@@ -459,6 +590,8 @@ if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
     echo -e "--skip-lfs\t\tSkip LFS objects during backup (passes SKIP=lfs to gitlab-backup)."
     echo -e "--skip-object-storage\tSkip every resource already offloaded to object storage (detected via gitlab-rails) from the backup. Assumes the bucket is backed up separately; prints exactly what it skips."
     echo -e "--no-maintenance-mode\tDo not enable GitLab maintenance mode for the upgrade. By default it is enabled right before the backup when the instance supports it (checked at runtime; CE/unlicensed instances are skipped silently) and disabled when the run ends. A mode that was already on is left on."
+    echo -e "--running-jobs=MODE\tWhat to do with CI jobs still running once the runners are paused: 'wait' (default) until they finish, or 'abort' the upgrade without touching them. Interactive runs ask, with this as the default. CI jobs are never cancelled by this script."
+    echo -e "--running-jobs-timeout=SECONDS\tUpper bound for --running-jobs=wait. 0 (default) waits indefinitely so a deployment job is never cut off; when exceeded, the upgrade is aborted before the backup."
     echo -e "--reset-stuck-finalizing\tReset batched_background_migrations rows stuck in status=finalizing(5) for >7 days back to active(1) so GitLab can re-finalize them. Does NOT execute the finalize rake task itself."
     echo -e "--max-tier=TIER\t\tUpper tier bound for the 'What is new since' link in the completion webhook. One of core/starter/premium/ultimate. Default: core for CE, ultimate for EE."
     echo -e "--discord-url=http\tNotify via Discord webhook."
@@ -498,6 +631,23 @@ else
                 skip_object_storage=1
             elif [ "${params[$i]}" == "--no-maintenance-mode" ]; then
                 use_maintenance_mode=0
+            # --running-jobs-timeout을 먼저 본다: --running-jobs 접두사가 둘 다에 걸린다.
+            elif [[ "${params[$i]}" == "--running-jobs-timeout"* ]]; then
+                if ! [[ "$temp" =~ ^[0-9]+$ ]]; then
+                    echo "Error: --running-jobs-timeout must be a whole number of seconds (0 = wait indefinitely)" >&2
+                    exit 1
+                fi
+                running_jobs_timeout=$temp
+            elif [[ "${params[$i]}" == "--running-jobs"* ]]; then
+                case "$temp" in
+                    wait|abort)
+                        running_jobs_mode=$temp
+                        ;;
+                    *)
+                        echo "Error: --running-jobs must be 'wait' or 'abort'" >&2
+                        exit 1
+                        ;;
+                esac
             elif [ "${params[$i]}" == "--reset-stuck-finalizing" ]; then
                 reset_stuck_finalizing=1
             elif [[ "${params[$i]}" == "--max-tier"* ]]; then
@@ -2866,6 +3016,19 @@ else
         echo -e "\t- I checked $active_runners active runner(s) will be paused after I accept this notice (resumed after the upgrade)"
     fi
 fi
+# 확인 화면에서는 알리기만 한다. 결정은 러너를 멈춘 뒤 다시 센 수로 한다(그 사이 끝나거나 새로
+# 시작될 수 있다). 조회 실패는 업그레이드를 막지 않는다.
+if _running_list=$(_list_running_jobs); then
+    running_jobs=$(grep -c . <<< "$_running_list")
+    if [ "$running_jobs" -gt 0 ]; then
+        echo ''
+        echo -e "\t- I checked $running_jobs CI job(s) are running right now (--running-jobs=$running_jobs_mode, handled after the runners are paused):"
+        _format_running_jobs "$_running_list"
+        echo ''
+    fi
+else
+    echo -e "\t- Warning: could not query running CI jobs (DB error); skipping the running-jobs check." >&2
+fi
 echo -e "\t- I checked TARGET_URL is valid: $TARGET_URL"
 
 if [ $auto_yes -eq 1 ]; then
@@ -2903,6 +3066,26 @@ if [ "$active_runners" -gt 0 ]; then
         echo "Warning: could not persist runner pause-state to $_runner_state_file; resume will rely on this run staying alive." >&2
     fi
     echo "Runners paused. They will be resumed after the upgrade."
+fi
+
+# 실행 중인 CI 작업 처리(#17). 러너를 멈춘 뒤라 새 running 작업은 더 생기지 않는다. maintenance
+# mode를 켜는 백업 전 rails 부팅보다 앞이어야 한다(위 헬퍼 주석 참고).
+running_jobs=0
+_running_list=$(_list_running_jobs) && running_jobs=$(grep -c . <<< "$_running_list")
+if [ "$running_jobs" -gt 0 ]; then
+    if [ $auto_yes -eq 0 ]; then
+        echo -n "$running_jobs CI job(s) are still running. [w]ait for them to finish or [a]bort the upgrade? (default: $running_jobs_mode) > "
+        read -r jobs_choice < "$_tty"
+        case "$jobs_choice" in
+            w|W) running_jobs_mode="wait" ;;
+            a|A) running_jobs_mode="abort" ;;
+        esac
+    fi
+    if [ "$running_jobs_mode" = abort ]; then
+        _abort_for_running_jobs "$running_jobs" "--running-jobs=abort"
+    fi
+    send_discord_webhook "NOTE" "Waiting for running CI jobs" "$running_jobs job(s) must finish before the upgrade starts"
+    _wait_for_running_jobs
 fi
 
 send_discord_webhook "NOTE" "Updating GitLab now!" "GitLab will be upgraded from $CURRENT_VERSION to ${UPGRADE_POINTS_ARRAY[-1]}"

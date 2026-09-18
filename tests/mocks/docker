@@ -27,6 +27,22 @@ _mock_crash_before() {
     [ "$c" -le "$threshold" ]
 }
 
+# _mock_running_jobs_now: sets and prints _n, the number of CI jobs "running" right now.
+# Every running-jobs query (count or listing) advances one shared counter, so the jobs
+# finish after MOCK_RUNNING_JOBS_FINISH_AFTER queries; unset = they never finish.
+_mock_running_jobs_now() {
+    local c=0
+    _n=${MOCK_RUNNING_JOBS:-0}
+    if [ -n "$MOCK_STATE_DIR" ]; then
+        [ -f "$MOCK_STATE_DIR/running_jobs_polls" ] && c=$(cat "$MOCK_STATE_DIR/running_jobs_polls")
+        c=$((c + 1)); echo "$c" > "$MOCK_STATE_DIR/running_jobs_polls"
+        if [ -n "${MOCK_RUNNING_JOBS_FINISH_AFTER:-}" ] && [ "$c" -gt "$MOCK_RUNNING_JOBS_FINISH_AFTER" ]; then
+            _n=0
+        fi
+    fi
+    echo "$_n"
+}
+
 args="$*"
 
 case "$args" in
@@ -103,6 +119,16 @@ case "$args" in
     # gitlab-psql: patterns must follow argument order in the expanded args string
     # e.g. "exec gitlab gitlab-psql -tAc SELECT COUNT(*) FROM ci_runners WHERE active = true;"
     #       → COUNT appears before ci_runners before active = true
+    # Running CI jobs (#17). The count finishes after MOCK_RUNNING_JOBS_FINISH_AFTER queries
+    # (the notice and the post-pause recount are queries too); unset = never finishes.
+    *"exec"*"gitlab-psql"*"to_regclass"*)
+        echo "${MOCK_CI_BUILDS_TABLE:-p_ci_builds}"
+        ;;
+    *"exec"*"gitlab-psql"*"EXTRACT(EPOCH"*"'canceling'"*)
+        # The single running-jobs listing (count = lines): id|project|pipeline|name|status|running_seconds.
+        _mock_running_jobs_now > /dev/null
+        for _i in $(seq 1 "$_n"); do echo "50${_i}|group/app|77|deploy|running|192"; done
+        ;;
     *"exec"*"gitlab-psql"*"information_schema"*)
         # MOCK_BBM_TABLE=missing → table genuinely absent (old GitLab); fail → psql error.
         case "${MOCK_BBM_TABLE:-present}" in
