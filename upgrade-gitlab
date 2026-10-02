@@ -1786,14 +1786,26 @@ check_migration_status() {
     fi
 }
 
+# 컨테이너 안에서 sign_in 페이지의 HTTP 상태를 출력한다. $1 = gitlab-healthcheck rc 파일 경로.
+# rc의 url은 ".../help", flags는 bash 배열이다(https면 --insecure).
+# shellcheck disable=SC2016
+_HTTP_READY_SH='url=http://localhost/help; flags=()
+[ -f "$1" ] && . "$1"
+curl -sf -m 3 -o /dev/null -w "%{http_code}" "${flags[@]}" "${url%/help}/users/sign_in"'
+
 wait_for_http_ready() {
     local label=$1
     echo "waiting until $label server boots..."
     # shellcheck disable=SC2329
     if [ "${CI:-}" = "true" ]; then
         # CI/DinD: 컨테이너 내부에서 curl (네트워크 격리 및 IP 변경 문제 회피)
+        # 주소는 컨테이너의 HEALTHCHECK(gitlab-healthcheck)가 쓰는 rc 파일에서 얻는다(#24). omnibus가
+        # reconfigure 때 nginx의 실제 listen 포트, https 여부, 상대 경로를 반영해 렌더하므로,
+        # external_url에 포트를 주거나 https를 쓰는 구성에서도 맞는다. localhost:80 고정이던 때는
+        # 그런 구성에서 이 대기가 끝나지 않았다. rc는 이미지가 아니라 reconfigure가 만드는 파일이라
+        # 새 컨테이너에서는 처음에 없다. 그동안과 rc가 없는 옛 버전에서는 예전 주소를 쓴다.
         _http_ready_check() {
-            [ "$(docker exec "$CONTAINER_NAME" curl -sf -m 3 -o /dev/null "http://localhost/users/sign_in" -w "%{http_code}" 2>/dev/null)" = '200' ]
+            [ "$(docker exec "$CONTAINER_NAME" bash -c "$_HTTP_READY_SH" _ /opt/gitlab/etc/gitlab-healthcheck-rc 2>/dev/null)" = '200' ]
         }
     else
         _http_ready_check() {

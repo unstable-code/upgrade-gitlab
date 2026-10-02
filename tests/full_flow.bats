@@ -1311,3 +1311,29 @@ _inspect_patch_full='
     [ "$now" != "17.3.7-ce.0" ]
     grep -q "gitlab is running $now\.$" "$MOCK_STATE_DIR/out.log"
 }
+
+# ---------- CI-mode HTTP readiness follows the healthcheck rc (#24) ----------
+@test "http ready: the in-container check uses the address from gitlab-healthcheck-rc" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    # external_url 'https://gitlab.test:8443/gitlab': nginx answers on 8443 under /gitlab only,
+    # so the old fixed http://localhost/users/sign_in would poll forever.
+    printf '%s\n' "url='https://localhost:8443/gitlab/help'" 'flags=(--insecure)' > "$MOCK_STATE_DIR/healthcheck-rc"
+    export MOCK_HEALTHCHECK_RC="$MOCK_STATE_DIR/healthcheck-rc"
+    export MOCK_READY_URL="https://localhost:8443/gitlab/users/sign_in"
+    # SIGKILL: a SIGTERM inside the critical zone is only deferred, so it would not end a hung poll.
+    run timeout -s KILL 120 bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    grep -q -- "--insecure $MOCK_READY_URL$" "$MOCK_STATE_DIR/sign_in_curl_args"
+}
+
+@test "http ready: without the rc file the check falls back to http://localhost" {
+    # An old version without the rc, or a new container before its first reconfigure.
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    unset MOCK_HEALTHCHECK_RC
+    export MOCK_READY_URL="http://localhost/users/sign_in"
+    run timeout -s KILL 120 bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    grep -q "http://localhost/users/sign_in$" "$MOCK_STATE_DIR/sign_in_curl_args"
+}

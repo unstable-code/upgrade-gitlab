@@ -184,6 +184,9 @@ Block boundaries: the header is a line that is exactly `Deprecations:`; entries 
 ### TTY-Aware Output
 Terminal detected → animated spinners, progress bars with ETA. No terminal (CI) → plain text status.
 
+### CI-Mode HTTP Readiness
+With `CI=true`, `wait_for_http_ready` curls `/users/sign_in` from inside the container instead of `--target-url`. The address comes from `/opt/gitlab/etc/gitlab-healthcheck-rc`, the file the image's own HEALTHCHECK (`gitlab-healthcheck`) sources: omnibus renders it at reconfigure with nginx's real listen port, scheme and relative URL (`url='http://localhost:18080/help'`, `flags=(--insecure)` as a bash array), and the check swaps `/help` for `/users/sign_in` (`_HTTP_READY_SH`). It used to be a fixed `http://localhost/users/sign_in`, which never answers when `external_url` carries a port, uses https (80 only redirects) or a relative path (#24). The poll loop has no timeout and runs inside the critical zone, so that meant an endless wait right after the swap; it surfaced once #22 stopped dropping `GITLAB_OMNIBUS_CONFIG`, which had been sending nginx back to port 80. The rc is not in the image, so a new container has none until its first reconfigure; until then, and on versions that never render it, the old address is used.
+
 ## Testing
 
 Tests use [BATS](https://github.com/bats-core/bats-core) (Bash Automated Testing System).
@@ -195,7 +198,7 @@ Tests use [BATS](https://github.com/bats-core/bats-core) (Bash Automated Testing
 - `tests/test_helper.bash` — Shared setup; prepends `tests/mocks/` to PATH, sets default version `16.11.0-ce.0`, and defaults `CI=true` so local bats bypasses `-y` mode's `DISCORD_URL` requirement. Tests that need to exercise non-CI paths explicitly `unset CI`.
 
 ### Mock System
-Stateful mock binaries in `tests/mocks/` (curl, docker, df, du) shadow real binaries via PATH priority. Docker mock tracks version state through `MOCK_STATE_DIR/current_version` file, enabling multi-step upgrade simulation. Curl mock routes URLs to fixture files. `MOCK_STUCK_MIGRATIONS` / `MOCK_STUCK_RESOLVE_AFTER` env vars simulate stuck batched_background_migrations for detection tests. `MOCK_DOCKER_UNREACHABLE` makes the startup `docker version` probe fail. `MOCK_DERIVED_IMAGE=1` starts the container on `gitlab-<ed>-patched:<ver>`; any `*-patched:<tag>` image answers the base-label query with its official base, and the image of the container created through the API becomes `current_image` at `docker rename`. The curl mock answers the Engine API over `--unix-socket` (`_ping`, `containers/create`, `networks/*/connect`) and appends each request body to `api_create` / `api_connect`; `MOCK_INSPECT_PATCH` is a jq filter over the mocked `docker container inspect` JSON, and `MOCK_CREATE_FAIL`, `MOCK_API_UNREACHABLE`, `MOCK_DOCKER_ENDPOINT` cover the failure paths.
+Stateful mock binaries in `tests/mocks/` (curl, docker, df, du) shadow real binaries via PATH priority. Docker mock tracks version state through `MOCK_STATE_DIR/current_version` file, enabling multi-step upgrade simulation. Curl mock routes URLs to fixture files. `MOCK_STUCK_MIGRATIONS` / `MOCK_STUCK_RESOLVE_AFTER` env vars simulate stuck batched_background_migrations for detection tests. `MOCK_DOCKER_UNREACHABLE` makes the startup `docker version` probe fail. `MOCK_DERIVED_IMAGE=1` starts the container on `gitlab-<ed>-patched:<ver>`; any `*-patched:<tag>` image answers the base-label query with its official base, and the image of the container created through the API becomes `current_image` at `docker rename`. The curl mock answers the Engine API over `--unix-socket` (`_ping`, `containers/create`, `networks/*/connect`) and appends each request body to `api_create` / `api_connect`; `MOCK_INSPECT_PATCH` is a jq filter over the mocked `docker container inspect` JSON, and `MOCK_CREATE_FAIL`, `MOCK_API_UNREACHABLE`, `MOCK_DOCKER_ENDPOINT` cover the failure paths. `docker exec <c> curl ...` runs the curl mock itself, and the CI readiness snippet runs locally against `MOCK_HEALTHCHECK_RC`; with `MOCK_READY_URL` set, only that `sign_in` address answers (every request is logged to `sign_in_curl_args`).
 
 ### Fixtures
 - `tests/fixtures/path.json` — Pre-computed upgrade path waypoints (major.minor stops)
@@ -207,7 +210,7 @@ There is no integration job in CI (see CI Pipeline below). Anything the mocks ca
 
 ```bash
 docker run -d --name ugtest-gitlab --shm-size 256m \
-  -p 127.0.0.1:18080:80 \
+  -p 127.0.0.1:18080:18080 \
   -v ugtest-gitlab-config:/etc/gitlab \
   -v ugtest-gitlab-logs:/var/log/gitlab \
   -v ugtest-gitlab-data:/var/opt/gitlab \

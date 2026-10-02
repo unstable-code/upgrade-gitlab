@@ -436,9 +436,16 @@ case "$args" in
     *"exec"*"gitlab-rake"*)
         exit 0
         ;;
+    *"exec"*"gitlab-healthcheck-rc"*)
+        # CI-mode HTTP readiness (#24): run the in-container snippet here, against
+        # MOCK_HEALTHCHECK_RC (unset = no rc, as on an old version or before reconfigure).
+        # Its curl reaches the curl mock, which MOCK_READY_URL can restrict to one address.
+        bash -c "$5" _ "${MOCK_HEALTHCHECK_RC:-/nonexistent}"
+        ;;
     *"exec"*"curl"*)
-        echo "200"
-        exit 0
+        # Run it against the curl mock, so an in-container request obeys MOCK_READY_URL too.
+        shift 2
+        exec "$@"
         ;;
     *"exec"*"sh -c"*"du -sb"*)
         # staging total: denominator for the "Creating backup archive" progress bar

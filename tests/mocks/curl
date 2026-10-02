@@ -116,7 +116,13 @@ case "$url" in
         cat "$FIXTURES_DIR/all-releases.xml"
         ;;
     *"users/sign_in"*)
-        # GitLab connectivity check
+        # GitLab connectivity check. MOCK_READY_URL: only that address answers, like an
+        # nginx that listens on one port; every other one is refused.
+        [ -n "$MOCK_STATE_DIR" ] && printf '%s\n' "$*" >> "$MOCK_STATE_DIR/sign_in_curl_args"
+        if [ -n "${MOCK_READY_URL:-}" ] && [ "$url" != "$MOCK_READY_URL" ]; then
+            [ "$write_out" = "http_code" ] && echo "000"
+            exit 7
+        fi
         if [ "$write_out" = "http_code" ]; then
             echo "200"
         fi
