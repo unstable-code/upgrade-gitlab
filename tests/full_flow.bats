@@ -1337,3 +1337,15 @@ _inspect_patch_full='
     [ "$status" -eq 0 ]
     grep -q "http://localhost/users/sign_in$" "$MOCK_STATE_DIR/sign_in_curl_args"
 }
+
+@test "recreate: a replacement that cannot start ends the run instead of waiting forever" {
+    # The original is already removed at that point, so the readiness wait could never succeed.
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_RENAME_FAIL=1
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    # SIGKILL: a SIGTERM inside the critical zone is only deferred, so it would not end a hung poll.
+    run timeout -s KILL 120 bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"could not start the replacement container"* ]]
+    [[ "$output" == *"FATAL ERROR: MANUAL INTERVENTION IS REQUIRED"* ]]
+    [[ "$output" != *"waiting until"*"server boots"* ]]
+}

@@ -1,24 +1,42 @@
 #!/usr/bin/env bash
 # Mock curl for BATS tests
-# Handles: path.json, Docker Hub API, generic URLs
+# Handles: path.json, Docker Hub API, Docker Engine API (unix socket), generic URLs
 
 FIXTURES_DIR="${FIXTURES_DIR:-$(cd "$(dirname "$0")/../fixtures" && pwd)}"
 
+# Parse curl arguments to find URL and flags
+url=""
+write_out=""
+socket=""
+body=""
+skip_next=""
+for arg in "$@"; do
+    if [ -n "$skip_next" ]; then
+        case "$skip_next" in
+            w) case "$arg" in *http_code*) write_out="http_code" ;; esac ;;
+            socket) socket=$arg ;;
+            body) body=$arg ;;
+        esac
+        skip_next=""
+        continue
+    fi
+    case "$arg" in
+        -s|-f|-sf|-fs) ;;
+        -o) skip_next="skip" ;;
+        -w) skip_next="w" ;;
+        -d|-H|-X) skip_next="skip" ;;
+        --unix-socket) skip_next="socket" ;;
+        --data-binary) skip_next="body" ;;
+        http*) url="$arg" ;;
+    esac
+done
+
 # Docker Engine API over the unix socket (#22): container create and network connect.
+# The script reads the body and then the HTTP status from stdout (`-w '\n%{http_code}'`).
 # Each request body is appended to MOCK_STATE_DIR/api_<create|connect> as one JSON line.
 # The created image only becomes the running one at `docker rename` (see the docker mock).
-if [[ " $* " == *" --unix-socket "* ]]; then
-    out=/dev/stdout body="" url=""
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            -o) out=$2; shift ;;
-            --data-binary) body=$2; shift ;;
-            -w|-X|-H|--unix-socket) shift ;;
-            http*) url=$1 ;;
-        esac
-        shift
-    done
-    _respond() { printf '%s' "$2" > "$out"; [ "$out" = /dev/stdout ] || printf '%s' "$1"; }
+if [ -n "$socket" ]; then
+    _respond() { printf '%s\n%s' "$2" "$1"; }
     case "$url" in
         */_ping)
             if [ "${MOCK_API_UNREACHABLE:-0}" -eq 1 ]; then
@@ -48,29 +66,6 @@ if [[ " $* " == *" --unix-socket "* ]]; then
     esac
     exit 0
 fi
-
-# Parse curl arguments to find URL and flags
-url=""
-write_out=""
-skip_next=""
-for arg in "$@"; do
-    if [ -n "$skip_next" ]; then
-        if [ "$skip_next" = "w" ]; then
-            case "$arg" in
-                *http_code*) write_out="http_code" ;;
-            esac
-        fi
-        skip_next=""
-        continue
-    fi
-    case "$arg" in
-        -s|-f|-sf|-fs) ;;
-        -o) skip_next="skip" ;;
-        -w) skip_next="w" ;;
-        -d|-H|-X) skip_next="skip" ;;
-        http*) url="$arg" ;;
-    esac
-done
 
 case "$url" in
     *"path.json"*)

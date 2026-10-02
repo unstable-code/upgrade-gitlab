@@ -141,25 +141,16 @@ case "$args" in
     *"inspect"*"Mounts"*)
         echo "/srv/gitlab/config:/etc/gitlab /srv/gitlab/logs:/var/log/gitlab /srv/gitlab/data:/var/opt/gitlab"
         ;;
-    *"inspect"*"PortBindings"*)
-        echo "443/tcp:443 80/tcp:80 22/tcp:22"
-        ;;
-    *"inspect"*"LogConfig.Type"*)
-        # MOCK_LOG_DRIVER lets tests exercise the Synology 'db' replacement branch.
-        echo "${MOCK_LOG_DRIVER:-json-file}"
-        ;;
-    *"inspect"*"LogConfig.Config"*)
-        printf '%s\n' "${MOCK_LOG_OPTS:-}"
-        ;;
     *"inspect"*"RestartPolicy"*)
-        # A container recreated through the API reports the policy it was created with,
-        # until a `docker update --restart` changes it.
+        # Once the replacement has taken the name (`docker rename`), the container reports the
+        # policy it was created with, until a `docker update --restart` changes it. Before that,
+        # the original container's, from the same JSON `container inspect` returns.
         if [ -n "$MOCK_STATE_DIR" ] && [ -f "$MOCK_STATE_DIR/restart_policy" ]; then
             cat "$MOCK_STATE_DIR/restart_policy"
-        elif [ -n "$MOCK_STATE_DIR" ] && [ -f "$MOCK_STATE_DIR/api_create" ]; then
+        elif [ -n "$MOCK_STATE_DIR" ] && [ -f "$MOCK_STATE_DIR/rename_args" ]; then
             tail -n1 "$MOCK_STATE_DIR/api_create" | jq -r .HostConfig.RestartPolicy.Name
         else
-            echo "unless-stopped"
+            _mock_container_json | jq -r .HostConfig.RestartPolicy.Name
         fi
         ;;
     "update --restart="*)
@@ -475,6 +466,8 @@ case "$args" in
         echo "$MOCK_IMAGE"
         ;;
     "rename "*)
+        # MOCK_RENAME_FAIL=1: the replacement cannot take the name after the original is removed.
+        [ "${MOCK_RENAME_FAIL:-0}" -eq 1 ] && exit 1
         # The replacement container (created through the API mock in curl) takes the real name:
         # from here on its image is what the container runs, and its tag the version.
         if [ -n "$MOCK_STATE_DIR" ]; then
