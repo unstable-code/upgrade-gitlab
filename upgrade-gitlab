@@ -989,12 +989,11 @@ if [ -n "$RUNNING_IMAGE" ] && [ -z "$image_hook" ]; then
     echo "Warning: $CONTAINER_NAME runs a derived image ($RUNNING_IMAGE) but no image hook is configured." >&2
     echo "Upgrading will replace it with the official image and drop its patches." >&2
     echo "To keep them, set UPGRADE_GITLAB_IMAGE_HOOK or place an executable build-image.hook next to this script." >&2
-    if [ "$dry_run" -eq 1 ]; then
-        :
-    elif [ "$auto_yes" -eq 1 ]; then
+    # --dry-run은 -y를 함께 켜므로 두 조건으로 세 경우가 갈린다.
+    if [ "$auto_yes" -eq 1 ] && [ "$dry_run" -eq 0 ]; then
         echo "Error: refusing to drop the patches in unattended mode (-y). Run interactively to confirm." >&2
         exit 1
-    else
+    elif [ "$auto_yes" -eq 0 ]; then
         echo -n "Continue with the official image and drop the patches? (y/N) > "
         read -r drop_patches < "$_tty"
         if [ "$drop_patches" != "y" ] && [ "$drop_patches" != "Y" ]; then
