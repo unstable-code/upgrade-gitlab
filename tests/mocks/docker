@@ -12,6 +12,15 @@ MOCK_EDITION="${MOCK_GITLAB_VERSION##*-}"   # ce.0 or ee.0
 MOCK_EDITION="${MOCK_EDITION%%.*}"          # ce or ee
 MOCK_CONTAINER="gitlab"
 MOCK_IMAGE="gitlab/gitlab-${MOCK_EDITION}:${MOCK_GITLAB_VERSION}"
+# Derived images (#20): an official image plus local patches, named <anything>-patched:<tag>.
+# MOCK_DERIVED_IMAGE=1 starts the container on one; after a `docker run`, the image it was
+# given is what the container reports.
+if [ "${MOCK_DERIVED_IMAGE:-0}" -eq 1 ]; then
+    MOCK_IMAGE="gitlab-${MOCK_EDITION}-patched:${MOCK_GITLAB_VERSION}"
+fi
+if [ -n "$MOCK_STATE_DIR" ] && [ -f "$MOCK_STATE_DIR/current_image" ]; then
+    MOCK_IMAGE=$(cat "$MOCK_STATE_DIR/current_image")
+fi
 MOCK_RUNNER_COUNT="${MOCK_RUNNER_COUNT:-0}"
 
 # _mock_crash_before <key> <threshold>: true (=still "crashing") for the first <threshold>
@@ -369,18 +378,42 @@ case "$args" in
     # Subcommand cases are anchored at the start (#19): a bare *"run"* or *"stop"* also matched
     # `/var/run`, `gitlab-runner` or `gitlab-ctl stop` anywhere in the args. The compound
     # *"exec"*/*"inspect"* patterns above are still unanchored, so they keep their ordering notes.
+    "image inspect -f {{range .RepoTags}}"*)
+        # "<RepoTags>|<base label>" in one call. RepoTags answer MOCK_IMAGE like the plain
+        # `image inspect` below. The label: a *-patched:<tag> image carries
+        # gitlab/gitlab-<edition>:<tag>, anything else has none. The image is the last argument.
+        _img=${args##* }
+        _label=""
+        if [[ $_img == *-patched:* ]]; then
+            _tag=${_img##*:}
+            _ed=${_tag##*-}
+            _label="gitlab/gitlab-${_ed%%.*}:${_tag}"
+        fi
+        echo "${MOCK_IMAGE} |${_label}"
+        ;;
     "image inspect "*)
         echo "$MOCK_IMAGE"
         ;;
     "run "*)
-        # Record the flags for assertions, and the image tag as the new version for full-flow runs.
+        # Record the flags for assertions. The image is the last argument: its tag becomes
+        # the new version and the image itself what the container now runs.
         if [ -n "$MOCK_STATE_DIR" ]; then
             printf '%s\n' "$args" >> "$MOCK_STATE_DIR/run_args"
-            _tag=$(echo "$args" | sed -n 's/.*gitlab\/gitlab-[^:]*:\([^ ]*\).*/\1/p')
-            if [ -n "$_tag" ]; then
-                echo "$_tag" > "$MOCK_STATE_DIR/current_version"
+            _img=${args##* }
+            if [[ $_img == *:* ]]; then
+                echo "${_img##*:}" > "$MOCK_STATE_DIR/current_version"
+                echo "$_img" > "$MOCK_STATE_DIR/current_image"
             fi
         fi
+        exit 0
+        ;;
+    "pull "*)
+        # MOCK_PULL_FAIL=1: the registry is unreachable.
+        if [ "${MOCK_PULL_FAIL:-0}" -eq 1 ]; then exit 1; fi
+        exit 0
+        ;;
+    "image rm "*)
+        [ -n "$MOCK_STATE_DIR" ] && printf '%s\n' "${args#image rm }" >> "$MOCK_STATE_DIR/image_rm_args"
         exit 0
         ;;
     "start "*)

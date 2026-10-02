@@ -5,6 +5,10 @@ DISCORD_URL=${DISCORD_URL:-}
 GITLAB_EDITION=
 PULL_PID=
 config_backup_hook=${UPGRADE_GITLAB_CONFIG_HOOK:-}
+image_hook=${UPGRADE_GITLAB_IMAGE_HOOK:-}
+# 파생 이미지(공식 이미지 + 로컬 패치)가 자기 베이스를 적어 두는 label(#20).
+# 컨테이너 감지와 hook 결과 검증이 모두 이 값을 본다.
+_BASE_LABEL=org.upgrade-gitlab.base
 LOG_DRIVER_OVERRIDE=${UPGRADE_GITLAB_LOG_DRIVER:-}
 # `docker stop`의 기본 유예는 10초라 GitLab(실측 32~55초)은 매번 SIGKILL(137)로 죽는다.
 # PostgreSQL/Gitaly가 정리 없이 종료되면 다음 부팅이 crash recovery로 들어간다.
@@ -36,6 +40,7 @@ running_jobs_timeout=0
 reset_stuck_finalizing=0
 max_tier_flag=
 _interrupted=0
+_image_prep_failed=0
 _trap_active=0
 _pull_pid=
 _tty=/dev/tty
@@ -282,13 +287,10 @@ _resume_paused_runners() {
     fi
 }
 
-# _exec_isolated <docker exec 인자...> — 컨테이너에서 명령을 실행해 stdout을 전역 _exec_out에 담는다.
-# 터미널 Ctrl+C는 포그라운드 프로세스 그룹 전체에 가므로 docker exec 클라이언트도 함께 죽지만,
-# 컨테이너 안의 명령은 클라이언트와 무관하게 끝까지 돈다(docker 29.8에서 재현, tty 할당 시도 동일).
-# 그러면 스크립트는 결과를 잃는다: maintenance mode를 켜는 runner라면 몇 분 뒤 고아 runner가
-# 상태 파일 없이(=아무도 끄지 않는 채) 켜 버리고, 백업 생존 확인이라면 빈 출력을 "이미
-# 끝났다"로 오판한다. 결과가 필요한 부작용 있는 호출은 이 함수를 거친다:
-#  - set -m으로 클라이언트를 별도 프로세스 그룹에 띄워 Ctrl+C가 닿지 않게 하고
+# _run_isolated <stderr 파일> <명령...> — 명령을 별도 프로세스 그룹에서 돌려 stdout을 전역 _exec_out에 담는다.
+# 터미널 Ctrl+C는 포그라운드 프로세스 그룹 전체에 간다. 결과가 필요한 부작용 있는 명령이 그때
+# 함께 죽으면 스크립트는 결과를 잃는다(아래 _exec_isolated, 이미지 hook 빌드).
+#  - set -m으로 별도 프로세스 그룹에 띄워 Ctrl+C가 닿지 않게 하고
 #    (setsid는 DSM에 있다는 보장이 없어 순수 bash로 한다)
 #  - 그동안은 critical zone처럼 시그널을 미뤄(_interrupted만 세움) 결과를 끝까지 회수한다.
 #    enter_critical이 아니라 _trap_active를 저장·복원하는 이유: enter/exit_critical은 재진입이
@@ -297,13 +299,14 @@ _resume_paused_runners() {
 # 미룬 시그널의 처리는 호출부 몫이다. $(...) 안에서 부르면 서브셸에서 트랩이 기본값으로
 # 돌아가 미루기가 무력해지므로, 결과는 명령 치환이 아니라 전역으로 넘긴다.
 _exec_out=""
-_exec_isolated() {
-    local tmp pid rc prev_trap=$_trap_active
+_run_isolated() {
+    local err=$1 tmp pid rc prev_trap=$_trap_active
+    shift
     tmp=$(mktemp)
     _TMPFILES+=("$tmp")
     _trap_active=1
     set -m
-    docker exec "$CONTAINER_NAME" "$@" > "$tmp" 2>/dev/null &
+    "$@" > "$tmp" 2> "$err" < /dev/null &
     pid=$!
     set +m
     _wait_reap "$pid"
@@ -314,9 +317,125 @@ _exec_isolated() {
     return "$rc"
 }
 
+# _exec_isolated <docker exec 인자...> — 컨테이너에서 명령을 실행해 stdout을 전역 _exec_out에 담는다.
+# Ctrl+C로 docker exec 클라이언트가 죽어도 컨테이너 안의 명령은 클라이언트와 무관하게 끝까지
+# 돈다(docker 29.8에서 재현, tty 할당 시도 동일). maintenance mode를 켜는 runner라면 몇 분 뒤
+# 고아 runner가 상태 파일 없이(=아무도 끄지 않는 채) 켜 버리고, 백업 생존 확인이라면 빈 출력을
+# "이미 끝났다"로 오판한다. 결과가 필요한 부작용 있는 호출은 이 함수를 거친다.
+_exec_isolated() {
+    _run_isolated /dev/null docker exec "$CONTAINER_NAME" "$@"
+}
+
 # _rails_runner <ruby> — gitlab-rails runner 한 번(부팅 5분 내외). 결과는 _exec_out.
 _rails_runner() {
     _exec_isolated gitlab-rails runner "$1"
+}
+
+# _find_hook <지정 경로> <환경변수 이름> <스크립트 옆 파일 이름> <설명>
+# 사용자 hook을 찾아 전역 _hook_path에 담는다. 환경변수로 지정한 경로가 우선이고, 없으면
+# 스크립트 옆 파일을 자동으로 찾는다. 반환: 0 찾음, 1 없음, 2 지정했지만 실행할 수 없음.
+# 실행할 수 없을 때 경고 후 계속할지 중단할지는 hook마다 달라서 호출부가 정한다.
+_hook_path=""
+_find_hook() {
+    local explicit=$1 var=$2 sibling=$3 label=$4 candidate
+    _hook_path=""
+    if [ -n "$explicit" ]; then
+        if [ ! -x "$explicit" ]; then
+            echo "Warning: $var is not executable: $explicit" >&2
+            return 2
+        fi
+        _hook_path=$explicit
+        return 0
+    fi
+    [ -n "$SCRIPT_DIR" ] || return 1
+    candidate="$SCRIPT_DIR/$sibling"
+    [ -e "$candidate" ] || return 1
+    if [ ! -x "$candidate" ]; then
+        echo "Warning: $candidate exists but is not executable, skipping auto-discovery" >&2
+        return 1
+    fi
+    _hook_path=$candidate
+    echo "Auto-detected $label: $_hook_path"
+}
+
+# _official_image_of <이미지> — 이미지가 어느 공식 이미지(gitlab/gitlab-(ce|ee)[:TAG])인지 전역
+# _official_image에 담고, 파생 이미지(#20)면 _derived=1로 둔다. 알 수 없으면 1을 돌려준다.
+# 판정 순서: 이름 자체 → 파생 이미지 label → RepoTags(이미지 ID나 다른 이름으로 띄운 경우).
+# label을 RepoTags보다 먼저 본다: 공식 태그를 덧붙인 파생 이미지를 공식 이미지로 여기면
+# 다음 hop이 공식 이미지를 띄워 패치가 조용히 빠진다. RepoTags와 label은 inspect 한 번으로 읽는다.
+_official_image=""
+_derived=0
+_official_image_of() {
+    local info label
+    _official_image=""
+    _derived=0
+    if [[ $1 =~ ^gitlab/gitlab-(ce|ee)(:|$) ]]; then
+        _official_image=$1
+        return 0
+    fi
+    info=$(docker image inspect -f "{{range .RepoTags}}{{.}} {{end}}|{{index .Config.Labels \"$_BASE_LABEL\"}}" "$1" 2>/dev/null) || return 1
+    label=${info##*|}
+    if [[ $label =~ ^gitlab/gitlab-(ce|ee):[^[:space:]]+$ ]]; then
+        _official_image=$label
+        _derived=1
+    else
+        _official_image=$(grep -oE "gitlab/gitlab-(ce|ee)[^ ]*" <<< "${info%|*}" | head -1)
+    fi
+    [ -n "$_official_image" ]
+}
+
+# _prepare_run_image <공식 이미지> — 이번 교체에 띄울 이미지를 준비해 전역 _run_image에 담는다.
+# 이전 컨테이너를 멈추기 전에 부른다: 준비가 실패하면 이전 버전이 그대로 도는 채로 멈출 수
+# 있어야 한다. 그래서 교체(stop → rm → run) 사이에는 받을 것도 만들 것도 남기지 않는다.
+#  - 공식 이미지를 받는다. 보통은 사전 Pull로 이미 받아져 있어 금방 끝난다.
+#  - 이미지 hook(#20)이 있으면 그 위에 로컬 패치를 얹은 파생 이미지를 만든다. 규약: stdout
+#    마지막 줄 = 이미지, non-zero = 실패. 빌드 로그(stderr)는 파일로 받아 진행 표시를 깨지 않고,
+#    실패했을 때만 끝부분을 보여준다. critical zone에서 Ctrl+C가 빌드만 죽여 실패로 끝나지 않게
+#    _run_isolated로 돌린다.
+#  - 결과가 이번 베이스의 파생 이미지여야 통과한다. 다른 버전이나 공식 이미지를 돌려주는 hook이
+#    패치 없는 이미지를 조용히 띄우는 일을 막는다.
+_run_image=""
+_prepare_run_image() {
+    local base=$1 log rc
+    _run_image=$base
+    if ! pull_with_retry "$base"; then
+        echo "Error: could not pull $base" >&2
+        return 1
+    fi
+    [ -n "$image_hook" ] || return 0
+    log=$(mktemp)
+    _TMPFILES+=("$log")
+    echo "Building image for $base via hook: $image_hook"
+    _run_isolated "$log" env \
+        UPGRADE_GITLAB_BASE_IMAGE="$base" \
+        UPGRADE_GITLAB_VERSION="${base##*:}" \
+        UPGRADE_GITLAB_EDITION="$GITLAB_EDITION" \
+        UPGRADE_GITLAB_CONTAINER="$CONTAINER_NAME" \
+        UPGRADE_GITLAB_SCRIPT_DIR="$SCRIPT_DIR" \
+        "$image_hook"
+    rc=$?
+    _run_image=${_exec_out##*$'\n'}
+    if [ "$rc" -ne 0 ] || [ -z "$_run_image" ]; then
+        echo "Error: image hook failed for $base (exit $rc). Last lines of its output:" >&2
+        tail -n 20 "$log" | sed 's/^/  /' >&2
+        return 1
+    fi
+    if ! _official_image_of "$_run_image" || [ "$_derived" -ne 1 ] || [ "$_official_image" != "$base" ]; then
+        echo "Error: image hook returned $_run_image, which is not derived from $base (missing or different $_BASE_LABEL label)" >&2
+        return 1
+    fi
+    echo "Image hook built $_run_image"
+}
+
+# _remove_previous_image <공식 이미지> — 교체가 끝난 이전 버전 이미지를 지운다. RUNNING_IMAGE가
+# 따로 있으면(파생 이미지, 또는 이전 hop에 띄운 이미지) 함께 지운다. 첫 hop의 공식 이미지는
+# RUNNING_IMAGE를 비워 두므로, `:latest`처럼 다른 이름으로 띄운 컨테이너의 태그는 건드리지 않는다.
+_remove_previous_image() {
+    if [ -n "$RUNNING_IMAGE" ] && [ "$RUNNING_IMAGE" != "$1" ]; then
+        docker image rm "$RUNNING_IMAGE" "$1" &> /dev/null
+    else
+        docker image rm "$1" &> /dev/null
+    fi
 }
 
 # --- maintenance mode (#15) ---
@@ -600,6 +719,7 @@ if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
     echo -e "TARGET_URL=http\t\tSame as --target-url flag."
     echo -e "DISCORD_URL=http\tSame as --discord-url flag."
     echo -e "UPGRADE_GITLAB_CONFIG_HOOK=PATH\tExecutable run after gitlab.rb / gitlab-secrets.json copies are created and pruned. If unset, an executable file named 'upload-config.hook' next to this script is auto-detected. Receives env vars UPGRADE_GITLAB_BACKUP_DIR (container-side path; use 'docker cp' to extract), UPGRADE_GITLAB_VERSION, UPGRADE_GITLAB_CONTAINER, UPGRADE_GITLAB_SCRIPT_DIR. Hook failure logs a warning but does not abort the upgrade. See upload-config.hook.example."
+    echo -e "UPGRADE_GITLAB_IMAGE_HOOK=PATH\tExecutable that builds the image to run for each hop, for instances running an official image plus local patches. If unset, an executable file named 'build-image.hook' next to this script is auto-detected. Receives UPGRADE_GITLAB_BASE_IMAGE (e.g. gitlab/gitlab-ee:19.4.1-ee.0), UPGRADE_GITLAB_VERSION, UPGRADE_GITLAB_EDITION, UPGRADE_GITLAB_CONTAINER, UPGRADE_GITLAB_SCRIPT_DIR; must print the image to run as the last stdout line, and that image must carry the label ${_BASE_LABEL}=<base image>. It runs before the old container is stopped, and a failure stops the upgrade with the current version still running. A container running such a derived image is refused when no hook is configured, since the official image would silently drop the patches."
     echo -e "UPGRADE_GITLAB_LOG_DRIVER=NAME\tLog driver for the recreated container. By default the current container's driver and options are preserved, except Synology ContainerManager's 'db' driver which is replaced with json-file (max-size=50m, max-file=3) because it deadlocks dockerd when a container is stopped while 'docker logs --follow' is attached. Set to 'db' to keep it anyway."
     exit 0
 else
@@ -751,11 +871,10 @@ fi
 # --------------------------
 CONTAINER_CANDIDATES=$(docker ps -a --format "{{.Image}}\t{{.Names}}" | grep "^gitlab/gitlab-\(ce\|ee\)" | awk '{print $2}')
 
-# 이름으로 못 찾으면 이미지 ID → RepoTags 역조회로 재시도
+# 이름으로 못 찾으면 파생 이미지 label과 RepoTags(이미지 ID로 띄운 경우)로 재시도
 if [ -z "$CONTAINER_CANDIDATES" ]; then
     while IFS=$'\t' read -r img name; do
-        repo_tags=$(docker image inspect "$img" --format='{{range .RepoTags}}{{.}} {{end}}' 2>/dev/null)
-        if echo "$repo_tags" | grep -q "gitlab/gitlab-\(ce\|ee\)"; then
+        if _official_image_of "$img"; then
             CONTAINER_CANDIDATES="${CONTAINER_CANDIDATES:+$CONTAINER_CANDIDATES$'\n'}$name"
         fi
     done < <(docker ps -a --format "{{.Image}}\t{{.Names}}")
@@ -812,15 +931,19 @@ _maintenance_state_file="$_runner_state_dir/upgrade-gitlab-${CONTAINER_NAME}.mai
 # 에디션 자동 감지 (CE/EE)
 # --------------------------
 CONFIG_IMAGE=$(docker inspect "$CONTAINER_NAME" --format='{{.Config.Image}}')
-if ! echo "$CONFIG_IMAGE" | grep -q "^gitlab/gitlab-"; then
-    CONFIG_IMAGE=$(docker image inspect "$CONFIG_IMAGE" --format='{{range .RepoTags}}{{.}} {{end}}' 2>/dev/null \
-        | grep -oE "gitlab/gitlab-(ce|ee)[^ ]*" | head -1)
-    if [ -z "$CONFIG_IMAGE" ]; then
-        echo "Error: Cannot determine GitLab edition from container image." >&2
-        echo "Hint: Try running 'docker tag <IMAGE_ID> gitlab/gitlab-ce:<VERSION>' to restore the image tag." >&2
-        exit 1
-    fi
+if ! _official_image_of "$CONFIG_IMAGE"; then
+    echo "Error: Cannot determine GitLab edition from container image." >&2
+    echo "Hint: Try running 'docker tag <IMAGE_ID> gitlab/gitlab-ce:<VERSION>' to restore the image tag." >&2
+    exit 1
 fi
+# 이 스크립트가 교체 후 지울 이미지(_remove_previous_image). 파생 이미지만 담는다: 공식
+# 이미지를 `:latest` 같은 다른 이름으로 띄웠다면 그 태그는 지금처럼 건드리지 않는다.
+RUNNING_IMAGE=""
+if [ "$_derived" -eq 1 ]; then
+    RUNNING_IMAGE=$CONFIG_IMAGE
+    echo "Container runs a derived image: $RUNNING_IMAGE (base: $_official_image)"
+fi
+CONFIG_IMAGE=$_official_image
 DETECTED_EDITION=$(echo "$CONFIG_IMAGE" | sed 's|gitlab/gitlab-||;s|:.*||')
 
 if [ -n "$edition_flag" ]; then
@@ -848,6 +971,22 @@ echo "Using GitLab edition: $GITLAB_EDITION"
 
 GITLAB_IMAGE="gitlab/gitlab-${GITLAB_EDITION}"
 TAG_SUFFIX="-${GITLAB_EDITION}.0"
+
+# 이미지 hook(#20). 파생 이미지로 도는 컨테이너는 hook 없이 업그레이드하지 않는다:
+# hop마다 공식 이미지를 띄우므로 로컬 패치가 아무 경고 없이 빠진다.
+# config hook과 달리 실행할 수 없는 hook을 지정했으면 건너뛰지 않고 멈춘다.
+_find_hook "$image_hook" UPGRADE_GITLAB_IMAGE_HOOK build-image.hook "image hook"
+if [ $? -eq 2 ]; then
+    echo "Error: refusing to upgrade without the configured image hook." >&2
+    exit 1
+fi
+image_hook=$_hook_path
+if [ -n "$RUNNING_IMAGE" ] && [ -z "$image_hook" ]; then
+    echo "Error: $CONTAINER_NAME runs a derived image ($RUNNING_IMAGE) but no image hook is configured." >&2
+    echo "Upgrading would replace it with the official image and silently drop its patches." >&2
+    echo "Set UPGRADE_GITLAB_IMAGE_HOOK, or place an executable build-image.hook next to this script." >&2
+    exit 1
+fi
 
 # --version 플래그의 에디션 suffix 적용 (GITLAB_EDITION 확정 후)
 _partial_version=0
@@ -2909,6 +3048,7 @@ if [ $dry_run -eq 1 ]; then
     echo "Container: $CONTAINER_NAME"
     echo "Current: $CURRENT_VERSION"
     echo "Edition: $GITLAB_EDITION"
+    echo "Image hook: ${image_hook:-none (official images)}"
     echo "Target: ${target_version_tag:-$LATEST_VERSION_TAG}"
     echo "Steps: ${#UPGRADE_POINTS_ARRAY[@]}"
     for idx in "${!UPGRADE_POINTS_ARRAY[@]}"; do
@@ -3237,30 +3377,15 @@ fi
 # upgrade-gitlab 스크립트와 같은 디렉토리의 upload-config.hook을 자동 탐지.
 # 실패 시 warning만 찍고 업그레이드는 계속 진행 (config 사본은 로컬에 남아있음).
 # Hook은 컨테이너 측 BACKUP_DIR 경로를 받음 — host 경로 해석은 docker cp 등에 위임.
-if [ -z "$config_backup_hook" ] && [ -n "$SCRIPT_DIR" ]; then
-    _hook_candidate="${SCRIPT_DIR}/upload-config.hook"
-    if [ -e "$_hook_candidate" ]; then
-        if [ -x "$_hook_candidate" ]; then
-            config_backup_hook="$_hook_candidate"
-            echo "Auto-detected post-config-backup hook: $config_backup_hook"
-        else
-            echo "Warning: $_hook_candidate exists but is not executable, skipping auto-discovery" >&2
-        fi
-    fi
-fi
-
-if [ -n "$config_backup_hook" ]; then
-    if [ ! -x "$config_backup_hook" ]; then
-        echo "Warning: UPGRADE_GITLAB_CONFIG_HOOK is not executable: $config_backup_hook" >&2
-    else
-        echo "Running post-config-backup hook: $config_backup_hook"
-        if ! UPGRADE_GITLAB_BACKUP_DIR="$BACKUP_DIR" \
-             UPGRADE_GITLAB_VERSION="$CURRENT_VERSION" \
-             UPGRADE_GITLAB_CONTAINER="$CONTAINER_NAME" \
-             UPGRADE_GITLAB_SCRIPT_DIR="$SCRIPT_DIR" \
-             "$config_backup_hook"; then
-            echo "Warning: post-config-backup hook exited non-zero (continuing upgrade)" >&2
-        fi
+if _find_hook "$config_backup_hook" UPGRADE_GITLAB_CONFIG_HOOK upload-config.hook "post-config-backup hook"; then
+    config_backup_hook=$_hook_path
+    echo "Running post-config-backup hook: $config_backup_hook"
+    if ! UPGRADE_GITLAB_BACKUP_DIR="$BACKUP_DIR" \
+         UPGRADE_GITLAB_VERSION="$CURRENT_VERSION" \
+         UPGRADE_GITLAB_CONTAINER="$CONTAINER_NAME" \
+         UPGRADE_GITLAB_SCRIPT_DIR="$SCRIPT_DIR" \
+         "$config_backup_hook"; then
+        echo "Warning: post-config-backup hook exited non-zero (continuing upgrade)" >&2
     fi
 fi
 
@@ -3289,7 +3414,10 @@ fi
 enter_critical
 
 # 에디션 전환 (같은 버전에서 CE → EE)
-if [ "$DETECTED_EDITION" != "$GITLAB_EDITION" ]; then
+# 띄울 이미지를 먼저 준비한다: 실패하면 지금 컨테이너를 건드리지 않고 멈춘다.
+if [ "$DETECTED_EDITION" != "$GITLAB_EDITION" ] && ! _prepare_run_image "$GITLAB_IMAGE:$EDITION_SWITCH_TAG"; then
+    _image_prep_failed=1
+elif [ "$DETECTED_EDITION" != "$GITLAB_EDITION" ]; then
     echo "Switching edition at current version: $CURRENT_VERSION -> $EDITION_SWITCH_TAG"
     send_discord_webhook "INFO" "Switching edition: $DETECTED_EDITION -> $GITLAB_EDITION" "Same version edition switch before version upgrades"
 
@@ -3316,13 +3444,12 @@ if [ "$DETECTED_EDITION" != "$GITLAB_EDITION" ]; then
     echo ' done'
 
     echo -n "removing previous $CURRENT_VERSION image..."
-    docker image rm "gitlab/gitlab-${DETECTED_EDITION}:$CURRENT_VERSION" &> /dev/null
+    _remove_previous_image "gitlab/gitlab-${DETECTED_EDITION}:$CURRENT_VERSION"
     echo ' done'
 
-    pull_with_retry "$GITLAB_IMAGE:$EDITION_SWITCH_TAG"
-
     # shellcheck disable=SC2086
-    docker run -d --name "$CONTAINER_NAME" $LOG_ARGS $VOLUMES $PORTS "$GITLAB_IMAGE:$EDITION_SWITCH_TAG"
+    docker run -d --name "$CONTAINER_NAME" $LOG_ARGS $VOLUMES $PORTS "$_run_image"
+    RUNNING_IMAGE=$_run_image
 
     wait_for_http_ready "$GITLAB_IMAGE:$EDITION_SWITCH_TAG"
     wait_for_healthy "$GITLAB_IMAGE:$EDITION_SWITCH_TAG"
@@ -3355,6 +3482,15 @@ for ver in "${UPGRADE_POINTS_ARRAY[@]}"; do
     # 새 버전 진입 안 하고 break, post-upgrade로 직행.
     if [ "$_interrupted" -eq 1 ]; then
         echo "Interrupted at safe checkpoint. Stopping upgrade loop. Running post-upgrade verification." >&2
+        break
+    fi
+    # 띄울 이미지를 준비하지 못하면(pull 또는 이미지 hook 실패, 에디션 전환 포함) 같은 방식으로
+    # 멈춘다: 지금 컨테이너는 그대로 돌고 있으므로 사후 검증과 hold 해제를 거친 뒤 루프 밖에서
+    # 실패로 끝낸다. critical zone 안에서 바로 exit하면 EXIT 트랩이 러너와 maintenance mode를
+    # 풀지 않는다.
+    if [ "$_image_prep_failed" -eq 1 ] || ! _prepare_run_image "$GITLAB_IMAGE:$ver"; then
+        _image_prep_failed=1
+        echo "Could not prepare the image before replacing $CNT_VERSION. Stopping upgrade loop. Running post-upgrade verification." >&2
         break
     fi
 
@@ -3400,7 +3536,7 @@ for ver in "${UPGRADE_POINTS_ARRAY[@]}"; do
     echo ' done'
 
     echo -n "removing previous $CNT_VERSION image..."
-    docker image rm "$GITLAB_IMAGE:$CNT_VERSION" &> /dev/null
+    _remove_previous_image "$GITLAB_IMAGE:$CNT_VERSION"
     echo ' done'
 
     # 사전 Pull 완료 대기
@@ -3409,10 +3545,9 @@ for ver in "${UPGRADE_POINTS_ARRAY[@]}"; do
         PULL_PID=
     fi
 
-    pull_with_retry "$GITLAB_IMAGE:$ver"
-
     # shellcheck disable=SC2086
-    docker run -d --name "$CONTAINER_NAME" $LOG_ARGS $VOLUMES $PORTS "$GITLAB_IMAGE:$ver"
+    docker run -d --name "$CONTAINER_NAME" $LOG_ARGS $VOLUMES $PORTS "$_run_image"
+    RUNNING_IMAGE=$_run_image
 
     wait_for_http_ready "$GITLAB_IMAGE:$ver"
     wait_for_healthy "$GITLAB_IMAGE:$ver"
@@ -3454,6 +3589,14 @@ if [ ${#_deprecation_order[@]} -gt 0 ]; then
     # 개수가 많을 수 있어 앞 몇 건만 싣는다. print_deprecation_summary는 출력만
     # 담당하게 두고(이름값), 알림은 호출부에서 보낸다.
     send_discord_webhook "WARN" "Configuration deprecations detected" "$(_deprecation_discord_note)"
+fi
+
+# 이미지 준비 실패는 교체 전에 멈춘 것이라 컨테이너는 CNT_VERSION 그대로다. 인터럽트보다
+# 먼저 본다: 둘 다 났다면 사용자가 고쳐야 하는 쪽은 pull이나 hook이다.
+if [ "$_image_prep_failed" -eq 1 ]; then
+    echo "Upgrade stopped: the image to run could not be prepared (pull or image hook, see above). $CONTAINER_NAME is still running $CNT_VERSION." >&2
+    send_discord_webhook "ERR" "Upgrade stopped: image not prepared" "Still running $CNT_VERSION. The pull or the image hook failed before the container swap; fix it, then re-run."
+    exit 1
 fi
 
 # Interrupted 종료 처리 (RestartPolicy 변경, Discord NOTE는 정상 완료 시에만)

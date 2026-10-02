@@ -21,6 +21,7 @@ An automated upgrade script for Docker-based GitLab instances. Supports both CE 
 - **Maintenance mode during the upgrade** — When the instance supports GitLab maintenance mode (Premium/Ultimate), it is enabled before the backup so non-admin writes cannot land between the database and repository dumps, then disabled at the end — including on aborts, and on the next run if the process died. Costs one `gitlab-rails` boot before the backup (shared with `--skip-object-storage` when that is also set) and one to release at the end — around 5 minutes each (2m22s CE / 3m52s EE measured on 19.2.6; slower on a larger instance). Opt out with `--no-maintenance-mode`.
 - **Approximate upload progress** — During `Uploading backup archive to remote storage` (when GitLab's `backup_upload_*` is configured), shows an approximate `~%` derived from container egress bytes vs the assembled tar size. fog SDK's per-chunk open/close defeats exact tracking, so the percentage is explicitly marked with `~`.
 - **Post-config-backup hook** — Optional executable invoked after the config snapshots are made and pruned. Use it to ship `gitlab.rb` / `gitlab-secrets.json` to wherever you want (S3, GCS, Azure Blob, OpenStack Swift, Google Drive — or anywhere `docker run ...` can reach). See [`upload-config.hook.example`](upload-config.hook.example).
+- **Patched images** — For instances that run the official image plus local source patches, an optional image hook builds the image to run for each hop (e.g. `FROM gitlab/gitlab-ee:<ver>` + `git apply`). It runs before the old container is stopped, and its result must carry an `org.upgrade-gitlab.base` label naming the official base; a failure stops the upgrade with the current version still running. A container on such a derived image is detected through that label, and refused when no hook is configured, since each hop would otherwise start the official image and silently drop the patches.
 - **Recovery on abnormal exit** — If the previous run left the container with a non-zero exit code, re-running the script at the already-installed version skips the backup and re-runs health, migration, and secrets checks instead of silently exiting "already satisfied".
 
 ## Requirements
@@ -73,6 +74,7 @@ EOS (end-of-support) versions are checked via GitLab releases API but not exhaus
 | `TARGET_URL` | Same as `--target-url` |
 | `DISCORD_URL` | Same as `--discord-url` |
 | `UPGRADE_GITLAB_CONFIG_HOOK` | Path to an executable run after the `gitlab.rb` / `gitlab-secrets.json` snapshots are copied and pruned. If unset, an executable file named `upload-config.hook` next to the script is auto-detected. Receives `UPGRADE_GITLAB_BACKUP_DIR` (container-side path; use `docker cp` to extract), `UPGRADE_GITLAB_VERSION`, `UPGRADE_GITLAB_CONTAINER`, `UPGRADE_GITLAB_SCRIPT_DIR` env vars. Hook failure logs a warning but does not abort the upgrade. See [`upload-config.hook.example`](upload-config.hook.example) for a template covering S3 / GCS / Azure Blob / OpenStack Swift / Google Drive uploads. |
+| `UPGRADE_GITLAB_IMAGE_HOOK` | Path to an executable that builds the image to run for each hop. If unset, an executable file named `build-image.hook` next to the script is auto-detected. Receives `UPGRADE_GITLAB_BASE_IMAGE` (e.g. `gitlab/gitlab-ee:19.4.1-ee.0`), `UPGRADE_GITLAB_VERSION`, `UPGRADE_GITLAB_EDITION`, `UPGRADE_GITLAB_CONTAINER`, `UPGRADE_GITLAB_SCRIPT_DIR`. Must print the image to run as the last line of stdout (build logs go to stderr), and that image must carry the label `org.upgrade-gitlab.base=<base image>`. Unlike the config hook, a failure or a configured-but-not-executable hook stops the upgrade. |
 
 ### Examples
 
@@ -109,21 +111,22 @@ Pre-checks:
   5. Secrets integrity baseline check
 
 Edition switch (if CE -> EE):
-  6. Same-version edition migration
+  6. Same-version edition migration (on the hook-built image, if configured)
 
 For each version in upgrade path:
-  7. Pre-pull next version image (background)
-  8. Health check current container
-  9. Wait for background migrations to complete (with stuck detection)
-  10. Container swap (stop -> rm -> pull -> run)
-  11. Wait for HTTP 200 + healthy status
-  12. Wait for background migrations to complete (with stuck detection)
-  13. Verify migration status (no 'down' states)
+  7. Prepare the image to run: pull it, then build it via UPGRADE_GITLAB_IMAGE_HOOK if configured (a failure stops here, before the swap)
+  8. Pre-pull next version image (background)
+  9. Health check current container
+  10. Wait for background migrations to complete (with stuck detection)
+  11. Container swap (stop -> rm -> run)
+  12. Wait for HTTP 200 + healthy status
+  13. Wait for background migrations to complete (with stuck detection)
+  14. Verify migration status (no 'down' states)
 
 Post-upgrade:
-  14. Final health check
-  15. Secrets integrity verification
-  16. Resume any runners that were paused before the upgrade
+  15. Final health check
+  16. Secrets integrity verification
+  17. Resume any runners that were paused before the upgrade
 ```
 
 ## Signal Handling

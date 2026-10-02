@@ -1034,3 +1034,128 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     # The 10s default SIGKILLs GitLab (ExitCode 137); a real shutdown measures 32-55s.
     grep -q -- 'stop -t 300' "$MOCK_STATE_DIR/stop_args"
 }
+
+# ---------- Image hook (#20): derived images, an official image plus local patches ----------
+
+# _write_image_hook <mode>: an image hook in MOCK_STATE_DIR, exported as UPGRADE_GITLAB_IMAGE_HOOK.
+#   ok       builds gitlab-<edition>-patched:<tag> (the mock gives it the matching base label)
+#   fail     exits non-zero, like a patch that no longer applies
+#   official returns the base image itself, which carries no base label
+_write_image_hook() {
+    cat > "$MOCK_STATE_DIR/build-image.hook" <<HOOK
+#!/usr/bin/env bash
+echo "base=\$UPGRADE_GITLAB_BASE_IMAGE edition=\$UPGRADE_GITLAB_EDITION version=\$UPGRADE_GITLAB_VERSION" >> "$MOCK_STATE_DIR/image_hook_calls"
+case "$1" in
+    fail)
+        echo "error: patch does not apply" >&2
+        exit 3
+        ;;
+    official)
+        echo "\$UPGRADE_GITLAB_BASE_IMAGE"
+        ;;
+    *)
+        echo "Step 1/3 : FROM \$UPGRADE_GITLAB_BASE_IMAGE" >&2
+        repo=\${UPGRADE_GITLAB_BASE_IMAGE%%:*}
+        echo "gitlab-\${repo##*-}-patched:\${UPGRADE_GITLAB_BASE_IMAGE##*:}"
+        ;;
+esac
+HOOK
+    chmod +x "$MOCK_STATE_DIR/build-image.hook"
+    export UPGRADE_GITLAB_IMAGE_HOOK="$MOCK_STATE_DIR/build-image.hook"
+}
+
+@test "image hook: a derived container is upgraded onto the image the hook builds" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_DERIVED_IMAGE=1
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    _write_image_hook ok
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Container runs a derived image: gitlab-ce-patched:17.11.3-ce.0"* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+    new=$(cat "$MOCK_STATE_DIR/current_version")
+    # The hook got the official base of the new version, and that is what the container runs.
+    grep -qx "base=gitlab/gitlab-ce:$new edition=ce version=$new" "$MOCK_STATE_DIR/image_hook_calls"
+    tail -n1 "$MOCK_STATE_DIR/run_args" | grep -q " gitlab-ce-patched:$new$"
+    # Both the previous derived image and its official base are removed, in one call.
+    grep -qx "gitlab-ce-patched:17.11.3-ce.0 gitlab/gitlab-ce:17.11.3-ce.0" "$MOCK_STATE_DIR/image_rm_args"
+}
+
+@test "image hook: a derived container without a hook is refused before anything runs" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_DERIVED_IMAGE=1
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    unset UPGRADE_GITLAB_IMAGE_HOOK
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"runs a derived image (gitlab-ce-patched:17.11.3-ce.0) but no image hook is configured"* ]]
+    [ ! -f "$MOCK_STATE_DIR/backup_args" ]
+    [ ! -f "$MOCK_STATE_DIR/stop_args" ]
+}
+
+@test "image hook: a failing hook stops the upgrade with the old container still running" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_DERIVED_IMAGE=1
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    _write_image_hook fail
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"image hook failed for gitlab/gitlab-ce:"* ]]
+    # The hook's own output is shown so the cause is visible.
+    [[ "$output" == *"patch does not apply"* ]]
+    [[ "$output" == *"is still running 17.11.3-ce.0"* ]]
+    [ ! -f "$MOCK_STATE_DIR/stop_args" ]
+    [ ! -f "$MOCK_STATE_DIR/run_args" ]
+    [ "$(cat "$MOCK_STATE_DIR/current_version")" = "17.11.3-ce.0" ]
+}
+
+@test "image hook: an image without the matching base label is rejected" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_DERIVED_IMAGE=1
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    _write_image_hook official
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"which is not derived from gitlab/gitlab-ce:"* ]]
+    [ ! -f "$MOCK_STATE_DIR/stop_args" ]
+}
+
+@test "image hook: a configured hook that is not executable is fatal" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    echo '#!/bin/bash' > "$MOCK_STATE_DIR/build-image.hook"
+    export UPGRADE_GITLAB_IMAGE_HOOK="$MOCK_STATE_DIR/build-image.hook"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"UPGRADE_GITLAB_IMAGE_HOOK is not executable"* ]]
+    [ ! -f "$MOCK_STATE_DIR/backup_args" ]
+}
+
+@test "image hook: --dry-run names the hook without running it" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_DERIVED_IMAGE=1
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    _write_image_hook ok
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Image hook: $MOCK_STATE_DIR/build-image.hook"* ]]
+    [ ! -f "$MOCK_STATE_DIR/image_hook_calls" ]
+}
+
+@test "image hook: the CE to EE switch also runs on the built image" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_DERIVED_IMAGE=1
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export CI=true
+    _write_image_hook ok
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --no-step-limit --edition=ee --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Edition switch"* ]]
+    grep -q "^base=gitlab/gitlab-ee:17.11.3-ee.0 edition=ee " "$MOCK_STATE_DIR/image_hook_calls"
+    head -n1 "$MOCK_STATE_DIR/run_args" | grep -q " gitlab-ee-patched:17.11.3-ee.0$"
+}
+
+@test "image prep: a failed pull stops before the old container is stopped" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_PULL_FAIL=1
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"could not pull gitlab/gitlab-ce:"* ]]
+    [[ "$output" == *"is still running 17.11.3-ce.0"* ]]
+    [ ! -f "$MOCK_STATE_DIR/stop_args" ]
+    [ ! -f "$MOCK_STATE_DIR/run_args" ]
+}
