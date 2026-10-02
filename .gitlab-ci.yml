@@ -39,6 +39,11 @@ logic-test:
 promote-to-master:
   stage: promote
   image: alpine:latest
+  # Back-to-back develop pushes would otherwise promote concurrently, and whichever push
+  # lands second with the older commit fails as non-fast-forward. The group runs one job at
+  # a time; landing them in pipeline order also needs the group's process mode set to
+  # oldest_first (a project-side setting: PUT /projects/:id/resource_groups/promote-to-master).
+  resource_group: promote-to-master
   before_script:
     - apk add --no-cache git
   script:
