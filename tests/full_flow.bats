@@ -1080,15 +1080,27 @@ HOOK
     grep -qx "gitlab-ce-patched:17.11.3-ce.0 gitlab/gitlab-ce:17.11.3-ce.0" "$MOCK_STATE_DIR/image_rm_args"
 }
 
-@test "image hook: a derived container without a hook is refused before anything runs" {
+@test "image hook: -y refuses a derived container without a hook before anything runs" {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_DERIVED_IMAGE=1
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     unset UPGRADE_GITLAB_IMAGE_HOOK
     run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
     [ "$status" -eq 1 ]
     [[ "$output" == *"runs a derived image (gitlab-ce-patched:17.11.3-ce.0) but no image hook is configured"* ]]
+    [[ "$output" == *"refusing to drop the patches in unattended mode (-y)"* ]]
     [ ! -f "$MOCK_STATE_DIR/backup_args" ]
     [ ! -f "$MOCK_STATE_DIR/stop_args" ]
+}
+
+@test "image hook: --dry-run warns about a derived container without a hook and still shows the path" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_DERIVED_IMAGE=1
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    unset UPGRADE_GITLAB_IMAGE_HOOK
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"no image hook is configured"* ]]
+    [[ "$output" == *"Image hook: none (official images)"* ]]
+    [[ "$output" == *"=== DRY-RUN: Upgrade Path ==="* ]]
 }
 
 @test "image hook: a failing hook stops the upgrade with the old container still running" {
