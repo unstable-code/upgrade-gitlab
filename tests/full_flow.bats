@@ -60,6 +60,21 @@ teardown() {
     [[ "$output" == *"Edition switch"* ]]
 }
 
+# ---------- Test 5b: edition switch with no version hop (#21) ----------
+@test "full-flow: an edition switch alone reports the switch and exits 0" {
+    # The switch tag is dropped from UPGRADE_POINTS_ARRAY once handled, so with no hop
+    # after it the array ends up empty; the completion message used to index it.
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export CI=true
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --no-step-limit --edition=ee --version=17.11.3 --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"bad array subscript"* ]]
+    [[ "$output" == *"Successfully updated GitLab server from 17.11.3-ce.0 to 17.11.3-ee.0"* ]]
+    [[ "$output" == *"Updated traceroute: 17.11.3-ee.0"* ]]
+    [ "$(wc -l < "$MOCK_STATE_DIR/api_create")" -eq 1 ]
+}
+
 # ---------- Test 6: 2-step upgrade ----------
 @test "full-flow: 2-step upgrade succeeds within step limit" {
     export MOCK_GITLAB_VERSION="17.7.4-ce.0"
@@ -1291,4 +1306,8 @@ _inspect_patch_full='
     wait "$pid" || status=$?
     [ "$status" -eq 130 ]
     grep -qx "update --restart=unless-stopped gitlab" "$MOCK_STATE_DIR/update_args"
+    # The version reported is the one running now, not the one the run started from.
+    now=$(cat "$MOCK_STATE_DIR/current_version")
+    [ "$now" != "17.3.7-ce.0" ]
+    grep -q "gitlab is running $now\.$" "$MOCK_STATE_DIR/out.log"
 }

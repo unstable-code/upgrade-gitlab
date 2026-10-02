@@ -3284,6 +3284,12 @@ if [ ${#UPGRADE_POINTS_ARRAY[@]} -eq 0 ]; then
     exit 0
 fi
 
+# 완료 보고에 쓸 시작 버전, 최종 목표, 경로를 따로 둔다(#21). 에디션 전환은 처리한 태그를 배열에서
+# 빼고 CURRENT_VERSION을 덮어쓰므로, 전환만 하는 실행에서는 끝날 때 배열이 비어 있다.
+ORIGINAL_VERSION=$CURRENT_VERSION
+FINAL_TARGET=${UPGRADE_POINTS_ARRAY[-1]}
+UPGRADE_ROUTE=("${UPGRADE_POINTS_ARRAY[@]}")
+
 echo -e "\nWould you like to upgrade GitLab server from $CURRENT_VERSION to ${UPGRADE_POINTS_ARRAY[-1]}?"
 echo "This action cannot be undone. PLEASE BACKUP GitLab drive BEFORE STARTING UPDATE..."
 echo "You should update pointing releases too. ROUTING COUNT: ${#UPGRADE_POINTS_ARRAY[@]}"
@@ -3777,10 +3783,11 @@ if [ "$_image_prep_failed" -eq 1 ]; then
     exit 1
 fi
 
-# Interrupted 종료 처리 (RestartPolicy 변경, Discord NOTE는 정상 완료 시에만)
+# Interrupted 종료 처리 (RestartPolicy 변경 안내와 Discord NOTE는 정상 완료 시에만).
+# 지금 도는 버전은 CNT_VERSION이다: CURRENT_VERSION은 hop마다 갱신되지 않아 시작 버전(또는 전환 태그)에 머문다.
 if [ "$_interrupted" -eq 1 ]; then
-    echo "Upgrade was interrupted by user signal. Post-upgrade verification completed." >&2
-    send_discord_webhook "WARN" "Upgrade interrupted" "User signal received during upgrade. Post-upgrade verification completed; current version: $CURRENT_VERSION"
+    echo "Upgrade was interrupted by user signal. Post-upgrade verification completed; $CONTAINER_NAME is running $CNT_VERSION." >&2
+    send_discord_webhook "WARN" "Upgrade interrupted" "User signal received during upgrade. Post-upgrade verification completed; current version: $CNT_VERSION"
     exit 130
 fi
 
@@ -3806,8 +3813,8 @@ if [ "$auto_restart_enabled" == 'no' ]; then
     fi
 fi
 
-echo "Successfully updated GitLab server from $CURRENT_VERSION to ${UPGRADE_POINTS_ARRAY[-1]}"
-echo "Updated traceroute: ${UPGRADE_POINTS_ARRAY[*]}"
+echo "Successfully updated GitLab server from $ORIGINAL_VERSION to $FINAL_TARGET"
+echo "Updated traceroute: ${UPGRADE_ROUTE[*]}"
 if [ -n "$max_tier_flag" ]; then
     max_tier=$max_tier_flag
 elif [ "$GITLAB_EDITION" = "ce" ]; then
@@ -3815,7 +3822,7 @@ elif [ "$GITLAB_EDITION" = "ce" ]; then
 else
     max_tier=ultimate
 fi
-whats_new_url="https://gitlab-com.gitlab.io/cs-tools/gitlab-cs-tools/what-is-new-since/?tab=features&minVersion=${CURRENT_VERSION%%-*}&selectedMinTier=core&selectedMaxTier=${max_tier}&selectedSaaS=self-managed+only"
-send_discord_webhook "NOTE" "Successfully upgraded GitLab server!" "GitLab version changed from [$CURRENT_VERSION to ${UPGRADE_POINTS_ARRAY[-1]}]($whats_new_url)"
+whats_new_url="https://gitlab-com.gitlab.io/cs-tools/gitlab-cs-tools/what-is-new-since/?tab=features&minVersion=${ORIGINAL_VERSION%%-*}&selectedMinTier=core&selectedMaxTier=${max_tier}&selectedSaaS=self-managed+only"
+send_discord_webhook "NOTE" "Successfully upgraded GitLab server!" "GitLab version changed from [$ORIGINAL_VERSION to $FINAL_TARGET]($whats_new_url)"
 
 exit 0
