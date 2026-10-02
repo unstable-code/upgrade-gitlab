@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Example image hook for upgrade-gitlab: run GitLab as the official image
+# plus your own source patches, and keep those patches across upgrades.
+#
+# Omnibus ships the Rails sources as plain files under
+# /opt/gitlab/embedded/service/gitlab-rails, so a patched image is just the
+# official image plus `git apply`. No source build is involved.
+#
+# Activation (option 1, recommended): copy this file alongside the
+# upgrade-gitlab script with the .example suffix removed, then chmod +x:
+#     cp build-image.hook.example build-image.hook
+#     chmod +x build-image.hook
+# upgrade-gitlab auto-detects 'build-image.hook' next to itself.
+#
+# Activation (option 2): set the env var explicitly:
+#     export UPGRADE_GITLAB_IMAGE_HOOK=/absolute/path/to/build-image.hook
+#
+# Patches: every *.patch in GITLAB_PATCH_DIR (default: a 'patches'
+# directory next to the upgrade-gitlab script), applied in name order with
+# paths relative to the gitlab-rails root (`git diff` output from a GitLab
+# checkout works as is).
+#
+# Receives via environment:
+#   UPGRADE_GITLAB_BASE_IMAGE — official image for this hop
+#                               (e.g. "gitlab/gitlab-ee:19.4.1-ee.0")
+#   UPGRADE_GITLAB_VERSION    — its tag (e.g. "19.4.1-ee.0")
+#   UPGRADE_GITLAB_EDITION    — "ce" or "ee"
+#   UPGRADE_GITLAB_CONTAINER  — container name
+#   UPGRADE_GITLAB_SCRIPT_DIR — directory holding the upgrade-gitlab script
+#
+# Contract with upgrade-gitlab:
+#   - print the image to run as the LAST line of stdout; send build logs to
+#     stderr (they are shown only when the hook fails)
+#   - that image must carry the label org.upgrade-gitlab.base=<base image>,
+#     which is also how upgrade-gitlab recognises the container next time
+#   - exit non-zero on any failure: the upgrade then stops before the old
+#     container is touched, still running the current version
+#
+# A patch that no longer applies to a new GitLab version fails `git apply
+# --check`, so an image without the patch is never produced. Rebase the
+# patch and re-run the upgrade.
+#
+# Smoke-test BEFORE the next real upgrade, against the version you run now:
+#   UPGRADE_GITLAB_BASE_IMAGE=gitlab/gitlab-ce:19.4.1-ce.0 \
+#   UPGRADE_GITLAB_EDITION=ce UPGRADE_GITLAB_SCRIPT_DIR="$PWD" ./build-image.hook
+#
+# A maintained real-world example (patches, apply check against new GitLab
+# releases in CI, E2E in a disposable container):
+#   https://gitlab.gggames.synology.me/peter/gitlab/gitlab-patches
+
+set -euo pipefail
+
+: "${UPGRADE_GITLAB_BASE_IMAGE:?required}"
+: "${UPGRADE_GITLAB_EDITION:?required}"
+
+patch_dir=${GITLAB_PATCH_DIR:-${UPGRADE_GITLAB_SCRIPT_DIR:?required}/patches}
+image="gitlab-${UPGRADE_GITLAB_EDITION}-patched:${UPGRADE_GITLAB_BASE_IMAGE##*:}"
+
+shopt -s nullglob
+patches=("$patch_dir"/*.patch)
+if [ ${#patches[@]} -eq 0 ]; then
+    echo "No *.patch files in $patch_dir" >&2
+    exit 1
+fi
+
+ctx=$(mktemp -d)
+trap 'rm -rf "$ctx"' EXIT
+mkdir "$ctx/patches"
+cp "${patches[@]}" "$ctx/patches/"
+
+# The image has no GNU patch (BusyBox only), so GitLab's bundled git applies them.
+cat > "$ctx/Dockerfile" <<'DOCKERFILE'
+ARG BASE_IMAGE=gitlab/gitlab-ce:latest
+FROM ${BASE_IMAGE}
+ARG BASE_IMAGE
+LABEL org.upgrade-gitlab.base="${BASE_IMAGE}"
+COPY patches/ /tmp/upgrade-gitlab-patches/
+RUN set -e; \
+    cd /opt/gitlab/embedded/service/gitlab-rails; \
+    for p in /tmp/upgrade-gitlab-patches/*.patch; do \
+        /opt/gitlab/embedded/bin/git apply --check "$p"; \
+        /opt/gitlab/embedded/bin/git apply "$p"; \
+    done; \
+    rm -rf /tmp/upgrade-gitlab-patches
+DOCKERFILE
+
+echo "Building $image from $UPGRADE_GITLAB_BASE_IMAGE with ${#patches[@]} patch(es)" >&2
+docker build --build-arg "BASE_IMAGE=$UPGRADE_GITLAB_BASE_IMAGE" -t "$image" "$ctx" >&2
+
+echo "$image"

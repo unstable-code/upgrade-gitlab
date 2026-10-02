@@ -238,6 +238,6 @@ It also could not cross GitLab 19.0, which is worth knowing independently of CI:
 
 Env-only: `UPGRADE_GITLAB_CONFIG_HOOK=PATH` runs an executable after gitlab.rb/secrets.json copies are made and pruned. If unset, an executable `upload-config.hook` next to the script is auto-detected. Hook receives `UPGRADE_GITLAB_SCRIPT_DIR` so it can locate sibling files (rclone.conf, etc.). Template at `upload-config.hook.example`.
 
-`UPGRADE_GITLAB_IMAGE_HOOK=PATH` builds the image to run for each hop; `build-image.hook` next to the script is auto-detected (see Image Hook above).
+`UPGRADE_GITLAB_IMAGE_HOOK=PATH` builds the image to run for each hop; `build-image.hook` next to the script is auto-detected (see Image Hook above). Template at `build-image.hook.example` (applies `patches/*.patch` next to the script).
 
 `UPGRADE_GITLAB_LOG_DRIVER=NAME` forces the log driver of the recreated container (see Container Log Driver below).
