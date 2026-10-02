@@ -4,6 +4,51 @@
 
 FIXTURES_DIR="${FIXTURES_DIR:-$(cd "$(dirname "$0")/../fixtures" && pwd)}"
 
+# Docker Engine API over the unix socket (#22): container create and network connect.
+# Each request body is appended to MOCK_STATE_DIR/api_<create|connect> as one JSON line.
+# The created image only becomes the running one at `docker rename` (see the docker mock).
+if [[ " $* " == *" --unix-socket "* ]]; then
+    out=/dev/stdout body="" url=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -o) out=$2; shift ;;
+            --data-binary) body=$2; shift ;;
+            -w|-X|-H|--unix-socket) shift ;;
+            http*) url=$1 ;;
+        esac
+        shift
+    done
+    _respond() { printf '%s' "$2" > "$out"; [ "$out" = /dev/stdout ] || printf '%s' "$1"; }
+    case "$url" in
+        */_ping)
+            if [ "${MOCK_API_UNREACHABLE:-0}" -eq 1 ]; then
+                echo "curl: (7) Couldn't connect to server" >&2
+                exit 7
+            fi
+            echo -n OK
+            ;;
+        */containers/create\?name=*)
+            if [ "${MOCK_CREATE_FAIL:-0}" -eq 1 ]; then
+                _respond 400 '{"message":"mock create rejected"}'
+                exit 0
+            fi
+            if [ -n "$MOCK_STATE_DIR" ]; then
+                jq -c . <<<"$body" >> "$MOCK_STATE_DIR/api_create"
+                jq -r .Image <<<"$body" > "$MOCK_STATE_DIR/created_image"
+            fi
+            _respond 201 '{"Id":"fedcba9876543210","Warnings":[]}'
+            ;;
+        */networks/*/connect)
+            [ -n "$MOCK_STATE_DIR" ] && jq -c --arg url "$url" '. + {url: $url}' <<<"$body" >> "$MOCK_STATE_DIR/api_connect"
+            _respond 200 ''
+            ;;
+        *)
+            _respond 404 '{"message":"mock: unknown endpoint"}'
+            ;;
+    esac
+    exit 0
+fi
+
 # Parse curl arguments to find URL and flags
 url=""
 write_out=""

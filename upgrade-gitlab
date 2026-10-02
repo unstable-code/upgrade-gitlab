@@ -41,6 +41,7 @@ reset_stuck_finalizing=0
 max_tier_flag=
 _interrupted=0
 _image_prep_failed=0
+_next_container_created=0
 _trap_active=0
 _pull_pid=
 _tty=/dev/tty
@@ -186,6 +187,11 @@ _cleanup_on_exit() {
     # 상단 고정 바가 켜진 채 종료(시그널/에러/abort)되면 터미널 스크롤 영역이 남으므로 가장 먼저 복원.
     command -v _sticky_teardown >/dev/null 2>&1 && _sticky_teardown
     [ ${#_TMPFILES[@]} -gt 0 ] && rm -f "${_TMPFILES[@]}" 2>/dev/null
+    # 만들어 두고 쓰지 못한 교체용 컨테이너(#22). 지금 컨테이너가 아직 있을 때만 지운다: 지금 컨테이너를
+    # 지운 뒤 이름 바꾸기에 실패했다면 남은 것은 이것뿐이다.
+    if [ "${_next_container_created:-0}" = 1 ] && docker container inspect "$CONTAINER_NAME" &> /dev/null; then
+        docker container rm "$_NEXT_CONTAINER" &> /dev/null
+    fi
     # 안전망: critical zone 진입 전(러너 pause ~ 백업 ~ 사전 시크릿 검사)에 종료되면 — 시그널,
     # 사전검사 실패/거부, 백업 실패, 사용자 abort 등 무엇이든 — 일시정지한 러너가 방치된다(#10).
     # 그 구간은 아직 컨테이너를 스왑하지 않아 살아 있으므로 여기서 재개한다.
@@ -394,15 +400,24 @@ _official_image_of() {
 #    _run_isolated로 돌린다.
 #  - 결과가 이번 베이스의 파생 이미지여야 통과한다. 다른 버전이나 공식 이미지를 돌려주는 hook이
 #    패치 없는 이미지를 조용히 띄우는 일을 막는다.
+#  - 그 이미지로 교체할 컨테이너를 임시 이름으로 만들어 둔다(#22). 교체 때는 이름을 바꿔 시작만 한다.
 _run_image=""
 _prepare_run_image() {
-    local base=$1 log rc
+    local base=$1
     _run_image=$base
     if ! pull_with_retry "$base"; then
         echo "Error: could not pull $base" >&2
         return 1
     fi
-    [ -n "$image_hook" ] || return 0
+    if [ -n "$image_hook" ] && ! _build_hook_image "$base"; then
+        return 1
+    fi
+    _create_next_container "$_run_image"
+}
+
+# _build_hook_image <공식 이미지> — 이미지 hook으로 파생 이미지를 만들어 _run_image에 담는다.
+_build_hook_image() {
+    local base=$1 log rc
     log=$(mktemp)
     _TMPFILES+=("$log")
     echo "Building image for $base via hook: $image_hook"
@@ -866,6 +881,27 @@ if ! _docker_err=$(docker version --format '{{.Server.Version}}' 2>&1 >/dev/null
     exit 1
 fi
 
+# 컨테이너 재생성은 Engine API(POST /containers/create)로 한다(#22). CLI에는 inspect 결과로
+# 컨테이너를 만드는 명령이 없고, 플래그를 하나씩 옮기면 환경변수·shm·바인딩 IP처럼 빠지는 항목이
+# 계속 나온다. 엔드포인트는 CLI가 쓰는 것을 그대로 받는다: DOCKER_HOST와 docker context를 모두
+# 반영한다. curl로 부를 수 있는 것은 unix 소켓뿐이므로 tcp://, ssh://는 여기서 멈춘다 — 백업도
+# 하기 전이라 안전하고, 컨테이너를 지운 뒤에 알게 되면 컨테이너가 없는 상태가 된다.
+_docker_host=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null)
+_docker_host=${_docker_host:-${DOCKER_HOST:-unix:///var/run/docker.sock}}
+if [[ $_docker_host != unix://* ]]; then
+    echo "Error: the Docker endpoint '$_docker_host' is not a unix socket." >&2
+    echo 'The container is recreated through the Engine API with curl --unix-socket, which needs a local socket.' >&2
+    exit 1
+fi
+DOCKER_SOCK=${_docker_host#unix://}
+DOCKER_API_VERSION=$(docker version --format '{{.Server.APIVersion}}' 2>/dev/null)
+if ! [[ $DOCKER_API_VERSION =~ ^[0-9]+\.[0-9]+$ ]] \
+    || [ "$(curl -sS --unix-socket "$DOCKER_SOCK" "http://localhost/v${DOCKER_API_VERSION}/_ping" 2>&1)" != OK ]; then
+    echo "Error: cannot call the Docker Engine API on $DOCKER_SOCK (API version: ${DOCKER_API_VERSION:-unknown})." >&2
+    echo 'Check that this user can open the socket itself; an alias such as "sudo docker" does not apply inside scripts.' >&2
+    exit 1
+fi
+
 # --------------------------
 # 🔍 gitlab/gitlab-ce 또는 gitlab/gitlab-ee 컨테이너 자동 감지
 # --------------------------
@@ -1025,25 +1061,82 @@ if [ -n "$target_version_tag" ]; then
 fi
 
 # --------------------------
-# 1️⃣ 볼륨 마운트 추출
+# 1️⃣ 컨테이너 설정 복사 (#22)
 # --------------------------
-VOLUMES=$(docker inspect "$CONTAINER_NAME" --format='{{range .Mounts}}{{.Source}}:{{.Destination}} {{end}}' \
-    | tr ' ' '\n' \
-    | sed '/^$/d' \
-    | awk '{printf "-v %s ", $0}' \
-    | sed 's/ $//')
+# hop마다 컨테이너를 다시 만들 때 지금 컨테이너의 설정을 통째로 옮기고 이미지만 바꾼다. 볼륨·포트·로그만
+# 골라 옮기던 때는 환경변수(GITLAB_OMNIBUS_CONFIG), --shm-size, 포트 바인딩 IP, 네트워크, label이
+# 업그레이드 한 번에 조용히 사라졌다. 이 사본은 업그레이드 전 컨테이너에서 한 번만 만들고 모든 hop이
+# 함께 쓴다: 이미지 기본값과 비교하려면 이 컨테이너를 만든 이미지가 필요한데, 그 이미지는 첫 hop에서 지운다.
+#
+# inspect 결과를 그대로 넘기면 안 되는 필드:
+# - Env, Labels: 이미지가 넣은 값이 섞여 있다. 그대로 넘기면 이전 이미지의 값(PATH, 파생 이미지의
+#   베이스 label 등)이 새 이미지에 고정되므로, 이전 이미지와 같은 항목은 뺀다.
+# - Cmd, Entrypoint, Healthcheck 등: 이미지에서 온 값이라 이전 이미지와 같으면 빼서 새 이미지 기본값을 쓴다.
+#   ExposedPorts는 남긴다 — -p로 연 포트도 여기에 들어 있다.
+# - Hostname: 직접 지정하지 않았다면 컨테이너 ID 앞 12자다.
+# - anonymous volume: HostConfig.Binds/Mounts에 없고 .Mounts에만 있다. 빠뜨리면 새 컨테이너가 빈 볼륨을
+#   새로 만든다(데이터 유실). 이름으로 Binds에 넣어 같은 볼륨을 다시 붙인다.
+# - HostConfig.Links: inspect는 "/대상:/자기이름/별칭"으로 돌려주지만 create는 "대상:별칭"을 받는다.
+# - ShmSize: Docker 기본값 64MB에서는 sidekiq이 shm 고갈로 죽어 background migration 대기가 끝나지
+#   않았다(#22). GitLab 문서의 권장값 256MB보다 작으면 올린다. 더 크게 잡은 값은 그대로 둔다.
+# - 네트워크: API 1.44 미만은 create 때 네트워크를 하나만 받으므로, NetworkMode의 네트워크는 create에,
+#   나머지는 만든 뒤 connect로 붙인다. 별칭에서는 Docker가 자동으로 넣은 컨테이너 ID와 이름을 뺀다.
+# - RestartPolicy: no로 띄운다. 새 버전이 reconfigure나 마이그레이션에서 FATAL로 죽으면 always/unless-stopped는
+#   컨테이너를 재부팅 루프에 넣는다. 원래 정책은 사후 검증을 통과한 뒤 되돌린다(auto_restart_enabled).
+# jq 1.5(DSM)에서도 돌아야 한다: `A + B as $x` 의 우선순위가 버전마다 달라 `as` 앞은 항상 괄호로 감싼다.
+_SHM_MIN=268435456
+# shellcheck disable=SC2016
+_CONTAINER_SPEC_JQ='
+def norm: if . == "" or . == [] or . == {} then null else . end;
+. as $c
+| ($c.Id[0:12]) as $sid
+| ($c.Name | ltrimstr("/")) as $name
+| (((($c.HostConfig.Binds // []) | map(split(":")[1]))) + (($c.HostConfig.Mounts // []) | map(.Target))) as $declared
+| ([$c.Mounts[]? | select(.Type == "volume") | select(.Destination as $d | $declared | index($d) | not)
+    | .Name + ":" + .Destination + (if .RW then "" else ":ro" end)]) as $anon
+| (($c.NetworkSettings.Networks // {})
+    | with_entries(.value |= {
+        Aliases: ((.Aliases // []) | map(select(. != $sid and . != $name)) | norm),
+        IPAMConfig, Links, DriverOpts, NetworkID})) as $nets
+| ($c.HostConfig.NetworkMode // "default") as $mode
+| (if $mode == "default" then "bridge" else $mode end) as $want
+| ([$nets | to_entries[] | select(.key == $want or ((.value.NetworkID // "") | startswith($want))) | .key][0]) as $primary
+| ($nets | with_entries(.value |= del(.NetworkID))) as $nets
+| {
+    Config: ($c.Config
+        | .Env = [(.Env // [])[] as $e | select(($img.Env // []) | index($e) | not) | $e]
+        | .Labels = ((.Labels // {}) | with_entries(select(.value != ($img.Labels // {})[.key])))
+        | (if .Hostname == $sid then del(.Hostname) else . end)
+        | reduce ("Cmd", "Entrypoint", "Healthcheck", "WorkingDir", "User", "StopSignal",
+                  "Shell", "OnBuild", "ArgsEscaped", "Volumes") as $k (.;
+            if (.[$k] | norm) == ($img[$k] | norm) then del(.[$k]) else . end)
+        | del(.Image)),
+    HostConfig: ($c.HostConfig
+        | .Binds = (((.Binds // []) + $anon) | norm)
+        | .Links = ((.Links // []) | map(ltrimstr("/") | split(":") | .[0] + ":" + (.[1] | split("/") | .[-1])) | norm)
+        | ((.IpcMode // "") as $ipc
+            | if $ipc == "" or $ipc == "private" or $ipc == "shareable"
+              then .ShmSize = ([.ShmSize // 0, $shm_min] | max) else . end)
+        | (if $log == null then . else .LogConfig = $log end)
+        | .RestartPolicy = {Name: "no", MaximumRetryCount: 0}),
+    Networks: {
+        primary: (if $primary == null then {} else {($primary): $nets[$primary]} end),
+        extra: ($nets | with_entries(select(.key != $primary)))
+    }
+  }'
+_container_json=$(docker container inspect --format '{{json .}}' "$CONTAINER_NAME" 2>/dev/null)
+_image_config=
+if [ -n "$_container_json" ]; then
+    _image_config=$(docker image inspect --format '{{json .Config}}' "$(jq -r '.Image' <<<"$_container_json")" 2>/dev/null)
+fi
+if [ -z "$_image_config" ]; then
+    echo "Error: could not read the configuration of $CONTAINER_NAME or of the image it was created from." >&2
+    echo 'Both are needed to recreate the container with its settings intact.' >&2
+    exit 1
+fi
 
 # --------------------------
-# 2️⃣ 포트 매핑 추출
-# --------------------------
-PORTS=$(docker inspect "$CONTAINER_NAME" --format='{{range $p, $conf := .HostConfig.PortBindings}}{{if $conf}}{{$p}}:{{(index $conf 0).HostPort}} {{end}}{{end}}' \
-    | tr ' ' '\n' \
-    | sed '/^$/d' \
-    | sed 's/\/tcp//g' \
-    | awk -F: '{printf "-p %s:%s ", $2, $1}')
-
-# --------------------------
-# 3️⃣ 로그 드라이버 결정
+# 2️⃣ 로그 드라이버 결정
 # --------------------------
 # 컨테이너 재생성 시 로그 설정을 넘겨주지 않으면 데몬 기본값으로 조용히 되돌아가므로 보존한다.
 # 단 Synology ContainerManager의 자체 드라이버(db)만은 예외로 json-file로 교체한다.
@@ -1052,25 +1145,83 @@ PORTS=$(docker inspect "$CONTAINER_NAME" --format='{{range $p, $conf := .HostCon
 #   handleContainerExit 의 CloseStreams 가 영원히 기다림 → 컨테이너 State 락이 풀리지 않아
 #   stop/kill/inspect 가 모두 무한 대기. 복구 수단은 dockerd 재시작뿐이다.
 # json-file 은 pkg/logdb 경로를 아예 타지 않으므로 이 데드락이 구조적으로 불가능하다.
-CURRENT_LOG_DRIVER=$(docker inspect "$CONTAINER_NAME" --format='{{.HostConfig.LogConfig.Type}}' 2>/dev/null)
-LOG_ARGS=
+# 그 밖의 드라이버는 복사한 HostConfig.LogConfig가 그대로 옮긴다(null = 덮어쓰지 않음).
+CURRENT_LOG_DRIVER=$(jq -r '.HostConfig.LogConfig.Type // empty' <<<"$_container_json")
+_log_config=null
 
 if [ -n "$LOG_DRIVER_OVERRIDE" ]; then
-    LOG_ARGS="--log-driver $LOG_DRIVER_OVERRIDE"
+    _log_config=$(jq -nc --arg t "$LOG_DRIVER_OVERRIDE" '{Type: $t, Config: {}}')
 elif [ "$CURRENT_LOG_DRIVER" = 'db' ]; then
-    LOG_ARGS='--log-driver json-file --log-opt max-size=50m --log-opt max-file=3'
+    _log_config='{"Type":"json-file","Config":{"max-size":"50m","max-file":"3"}}'
     echo "Notice: the Synology 'db' log driver deadlocks dockerd when a container is stopped" >&2
     echo "        while 'docker logs --follow' is attached. This container will be recreated with json-file." >&2
     echo "        Logs stay available via 'docker logs' but no longer appear in the DSM UI." >&2
     echo "        Set UPGRADE_GITLAB_LOG_DRIVER=db to keep the original driver." >&2
-elif [ -n "$CURRENT_LOG_DRIVER" ]; then
-    LOG_ARGS="--log-driver $CURRENT_LOG_DRIVER"
-    log_opts=$(docker inspect "$CONTAINER_NAME" \
-        --format='{{range $k, $v := .HostConfig.LogConfig.Config}}--log-opt {{$k}}={{$v}} {{end}}' 2>/dev/null)
-    if [ -n "$log_opts" ]; then
-        LOG_ARGS="$LOG_ARGS $log_opts"
-    fi
 fi
+
+if ! CONTAINER_SPEC=$(jq -c --argjson img "$_image_config" --argjson log "$_log_config" \
+        --argjson shm_min "$_SHM_MIN" "$_CONTAINER_SPEC_JQ" <<<"$_container_json") || [ -z "$CONTAINER_SPEC" ]; then
+    echo "Error: could not build the configuration for recreating $CONTAINER_NAME." >&2
+    exit 1
+fi
+_shm_before=$(jq -r '.HostConfig.ShmSize // 0' <<<"$_container_json")
+_shm_after=$(jq -r '.HostConfig.ShmSize // 0' <<<"$CONTAINER_SPEC")
+if [ "$_shm_after" != "$_shm_before" ]; then
+    echo "Notice: $CONTAINER_NAME runs with a $((_shm_before / 1048576))MB /dev/shm. GitLab recommends 256MB;" >&2
+    echo "        below that, Sidekiq can crash and leave background migrations stuck. It will be recreated with $((_shm_after / 1048576))MB." >&2
+fi
+
+# _docker_api METHOD PATH BODY: Engine API 호출. 응답 본문은 _api_body, HTTP 상태는 _api_status.
+_docker_api() {
+    local out
+    out=$(mktemp) || return 1
+    _api_status=$(curl -sS -o "$out" -w '%{http_code}' --unix-socket "$DOCKER_SOCK" -X "$1" \
+        -H 'Content-Type: application/json' --data-binary "$3" "http://localhost/v${DOCKER_API_VERSION}$2")
+    _api_body=$(cat "$out")
+    rm -f "$out"
+    [[ $_api_status == 2[0-9][0-9] ]]
+}
+
+# 교체할 컨테이너는 지금 컨테이너를 멈추기 전에 임시 이름으로 만들어 둔다(시작하지 않음). create는
+# 포트를 잡지 않으므로 두 컨테이너가 함께 있어도 되고, 설정이 거부되면 지금 컨테이너는 아직 돌고 있다.
+# 지우고 나서 만들면, 실패했을 때 컨테이너가 하나도 남지 않는다.
+_NEXT_CONTAINER="${CONTAINER_NAME}-upgrade-next"
+
+# _create_next_container IMAGE
+_create_next_container() {
+    local body net
+    # 이전 실행이 남긴 것. 강제로 지우지는 않는다: 돌고 있다면 create가 이름 충돌로 실패하고 멈춘다.
+    docker container rm "$_NEXT_CONTAINER" &> /dev/null
+    body=$(jq -c --arg img "$1" '.Config + {Image: $img, HostConfig: .HostConfig,
+        NetworkingConfig: {EndpointsConfig: .Networks.primary}}' <<<"$CONTAINER_SPEC")
+    if ! _docker_api POST "/containers/create?name=$_NEXT_CONTAINER" "$body"; then
+        echo "Error: could not create the replacement container (HTTP $_api_status): $(jq -r '.message // empty' <<<"$_api_body" 2>/dev/null)" >&2
+        return 1
+    fi
+    _next_container_created=1
+    while read -r net; do
+        [ -n "$net" ] || continue
+        body=$(jq -c --arg n "$net" --arg c "$_NEXT_CONTAINER" \
+            '{Container: $c, EndpointConfig: .Networks.extra[$n]}' <<<"$CONTAINER_SPEC")
+        if ! _docker_api POST "/networks/$net/connect" "$body"; then
+            echo "Error: could not connect the replacement container to network $net (HTTP $_api_status): $(jq -r '.message // empty' <<<"$_api_body" 2>/dev/null)" >&2
+            docker container rm "$_NEXT_CONTAINER" &> /dev/null
+            _next_container_created=0
+            return 1
+        fi
+    done < <(jq -r '.Networks.extra | keys[]' <<<"$CONTAINER_SPEC")
+}
+
+# 지금 컨테이너를 지운 뒤 호출한다: 임시 컨테이너에 원래 이름을 주고 시작한다.
+_start_next_container() {
+    if docker rename "$_NEXT_CONTAINER" "$CONTAINER_NAME"; then
+        _next_container_created=0
+    fi
+    if [ "$_next_container_created" -eq 1 ] || ! docker start "$CONTAINER_NAME" > /dev/null; then
+        echo "Error: could not start the replacement container. Check 'docker ps -a' for $CONTAINER_NAME or $_NEXT_CONTAINER." >&2
+        return 1
+    fi
+}
 
 send_discord_webhook() {
     if [ -z "$DISCORD_URL" ] || [ $# -ne 3 ]; then
@@ -3248,7 +3399,11 @@ if [ "$running_jobs" -gt 0 ]; then
 fi
 
 send_discord_webhook "NOTE" "Updating GitLab now!" "GitLab will be upgraded from $CURRENT_VERSION to ${UPGRADE_POINTS_ARRAY[-1]}"
-auto_restart_enabled=$(docker inspect --format='{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER_NAME")
+# docker update --restart 형식으로 담는다: on-failure의 재시도 횟수도 함께 되돌려야 한다.
+auto_restart_enabled=$(jq -r '.HostConfig.RestartPolicy | (.Name // "") as $n
+    | if $n == "" then "no"
+      elif $n == "on-failure" and (.MaximumRetryCount // 0) > 0 then "on-failure:\(.MaximumRetryCount)"
+      else $n end' <<<"$_container_json")
 
 # 0. 디스크 여유 공간 사전 검증
 check_disk_space
@@ -3462,8 +3617,7 @@ elif [ "$DETECTED_EDITION" != "$GITLAB_EDITION" ]; then
     _remove_previous_image "gitlab/gitlab-${DETECTED_EDITION}:$CURRENT_VERSION"
     echo ' done'
 
-    # shellcheck disable=SC2086
-    docker run -d --name "$CONTAINER_NAME" $LOG_ARGS $VOLUMES $PORTS "$_run_image"
+    _start_next_container
     RUNNING_IMAGE=$_run_image
 
     wait_for_http_ready "$GITLAB_IMAGE:$EDITION_SWITCH_TAG"
@@ -3505,7 +3659,7 @@ for ver in "${UPGRADE_POINTS_ARRAY[@]}"; do
     # 풀지 않는다.
     if [ "$_image_prep_failed" -eq 1 ] || ! _prepare_run_image "$GITLAB_IMAGE:$ver"; then
         _image_prep_failed=1
-        echo "Could not prepare the image before replacing $CNT_VERSION. Stopping upgrade loop. Running post-upgrade verification." >&2
+        echo "Could not prepare the replacement container before replacing $CNT_VERSION. Stopping upgrade loop. Running post-upgrade verification." >&2
         break
     fi
 
@@ -3560,8 +3714,7 @@ for ver in "${UPGRADE_POINTS_ARRAY[@]}"; do
         PULL_PID=
     fi
 
-    # shellcheck disable=SC2086
-    docker run -d --name "$CONTAINER_NAME" $LOG_ARGS $VOLUMES $PORTS "$_run_image"
+    _start_next_container
     RUNNING_IMAGE=$_run_image
 
     wait_for_http_ready "$GITLAB_IMAGE:$ver"
@@ -3606,11 +3759,21 @@ if [ ${#_deprecation_order[@]} -gt 0 ]; then
     send_discord_webhook "WARN" "Configuration deprecations detected" "$(_deprecation_discord_note)"
 fi
 
+# 교체한 컨테이너는 재시작 정책 no로 띄웠으므로(_CONTAINER_SPEC_JQ) 원래 정책으로 되돌린다. 사후 검증을
+# 통과한 컨테이너라 이미지 준비 실패·인터럽트로 끝나는 실행에서도 되돌린다 — 성공에서만 되돌리던 때는
+# 중단된 실행 뒤에 컨테이너가 재시작 정책 없이 남았다. FATAL로 critical zone 안에서 끝난 실행은 여기에
+# 오지 않으므로 no로 남는다: 고장 난 컨테이너를 재부팅 루프에 넣지 않는 것이 그 정책의 목적이다.
+_current_restart=$(docker inspect --format='{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER_NAME" 2>/dev/null)
+if [ "$auto_restart_enabled" != no ] && [ "$_current_restart" = no ]; then
+    echo "Restoring gitlab RestartPolicy to $auto_restart_enabled"
+    docker update --restart="$auto_restart_enabled" "$CONTAINER_NAME" &> /dev/null
+fi
+
 # 이미지 준비 실패는 교체 전에 멈춘 것이라 컨테이너는 CNT_VERSION 그대로다. 인터럽트보다
 # 먼저 본다: 둘 다 났다면 사용자가 고쳐야 하는 쪽은 pull이나 hook이다.
 if [ "$_image_prep_failed" -eq 1 ]; then
-    echo "Upgrade stopped: the image to run could not be prepared (pull or image hook, see above). $CONTAINER_NAME is still running $CNT_VERSION." >&2
-    send_discord_webhook "ERR" "Upgrade stopped: image not prepared" "Still running $CNT_VERSION. The pull or the image hook failed before the container swap; fix it, then re-run."
+    echo "Upgrade stopped: the replacement container could not be prepared (pull, image hook or container create, see above). $CONTAINER_NAME is still running $CNT_VERSION." >&2
+    send_discord_webhook "ERR" "Upgrade stopped: replacement not prepared" "Still running $CNT_VERSION. The pull, the image hook or the container create failed before the container swap; fix it, then re-run."
     exit 1
 fi
 
@@ -3621,7 +3784,7 @@ if [ "$_interrupted" -eq 1 ]; then
     exit 130
 fi
 
-if [ "$auto_restart_enabled" == "$(docker inspect --format='{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER_NAME")" ] && [ "$auto_restart_enabled" == 'no' ]; then
+if [ "$auto_restart_enabled" == 'no' ]; then
     if [ $auto_yes -eq 0 ]; then
         echo "Would you like to change RestartPolicy from $auto_restart_enabled to always?"
         echo 'AVAILABLE OPTIONS'
@@ -3641,9 +3804,6 @@ if [ "$auto_restart_enabled" == "$(docker inspect --format='{{.HostConfig.Restar
                 ;;
         esac
     fi
-elif [ "$auto_restart_enabled" != "$(docker inspect --format='{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER_NAME")" ]; then
-    echo "Updating gitlab RestartPolicy from $(docker inspect --format='{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER_NAME") to $auto_restart_enabled"
-    docker update --restart="$auto_restart_enabled" "$CONTAINER_NAME" &> /dev/null
 fi
 
 echo "Successfully updated GitLab server from $CURRENT_VERSION to ${UPGRADE_POINTS_ARRAY[-1]}"

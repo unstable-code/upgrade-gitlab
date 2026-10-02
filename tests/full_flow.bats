@@ -779,7 +779,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     [[ "$output" == *"not upgrading without a complete backup"* ]]
     [[ "$output" != *"Entering critical section"* ]]
     [[ "$output" == *"Resumed previously paused runners: 1,2"* ]]
-    [ ! -f "$MOCK_STATE_DIR/run_args" ]           # the container was never recreated
+    [ ! -f "$MOCK_STATE_DIR/api_create" ]        # the container was never recreated
     # the backup had already returned, so there is nothing inside the container to stop
     [ ! -f "$MOCK_STATE_DIR/backup_term_sent" ]
 }
@@ -992,9 +992,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     [ "$status" -eq 0 ]
     [[ "$output" == *"recreated with json-file"* ]]
     # db deadlocks dockerd when stop races an attached `docker logs --follow`, so it must not survive.
-    grep -q -- '--log-driver json-file' "$MOCK_STATE_DIR/run_args"
-    grep -q -- '--log-opt max-size=50m' "$MOCK_STATE_DIR/run_args"
-    ! grep -q -- '--log-driver db' "$MOCK_STATE_DIR/run_args"
+    jq -e '.HostConfig.LogConfig == {Type: "json-file", Config: {"max-size": "50m", "max-file": "3"}}' "$MOCK_STATE_DIR/api_create"
 }
 
 # ---------- Test 34: non-Synology log driver is preserved as-is ----------
@@ -1002,13 +1000,13 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_LOG_DRIVER=syslog
-    export MOCK_LOG_OPTS="--log-opt syslog-address=udp://1.2.3.4:514 "
+    export MOCK_LOG_OPTS='{"syslog-address":"udp://1.2.3.4:514"}'
 
     run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
     [ "$status" -eq 0 ]
     # Previously the recreate dropped log settings, silently reverting to the daemon default.
-    grep -q -- '--log-driver syslog' "$MOCK_STATE_DIR/run_args"
-    grep -q -- 'syslog-address=udp://1.2.3.4:514' "$MOCK_STATE_DIR/run_args"
+    jq -e '.HostConfig.LogConfig == {Type: "syslog", Config: {"syslog-address": "udp://1.2.3.4:514"}}' \
+        "$MOCK_STATE_DIR/api_create"
 }
 
 # ---------- Test 35: UPGRADE_GITLAB_LOG_DRIVER overrides the db replacement ----------
@@ -1020,8 +1018,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
 
     run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
     [ "$status" -eq 0 ]
-    grep -q -- '--log-driver db' "$MOCK_STATE_DIR/run_args"
-    ! grep -q -- '--log-driver json-file' "$MOCK_STATE_DIR/run_args"
+    jq -e '.HostConfig.LogConfig.Type == "db"' "$MOCK_STATE_DIR/api_create"
 }
 
 # ---------- Test 36: container stop uses a grace period long enough for GitLab ----------
@@ -1075,7 +1072,7 @@ HOOK
     new=$(cat "$MOCK_STATE_DIR/current_version")
     # The hook got the official base of the new version, and that is what the container runs.
     grep -qx "base=gitlab/gitlab-ce:$new edition=ce version=$new" "$MOCK_STATE_DIR/image_hook_calls"
-    tail -n1 "$MOCK_STATE_DIR/run_args" | grep -q " gitlab-ce-patched:$new$"
+    [ "$(tail -n1 "$MOCK_STATE_DIR/api_create" | jq -r .Image)" = "gitlab-ce-patched:$new" ]
     # Both the previous derived image and its official base are removed, in one call.
     grep -qx "gitlab-ce-patched:17.11.3-ce.0 gitlab/gitlab-ce:17.11.3-ce.0" "$MOCK_STATE_DIR/image_rm_args"
 }
@@ -1114,7 +1111,7 @@ HOOK
     [[ "$output" == *"patch does not apply"* ]]
     [[ "$output" == *"is still running 17.11.3-ce.0"* ]]
     [ ! -f "$MOCK_STATE_DIR/stop_args" ]
-    [ ! -f "$MOCK_STATE_DIR/run_args" ]
+    [ ! -f "$MOCK_STATE_DIR/api_create" ]
     [ "$(cat "$MOCK_STATE_DIR/current_version")" = "17.11.3-ce.0" ]
 }
 
@@ -1158,7 +1155,7 @@ HOOK
     [ "$status" -eq 0 ]
     [[ "$output" == *"Edition switch"* ]]
     grep -q "^base=gitlab/gitlab-ee:17.11.3-ee.0 edition=ee " "$MOCK_STATE_DIR/image_hook_calls"
-    head -n1 "$MOCK_STATE_DIR/run_args" | grep -q " gitlab-ee-patched:17.11.3-ee.0$"
+    [ "$(head -n1 "$MOCK_STATE_DIR/api_create" | jq -r .Image)" = "gitlab-ee-patched:17.11.3-ee.0" ]
 }
 
 @test "image prep: a failed pull stops before the old container is stopped" {
@@ -1169,5 +1166,129 @@ HOOK
     [[ "$output" == *"could not pull gitlab/gitlab-ce:"* ]]
     [[ "$output" == *"is still running 17.11.3-ce.0"* ]]
     [ ! -f "$MOCK_STATE_DIR/stop_args" ]
-    [ ! -f "$MOCK_STATE_DIR/run_args" ]
+    [ ! -f "$MOCK_STATE_DIR/api_create" ]
+}
+
+# ---------- Container recreate (#22): the whole configuration carries over ----------
+
+# A container as the official Docker docs set one up, plus a user network, an anonymous volume
+# and a legacy link: everything the per-flag `docker run` used to drop.
+_inspect_patch_full='
+  .Config.Env += ["GITLAB_OMNIBUS_CONFIG=external_url '"'"'http://gitlab.test'"'"'"]
+  | .Config.Labels += {"com.docker.compose.project": "gitlab"}
+  | .Config.Hostname = "gitlab.example.com"
+  | .HostConfig.ShmSize = 536870912
+  | .HostConfig.PortBindings["80/tcp"] = [{HostIp: "127.0.0.1", HostPort: "8080"}, {HostIp: "::1", HostPort: "8080"}]
+  | .HostConfig.NetworkMode = "proxy"
+  | .HostConfig.Links = ["/redis:/gitlab/cache"]
+  | .Mounts += [{Type: "volume", Name: "anonvol", Source: "/var/lib/docker/volumes/anonvol/_data", Destination: "/assets/extra", RW: true}]
+  | .NetworkSettings.Networks = {
+      proxy: {Aliases: ["0123456789ab", "gitlab", "git"], NetworkID: "proxyid", IPAMConfig: {IPv4Address: "172.20.0.10"}},
+      runners: {Aliases: ["0123456789ab"], NetworkID: "runnersid"}
+    }'
+
+@test "recreate: user settings carry over and image defaults are left to the new image" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_INSPECT_PATCH="$_inspect_patch_full"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    body=$(tail -n1 "$MOCK_STATE_DIR/api_create")
+    # Only what the user added; PATH/LANG from the old image would pin it onto the new one.
+    jq -e '.Env == ["GITLAB_OMNIBUS_CONFIG=external_url '"'"'http://gitlab.test'"'"'"]' <<<"$body"
+    jq -e '.Labels == {"com.docker.compose.project": "gitlab"}' <<<"$body"
+    jq -e '.Hostname == "gitlab.example.com"' <<<"$body"
+    jq -e 'has("Cmd") or has("Healthcheck") or has("Volumes") | not' <<<"$body"
+    jq -e '.Image == "gitlab/gitlab-ce:'"$(cat "$MOCK_STATE_DIR/current_version")"'"' <<<"$body"
+    # Bind IPs and every binding of a port.
+    jq -e '.HostConfig.PortBindings["80/tcp"] == [{HostIp: "127.0.0.1", HostPort: "8080"}, {HostIp: "::1", HostPort: "8080"}]' <<<"$body"
+    jq -e '.HostConfig.ShmSize == 536870912' <<<"$body"   # larger than 256MB: kept
+    # The anonymous volume is reattached by name instead of being recreated empty.
+    jq -e '.HostConfig.Binds | index("anonvol:/assets/extra") != null' <<<"$body"
+    jq -e '.HostConfig.Binds | length == 4' <<<"$body"
+    jq -e '.HostConfig.Links == ["redis:cache"]' <<<"$body"
+    # The NetworkMode network at create, without the aliases Docker added itself.
+    jq -e '.NetworkingConfig.EndpointsConfig | keys == ["proxy"]' <<<"$body"
+    jq -e '.NetworkingConfig.EndpointsConfig.proxy.Aliases == ["git"]' <<<"$body"
+    jq -e '.NetworkingConfig.EndpointsConfig.proxy.IPAMConfig.IPv4Address == "172.20.0.10"' <<<"$body"
+    # The other network is connected before start (API < 1.44 takes one network at create).
+    connect=$(tail -n1 "$MOCK_STATE_DIR/api_connect")
+    jq -e '.url | endswith("/v1.43/networks/runners/connect")' <<<"$connect"
+    jq -e '.Container == "gitlab-upgrade-next" and .EndpointConfig.Aliases == null' <<<"$connect"
+    grep -qx "rename gitlab-upgrade-next gitlab" "$MOCK_STATE_DIR/rename_args"
+}
+
+@test "recreate: a 64MB /dev/shm is raised to 256MB" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_INSPECT_PATCH='.HostConfig.ShmSize = 67108864'
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"runs with a 64MB /dev/shm"*"recreated with 256MB"* ]]
+    jq -e '.HostConfig.ShmSize == 268435456' "$MOCK_STATE_DIR/api_create"
+}
+
+@test "recreate: a derived image's base label stays with the image" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_DERIVED_IMAGE=1
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    _write_image_hook ok
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    # Copied onto the container, the old base would outlive the new image's own label.
+    jq -e '.Labels == {}' "$MOCK_STATE_DIR/api_create"
+}
+
+@test "recreate: a rejected create stops before the old container is stopped" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_CREATE_FAIL=1
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"could not create the replacement container (HTTP 400): mock create rejected"* ]]
+    [[ "$output" == *"is still running 17.11.3-ce.0"* ]]
+    [ ! -f "$MOCK_STATE_DIR/stop_args" ]
+    [ "$(cat "$MOCK_STATE_DIR/current_version")" = "17.11.3-ce.0" ]
+}
+
+@test "recreate: a non-unix Docker endpoint is refused before anything runs" {
+    export MOCK_DOCKER_ENDPOINT="ssh://admin@nas"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"'ssh://admin@nas' is not a unix socket"* ]]
+    [ ! -f "$MOCK_STATE_DIR/backup_args" ]
+}
+
+@test "recreate: an unreachable Engine API is refused before anything runs" {
+    export MOCK_API_UNREACHABLE=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"cannot call the Docker Engine API on /var/run/docker.sock (API version: 1.43)"* ]]
+    [ ! -f "$MOCK_STATE_DIR/backup_args" ]
+}
+
+@test "recreate: the swap runs with restart policy no and the original is restored afterwards" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_INSPECT_PATCH='.HostConfig.RestartPolicy = {Name: "on-failure", MaximumRetryCount: 3}'
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 0 ]
+    # A new version that dies in reconfigure must not be rebooted in a loop.
+    jq -e '.HostConfig.RestartPolicy == {Name: "no", MaximumRetryCount: 0}' "$MOCK_STATE_DIR/api_create"
+    # Restored once verification passed, retry count included.
+    grep -qx "update --restart=on-failure:3 gitlab" "$MOCK_STATE_DIR/update_args"
+    [[ "$output" == *"Restoring gitlab RestartPolicy to on-failure:3"* ]]
+}
+
+@test "recreate: an interrupted run still restores the restart policy" {
+    # 3-hop path; the signal arrives once the first replacement exists, so the loop stops at
+    # the next checkpoint with the hop-1 container (created with no) up and verified.
+    export MOCK_GITLAB_VERSION="17.3.7-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    bash "$PROJECT_ROOT/upgrade-gitlab" -y --no-step-limit --target-url=http://mock > "$MOCK_STATE_DIR/out.log" 2>&1 &
+    pid=$!
+    wait_for_marker "$MOCK_STATE_DIR/api_create"
+    kill -TERM "$pid"   # SIGINT is ignored by background jobs; _handle_signal traps both
+    status=0
+    wait "$pid" || status=$?
+    [ "$status" -eq 130 ]
+    grep -qx "update --restart=unless-stopped gitlab" "$MOCK_STATE_DIR/update_args"
 }
