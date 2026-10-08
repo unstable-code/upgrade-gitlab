@@ -293,9 +293,10 @@ _resume_paused_runners() {
     fi
 }
 
-# _run_isolated <stderr 파일> <명령...> — 명령을 별도 프로세스 그룹에서 돌려 stdout을 전역 _exec_out에 담는다.
+# _run_isolated <명령...> — 명령을 별도 프로세스 그룹에서 돌려 stdout은 전역 _exec_out에, stderr는
+# 전역 _exec_err에 담는다.
 # 터미널 Ctrl+C는 포그라운드 프로세스 그룹 전체에 간다. 결과가 필요한 부작용 있는 명령이 그때
-# 함께 죽으면 스크립트는 결과를 잃는다(아래 _exec_isolated, 이미지 hook 빌드).
+# 함께 죽으면 스크립트는 결과를 잃는다(아래 _exec_isolated, 이미지 hook 빌드, Engine API 호출).
 #  - set -m으로 별도 프로세스 그룹에 띄워 Ctrl+C가 닿지 않게 하고
 #    (setsid는 DSM에 있다는 보장이 없어 순수 bash로 한다)
 #  - 그동안은 critical zone처럼 시그널을 미뤄(_interrupted만 세움) 결과를 끝까지 회수한다.
@@ -304,23 +305,33 @@ _resume_paused_runners() {
 #    끝내 버린다.
 # 미룬 시그널의 처리는 호출부 몫이다. $(...) 안에서 부르면 서브셸에서 트랩이 기본값으로
 # 돌아가 미루기가 무력해지므로, 결과는 명령 치환이 아니라 전역으로 넘긴다.
+# stderr도 경로를 받지 않고 항상 여기서 받는다: 호출부가 /dev/stderr를 넘기면, 스크립트의 stderr가
+# 파일(`> log 2>&1`)일 때 그 파일이 O_TRUNC로 다시 열려 그때까지의 로그가 지워졌다. 보여 줄지는
+# 호출부가 _exec_err로 정한다.
 _exec_out=""
+_exec_err=""
 _run_isolated() {
-    local err=$1 tmp pid rc prev_trap=$_trap_active
-    shift
-    tmp=$(mktemp)
-    _TMPFILES+=("$tmp")
+    local out err pid rc prev_trap=$_trap_active
+    out=$(mktemp)
+    err=$(mktemp)
+    _TMPFILES+=("$out" "$err")
     _trap_active=1
     set -m
-    "$@" > "$tmp" 2> "$err" < /dev/null &
+    "$@" > "$out" 2> "$err" < /dev/null &
     pid=$!
     set +m
     _wait_reap "$pid"
     rc=$?
     _trap_active=$prev_trap
-    _exec_out=$(<"$tmp")
-    rm -f "$tmp"
+    _exec_out=$(<"$out")
+    _exec_err=$(<"$err")
+    rm -f "$out" "$err"
     return "$rc"
+}
+
+# _print_exec_err_tail — 실패한 _run_isolated 호출의 stderr 끝부분을 들여 써서 보여 준다.
+_print_exec_err_tail() {
+    [ -n "$_exec_err" ] && tail -n 20 <<< "$_exec_err" | sed 's/^/  /' >&2
 }
 
 # _exec_isolated <docker exec 인자...> — 컨테이너에서 명령을 실행해 stdout을 전역 _exec_out에 담는다.
@@ -329,7 +340,7 @@ _run_isolated() {
 # 고아 runner가 상태 파일 없이(=아무도 끄지 않는 채) 켜 버리고, 백업 생존 확인이라면 빈 출력을
 # "이미 끝났다"로 오판한다. 결과가 필요한 부작용 있는 호출은 이 함수를 거친다.
 _exec_isolated() {
-    _run_isolated /dev/null docker exec "$CONTAINER_NAME" "$@"
+    _run_isolated docker exec "$CONTAINER_NAME" "$@"
 }
 
 # _rails_runner <ruby> — gitlab-rails runner 한 번(부팅 5분 내외). 결과는 _exec_out.
@@ -417,11 +428,9 @@ _prepare_run_image() {
 
 # _build_hook_image <공식 이미지> — 이미지 hook으로 파생 이미지를 만들어 _run_image에 담는다.
 _build_hook_image() {
-    local base=$1 log rc
-    log=$(mktemp)
-    _TMPFILES+=("$log")
+    local base=$1 rc
     echo "Building image for $base via hook: $image_hook"
-    _run_isolated "$log" env \
+    _run_isolated env \
         UPGRADE_GITLAB_BASE_IMAGE="$base" \
         UPGRADE_GITLAB_VERSION="${base##*:}" \
         UPGRADE_GITLAB_EDITION="$GITLAB_EDITION" \
@@ -432,7 +441,7 @@ _build_hook_image() {
     _run_image=${_exec_out##*$'\n'}
     if [ "$rc" -ne 0 ] || [ -z "$_run_image" ]; then
         echo "Error: image hook failed for $base (exit $rc). Last lines of its output:" >&2
-        tail -n 20 "$log" | sed 's/^/  /' >&2
+        _print_exec_err_tail
         return 1
     fi
     if ! _official_image_of "$_run_image" || [ "$_derived" -ne 1 ] || [ "$_official_image" != "$base" ]; then
@@ -1185,9 +1194,11 @@ fi
 # _docker_api METHOD PATH BODY: Engine API 호출. 응답 본문은 _api_body, HTTP 상태는 _api_status.
 # 부작용이 있는 호출이라 _run_isolated로 돌린다: critical zone에서 Ctrl+C가 curl만 죽이면 인터럽트가
 # create 실패로 보고되고, dockerd가 이미 만든 교체용 컨테이너는 아무도 모른 채 남는다.
+# curl의 오류(연결 실패 등)는 호출이 끝난 뒤 그대로 옮긴다.
 _docker_api() {
-    _run_isolated /dev/stderr curl -sS -w '\n%{http_code}' --unix-socket "$DOCKER_SOCK" -X "$1" \
+    _run_isolated curl -sS -w '\n%{http_code}' --unix-socket "$DOCKER_SOCK" -X "$1" \
         -H 'Content-Type: application/json' --data-binary "$3" "http://localhost/v${DOCKER_API_VERSION}$2"
+    [ -z "$_exec_err" ] || printf '%s\n' "$_exec_err" >&2
     _api_status=${_exec_out##*$'\n'}
     _api_body=${_exec_out%$'\n'*}
     [[ $_api_status == 2[0-9][0-9] ]]

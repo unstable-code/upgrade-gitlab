@@ -1349,3 +1349,19 @@ _inspect_patch_full='
     [[ "$output" == *"FATAL ERROR: MANUAL INTERVENTION IS REQUIRED"* ]]
     [[ "$output" != *"waiting until"*"server boots"* ]]
 }
+
+@test "recreate: a run logging to a file keeps the whole log" {
+    # The Engine API call once sent curl's stderr to /dev/stderr. With the script's stderr on a
+    # regular file (`> log 2>&1`, as under cron), that reopened the file with O_TRUNC and erased
+    # everything logged before the container was created. `run` captures through a pipe, so the
+    # script is redirected to a file here instead.
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    status=0
+    timeout -s KILL 120 bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock \
+        > "$MOCK_STATE_DIR/run.log" 2>&1 || status=$?
+    [ "$status" -eq 0 ]
+    [ -f "$MOCK_STATE_DIR/api_create" ]                       # the API was called
+    grep -q "Detected gitlab container" "$MOCK_STATE_DIR/run.log"   # logged before that call
+    grep -q "Successfully updated" "$MOCK_STATE_DIR/run.log"
+}
