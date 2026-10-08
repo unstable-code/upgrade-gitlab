@@ -366,6 +366,7 @@ teardown() {
     echo "version=\$UPGRADE_GITLAB_VERSION"
     echo "container=\$UPGRADE_GITLAB_CONTAINER"
     echo "backup_dir=\$UPGRADE_GITLAB_BACKUP_DIR"
+    echo "config_archive=\$UPGRADE_GITLAB_CONFIG_ARCHIVE"
 } > "$HOOK_OUT"
 HOOK
     chmod +x "$HOOK_DIR/hook.sh"
@@ -379,6 +380,8 @@ HOOK
     grep -q "^container=gitlab" "$HOOK_OUT"
     # Hook receives the container-side BACKUP_DIR (use `docker cp` from there).
     grep -q "^backup_dir=/var/opt/gitlab/backups$" "$HOOK_OUT"
+    # ...and the container-side path of the whole /etc/gitlab archive (#26).
+    grep -qx "config_archive=/etc/gitlab/config_backup/gitlab_config_1700000000_2026_01_01.tar" "$HOOK_OUT"
 
     rm -rf "$HOOK_DIR"
     unset UPGRADE_GITLAB_CONFIG_HOOK
@@ -797,6 +800,21 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     [ ! -f "$MOCK_STATE_DIR/api_create" ]        # the container was never recreated
     # the backup had already returned, so there is nothing inside the container to stop
     [ ! -f "$MOCK_STATE_DIR/backup_term_sent" ]
+}
+
+@test "full-flow: a failed /etc/gitlab archive aborts the upgrade and releases holds" {
+    # Without gitlab-secrets.json and the keys in /etc/gitlab, the app backup cannot be restored (#26).
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_RUNNER_COUNT=2
+    export MOCK_CONFIG_BACKUP_FAIL=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"configuration backup of /etc/gitlab failed"* ]]
+    [[ "$output" == *"No space left on device"* ]]        # the command's own output is shown
+    [[ "$output" != *"Entering critical section"* ]]
+    [[ "$output" == *"Resumed previously paused runners: 1,2"* ]]
+    [ ! -f "$MOCK_STATE_DIR/api_create" ]                # the container was never recreated
 }
 
 # ---------- Test 31d: non-signal abort before the critical zone resumes paused runners ----------

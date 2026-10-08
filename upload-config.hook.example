@@ -11,21 +11,38 @@
 #     export UPGRADE_GITLAB_CONFIG_HOOK=/absolute/path/to/upload-config.hook
 #
 # Receives via environment:
-#   UPGRADE_GITLAB_BACKUP_DIR — container-side path to GitLab's backup
-#                               directory (e.g. "/var/opt/gitlab/backups")
-#   UPGRADE_GITLAB_VERSION    — version tag of the just-created snapshots
-#                               (e.g. "18.10.4-ee.0")
-#   UPGRADE_GITLAB_CONTAINER  — container name
-#   UPGRADE_GITLAB_SCRIPT_DIR — directory holding the upgrade-gitlab script
-#                               (handy for sibling files like rclone.conf)
+#   UPGRADE_GITLAB_CONFIG_ARCHIVE — container-side path to the archive of the
+#                                   whole /etc/gitlab volume, made by
+#                                   `gitlab-ctl backup-etc` (e.g.
+#                                   "/etc/gitlab/config_backup/gitlab_config_1791452138_2026_10_08.tar")
+#   UPGRADE_GITLAB_BACKUP_DIR     — container-side path to GitLab's backup
+#                                   directory (e.g. "/var/opt/gitlab/backups")
+#   UPGRADE_GITLAB_VERSION        — version tag of the just-created snapshots
+#                                   (e.g. "18.10.4-ee.0")
+#   UPGRADE_GITLAB_CONTAINER      — container name
+#   UPGRADE_GITLAB_SCRIPT_DIR     — directory holding the upgrade-gitlab script
+#                                   (handy for sibling files like rclone.conf)
 #
-# The two files inside the container at hook time:
-#   $UPGRADE_GITLAB_BACKUP_DIR/gitlab.rb.${UPGRADE_GITLAB_VERSION}-backup
-#   $UPGRADE_GITLAB_BACKUP_DIR/gitlab-secrets.json.${UPGRADE_GITLAB_VERSION}-backup
+# The archive holds everything GitLab's own backup leaves out of /etc/gitlab:
+# gitlab.rb, gitlab-secrets.json, the SSH host keys, TLS keys and
+# certificates, the Gitaly commit signing key, the license file. It contains
+# private keys and secrets (mode 600 inside the container), so keep the
+# upload target private, and apart from the application backup: an encrypted
+# database and its key should not live in the same place.
 #
-# This template uses `docker cp` to extract them so the hook works
+# Hooks copied from an earlier version of this template `docker cp` two files,
+# $UPGRADE_GITLAB_BACKUP_DIR/gitlab.rb.<version>-backup and
+# $UPGRADE_GITLAB_BACKUP_DIR/gitlab-secrets.json.<version>-backup. Those copies
+# are no longer made (both files are inside the archive), so such a hook fails
+# and nothing is uploaded. Replace its extract-and-tar part with the
+# `docker cp` of the archive below; the upload section can stay as it is.
+#
+# This template uses `docker cp` to extract the archive so the hook works
 # regardless of how the container's volumes are mounted on the host
 # (bind mount, named volume, tmpfs, Docker Desktop VM, etc.).
+#
+# To restore: extract it at the root of a new container's /etc/gitlab volume
+# (`tar -xf gitlab_config_*.tar -C /`, the member names start with etc/gitlab/).
 #
 # Uncomment ONE of the upload sections below and fill in credentials
 # / bucket names. The first four backends mirror what GitLab itself
@@ -33,8 +50,8 @@
 # Swift); the fifth (Google Drive via rclone) is provided for personal /
 # Workspace deployments.
 #
-# If no section is uncommented, this hook is a silent no-op — the tar
-# archive is created in a tempdir and discarded on exit. You will see
+# If no section is uncommented, this hook is a silent no-op — the
+# archive is copied into a tempdir and discarded on exit. You will see
 # nothing in your target storage; check the docker run output of the
 # uncommented section to confirm uploads.
 #
@@ -54,26 +71,17 @@
 
 set -euo pipefail
 
-: "${UPGRADE_GITLAB_BACKUP_DIR:?required}"
+: "${UPGRADE_GITLAB_CONFIG_ARCHIVE:?required}"
 : "${UPGRADE_GITLAB_VERSION:?required}"
 : "${UPGRADE_GITLAB_CONTAINER:?required}"
 
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-# Extract the just-created snapshots from the container
-docker cp \
-    "${UPGRADE_GITLAB_CONTAINER}:${UPGRADE_GITLAB_BACKUP_DIR}/gitlab.rb.${UPGRADE_GITLAB_VERSION}-backup" \
-    "$WORK_DIR/"
-docker cp \
-    "${UPGRADE_GITLAB_CONTAINER}:${UPGRADE_GITLAB_BACKUP_DIR}/gitlab-secrets.json.${UPGRADE_GITLAB_VERSION}-backup" \
-    "$WORK_DIR/"
-
-ARCHIVE_NAME="gitlab-config-${UPGRADE_GITLAB_VERSION}-$(date +%Y-%m-%d).tar.gz"
-ARCHIVE_PATH="${WORK_DIR}/${ARCHIVE_NAME}"
-tar -czf "$ARCHIVE_PATH" -C "$WORK_DIR" \
-    "gitlab.rb.${UPGRADE_GITLAB_VERSION}-backup" \
-    "gitlab-secrets.json.${UPGRADE_GITLAB_VERSION}-backup"
+# Extract the /etc/gitlab archive from the container, named after the version
+# so uploads from different upgrades are easy to tell apart.
+ARCHIVE_NAME="gitlab-config-${UPGRADE_GITLAB_VERSION}-$(basename "$UPGRADE_GITLAB_CONFIG_ARCHIVE")"
+docker cp "${UPGRADE_GITLAB_CONTAINER}:${UPGRADE_GITLAB_CONFIG_ARCHIVE}" "${WORK_DIR}/${ARCHIVE_NAME}"
 
 # ---------------------------------------------------------------------------
 # AWS S3 (or any S3-compatible: MinIO, Cloudflare R2, Backblaze B2, ...)

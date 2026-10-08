@@ -754,7 +754,7 @@ if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
     echo -e '\n\e[0;1mENV VALUES\e[m'
     echo -e "TARGET_URL=http\t\tSame as --target-url flag."
     echo -e "DISCORD_URL=http\tSame as --discord-url flag."
-    echo -e "UPGRADE_GITLAB_CONFIG_HOOK=PATH\tExecutable run after gitlab.rb / gitlab-secrets.json copies are created and pruned. If unset, an executable file named 'upload-config.hook' next to this script is auto-detected. Receives env vars UPGRADE_GITLAB_BACKUP_DIR (container-side path; use 'docker cp' to extract), UPGRADE_GITLAB_VERSION, UPGRADE_GITLAB_CONTAINER, UPGRADE_GITLAB_SCRIPT_DIR. Hook failure logs a warning but does not abort the upgrade. See upload-config.hook.example."
+    echo -e "UPGRADE_GITLAB_CONFIG_HOOK=PATH\tExecutable run after the /etc/gitlab archive is created and old config backups are pruned. If unset, an executable file named 'upload-config.hook' next to this script is auto-detected. Receives env vars UPGRADE_GITLAB_CONFIG_ARCHIVE and UPGRADE_GITLAB_BACKUP_DIR (container-side paths; use 'docker cp' to extract), UPGRADE_GITLAB_VERSION, UPGRADE_GITLAB_CONTAINER, UPGRADE_GITLAB_SCRIPT_DIR. Hook failure logs a warning but does not abort the upgrade. See upload-config.hook.example."
     echo -e "UPGRADE_GITLAB_IMAGE_HOOK=PATH\tExecutable that builds the image to run for each hop, for instances running an official image plus local patches. If unset, an executable file named 'build-image.hook' next to this script is auto-detected. Receives UPGRADE_GITLAB_BASE_IMAGE (e.g. gitlab/gitlab-ee:19.4.1-ee.0), UPGRADE_GITLAB_VERSION, UPGRADE_GITLAB_EDITION, UPGRADE_GITLAB_CONTAINER, UPGRADE_GITLAB_SCRIPT_DIR; must print the image to run as the last stdout line, and that image must carry the label ${_BASE_LABEL}=<base image>. See build-image.hook.example. It runs before the old container is stopped, and a failure stops the upgrade with the current version still running. A container running such a derived image without a hook would drop its patches: interactive runs ask (y/N), -y refuses."
     echo -e "UPGRADE_GITLAB_LOG_DRIVER=NAME\tLog driver for the recreated container. By default the current container's driver and options are preserved, except Synology ContainerManager's 'db' driver which is replaced with json-file (max-size=50m, max-file=3) because it deadlocks dockerd when a container is stopped while 'docker logs --follow' is attached. Set to 'db' to keep it anyway."
     exit 0
@@ -3610,22 +3610,61 @@ fi
 BACKUP_DIR=$(docker exec "$CONTAINER_NAME" grep "'backup_path'" /etc/gitlab/gitlab.rb 2>/dev/null | awk -F"=" '{ print $2 }' | sed 's/\"//g' | sed 's/^ //')
 if [ -z "$BACKUP_DIR" ]; then
     # gitlab.rb에 backup_path 줄이 없으면 빈 값을 그대로 쓰지 않고 GitLab 기본 경로로 폴백한다
-    # (빈 값이면 cp 대상이 컨테이너 루트가 되고 hook에도 빈 경로가 전달됨).
+    # (빈 값이면 hook에 빈 경로가 전달되고, 옛 사본 정리가 엉뚱한 곳을 본다).
     BACKUP_DIR="/var/opt/gitlab/backups"
-    echo "Note: backup_path not found in gitlab.rb; using GitLab default $BACKUP_DIR for config snapshots."
+    echo "Note: backup_path not found in gitlab.rb; using GitLab default $BACKUP_DIR."
 fi
-docker exec "$CONTAINER_NAME" sh -c "cp /etc/gitlab/gitlab-secrets.json $BACKUP_DIR/gitlab-secrets.json.${CURRENT_VERSION}-backup"
-docker exec "$CONTAINER_NAME" sh -c "cp /etc/gitlab/gitlab.rb $BACKUP_DIR/gitlab.rb.${CURRENT_VERSION}-backup"
+
+# 설정 볼륨 전체 백업(#26). 앱 백업은 /etc/gitlab을 일부러 빼는데, 거기에는 gitlab.rb와
+# gitlab-secrets.json 말고도 SSH 호스트 키, TLS 키·인증서, Gitaly 커밋 서명 키, 라이선스가 있다.
+# 파일을 골라 담던 방식은 새로 추가된 서명 키를 놓쳤으므로 볼륨을 통째로 담는다. 두 파일을
+# BACKUP_DIR에 따로 복사하던 사본은 없앴다: 아카이브와 중복이고, 앱 백업 tar 옆에 복호화 키를 두어
+# 아래의 분리를 무너뜨렸다.
+# gitlab-ctl backup-etc가 아카이브 권한(600)과 디렉터리(700, /etc/gitlab/config_backup)를 맡는다.
+# 그 위치는 앱 백업과 다른 볼륨이다: 암호화된 DB와 그 키를 한곳에 두지 말라는 공식 권고와 맞는다.
+# backup-etc가 없는 옛 버전에서는 같은 이름·형식의 tar로 대신한다.
+# 실패하면 중단한다: gitlab-secrets.json이 없으면 앱 백업을 복원할 수 없으니, 앱 백업이 실패한
+# 경우와 같은 판단이다. 아카이브 경로는 backup-etc의 출력 문구가 아니라 만들어진 파일에서 얻는다
+# (버전마다 문구가 같다는 보장이 없다). 명령의 출력은 실패했을 때 보여 주도록 stderr로 모은다.
+# shellcheck disable=SC2016
+_CONFIG_BACKUP_SH='d=/etc/gitlab/config_backup
+if gitlab-ctl backup-etc >&2; then
+    f=$(ls -t "$d"/gitlab_config_*.tar 2>/dev/null | head -n1)
+else
+    echo "gitlab-ctl backup-etc failed or is unavailable; archiving /etc/gitlab with tar instead" >&2
+    f=$d/gitlab_config_$(date +%s_%Y_%m_%d).tar
+    umask 077
+    mkdir -p "$d" && tar --absolute-names --dereference -cf "$f" --exclude "$d" -- /etc/gitlab >&2 || exit 1
+fi
+[ -s "$f" ] && echo "$f"'
+_exec_isolated sh -c "$_CONFIG_BACKUP_SH"
+_config_backup_rc=$?
+CONFIG_ARCHIVE=${_exec_out##*$'\n'}
+if [ "$_interrupted" -eq 1 ]; then
+    echo "Interrupted during the configuration backup; releasing runners and maintenance mode." >&2
+    _handle_signal    # critical zone 밖이므로 EXIT 트랩이 hold를 푼다
+fi
+if [ "$_config_backup_rc" -ne 0 ] || [ -z "$CONFIG_ARCHIVE" ]; then
+    echo "Error: configuration backup of /etc/gitlab failed (exit code $_config_backup_rc). Last lines of its output:" >&2
+    _print_exec_err_tail
+    echo "Aborted: without gitlab-secrets.json and the keys in /etc/gitlab, the backup cannot be restored." >&2
+    send_discord_webhook "ERR" "Configuration backup failed" "Upgrade aborted: /etc/gitlab of $CURRENT_VERSION could not be archived"
+    exit 1
+fi
+echo "Configuration backup archive: $CONFIG_ARCHIVE"
 
 # config backup 정리: gitlab.rb의 backup_keep_time(초) 기준으로 오래된 파일 삭제.
 # GitLab 본체 *.tar 백업과 동일한 retention 정책. 0/미설정이면 영구 보관.
+# backup-etc도 같은 값으로 아카이브를 정리하지만, tar로 대신한 경우를 위해 여기서도 함께 본다.
+# BACKUP_DIR의 gitlab.rb·gitlab-secrets.json 사본은 더 만들지 않지만, 예전 실행이 남긴 것이 같은 기준으로
+# 사라지도록 이름 패턴은 남겨 둔다.
 backup_keep_time=$(docker exec "$CONTAINER_NAME" grep "'backup_keep_time'" /etc/gitlab/gitlab.rb 2>/dev/null \
     | awk -F"=" '{print $2}' | sed 's/\"//g' | sed 's/^ //')
 if [[ "$backup_keep_time" =~ ^[0-9]+$ ]] && [ "$backup_keep_time" -gt 0 ]; then
     keep_minutes=$((backup_keep_time / 60))
     if [ "$keep_minutes" -gt 0 ]; then
         docker exec "$CONTAINER_NAME" sh -c \
-            "find '$BACKUP_DIR' -maxdepth 1 -type f \( -name 'gitlab.rb.*-backup' -o -name 'gitlab-secrets.json.*-backup' \) -mmin +$keep_minutes -delete 2>/dev/null" || true
+            "find '$BACKUP_DIR' '${CONFIG_ARCHIVE%/*}' -maxdepth 1 -type f \( -name 'gitlab.rb.*-backup' -o -name 'gitlab-secrets.json.*-backup' -o -name 'gitlab_config_*.tar' \) -mmin +$keep_minutes -delete 2>/dev/null" || true
         echo "Pruned config backups older than ${backup_keep_time}s (backup_keep_time)"
     fi
 fi
@@ -3639,6 +3678,7 @@ if _find_hook "$config_backup_hook" UPGRADE_GITLAB_CONFIG_HOOK upload-config.hoo
     config_backup_hook=$_hook_path
     echo "Running post-config-backup hook: $config_backup_hook"
     if ! UPGRADE_GITLAB_BACKUP_DIR="$BACKUP_DIR" \
+         UPGRADE_GITLAB_CONFIG_ARCHIVE="$CONFIG_ARCHIVE" \
          UPGRADE_GITLAB_VERSION="$CURRENT_VERSION" \
          UPGRADE_GITLAB_CONTAINER="$CONTAINER_NAME" \
          UPGRADE_GITLAB_SCRIPT_DIR="$SCRIPT_DIR" \

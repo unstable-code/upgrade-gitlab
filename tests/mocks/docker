@@ -173,6 +173,16 @@ case "$args" in
     *"exec"*"dpkg -l"*)
         echo "ii  gitlab-${MOCK_EDITION}  ${MOCK_GITLAB_VERSION}  amd64  GitLab ${MOCK_EDITION^^}"
         ;;
+    *"exec"*"gitlab-ctl backup-etc"*)
+        # Configuration volume archive (#26). Placed before the generic "sh -c" and "-t" cases:
+        # the snippet carries `ls -t`. MOCK_CONFIG_BACKUP_FAIL=1: both backup-etc and the tar
+        # fallback fail.
+        if [ "${MOCK_CONFIG_BACKUP_FAIL:-0}" -eq 1 ]; then
+            echo "tar: /etc/gitlab/config_backup: No space left on device" >&2
+            exit 1
+        fi
+        echo "/etc/gitlab/config_backup/gitlab_config_1700000000_2026_01_01.tar"
+        ;;
     # In-container backup liveness/stop for the cancel path. Placed early: "pgrep" contains
     # "grep", which the gitlab.rb grep patterns below would otherwise catch.
     *"exec"*"kill -TERM"*)
