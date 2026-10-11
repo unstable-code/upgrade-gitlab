@@ -36,6 +36,14 @@ _mock_crash_before() {
     [ "$c" -le "$threshold" ]
 }
 
+# _mock_hold <name> <seconds>: when <seconds> is set, write the <name>_held marker and sleep, so a
+# test can signal the script at that point (#31). Requires MOCK_STATE_DIR.
+_mock_hold() {
+    [ -n "$2" ] && [ -n "$MOCK_STATE_DIR" ] || return 1
+    : > "$MOCK_STATE_DIR/$1_held"
+    sleep "$2"
+}
+
 # _mock_running_jobs_now: sets and prints _n, the number of CI jobs "running" right now.
 # Every running-jobs query (count or listing) advances one shared counter, so the jobs
 # finish after MOCK_RUNNING_JOBS_FINISH_AFTER queries; unset = they never finish.
@@ -175,6 +183,9 @@ case "$args" in
         ;;
     # MOCK_RUNNING=false: the container has stopped (with MOCK_EXIT_CODE, default 0).
     *"inspect"*"State.Running"*)
+        # MOCK_RUNNING_SLEEP: hold the death check of the readiness wait after the swap, once.
+        [ -f "$MOCK_STATE_DIR/rename_args" ] && [ ! -f "$MOCK_STATE_DIR/running_held" ] \
+            && _mock_hold running "${MOCK_RUNNING_SLEEP:-}"
         echo "${MOCK_RUNNING:-true} ${MOCK_EXIT_CODE:-0}"
         ;;
     *"inspect"*"ExitCode"*)
@@ -453,6 +464,9 @@ case "$args" in
                 exit 1
             fi
         fi
+        # MOCK_SECRETS_SLEEP: hold the post-upgrade check (after the swap's rename) with a marker,
+        # so a test can signal a run_with_bouncing_bar called inside $(...) (#31).
+        [ -f "$MOCK_STATE_DIR/rename_args" ] && _mock_hold secrets "${MOCK_SECRETS_SLEEP:-}"
         # Real GitLab behavior: doctor:secrets logs failures but ALWAYS exits 0 + prints "Done!".
         # Integrity is judged from the "Total: N row(s) affected" line, not the exit code.
         case "${MOCK_SECRETS:-ok}" in
@@ -530,6 +544,7 @@ case "$args" in
         exit 0
         ;;
     "start "*)
+        _mock_hold start "${MOCK_START_SLEEP:-}"
         # Starting clears the stopped marker so later `docker ps` shows it running.
         [ -n "$MOCK_STATE_DIR" ] && rm -f "$MOCK_STATE_DIR/stopped"
         exit 0
@@ -538,6 +553,8 @@ case "$args" in
         # Record `docker stop` invocations so tests can assert on the grace period.
         if [ -n "$MOCK_STATE_DIR" ]; then
             printf '%s\n' "$args" >> "$MOCK_STATE_DIR/stop_args"
+            # stop_done marks a held client that was not killed while it waited.
+            _mock_hold stop "${MOCK_STOP_SLEEP:-}" && : > "$MOCK_STATE_DIR/stop_done"
         fi
         exit 0
         ;;

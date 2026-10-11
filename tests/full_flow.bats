@@ -1059,19 +1059,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_RUNNER_COUNT=2
     export MOCK_MAINTENANCE=enabled
     export MOCK_RAILS_SLEEP=3                     # hold inside the enable boot
-
-    set -m                                        # own process group: pgid == pid
-    bash "$PROJECT_ROOT/upgrade-gitlab" -y > "$MOCK_STATE_DIR/out.log" 2>&1 &
-    pid=$!
-    set +m
-    wait_for_marker "$MOCK_STATE_DIR/maintenance_probe"   # sanity: the enable is in flight
-
-    # Signal the whole group, as a terminal does. SIGTERM stands in for SIGINT for the
-    # reason given in the SIGINT-during-backup test; _handle_signal traps both.
-    kill -TERM -- "-$pid"
-    status=0
-    wait "$pid" || status=$?
-
+    run_and_group_signal maintenance_probe -y     # signalled while the enable is in flight
     [ "$status" -eq 130 ]
     grep -q "Maintenance mode enabled" "$MOCK_STATE_DIR/out.log"     # the result was not lost...
     grep -q "Maintenance mode disabled." "$MOCK_STATE_DIR/out.log"   # ...so it could be undone
@@ -1582,9 +1570,8 @@ _inspect_patch_full='
 @test "ready wait: an interrupt during the wait is announced and the wait goes on" {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_HEALTH_STATUS=starting
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
-    # Signal the script alone, as the other interrupt tests do. A group-wide signal (a terminal's
-    # Ctrl+C, or `timeout` forwarding one) also kills the docker client of the swap itself; that is
-    # a separate gap (#31), not what this test covers. --ready-timeout bounds the run.
+    # Signal the script alone, as the other interrupt tests do; the group-wide case is covered by
+    # the swap tests below. --ready-timeout bounds the run.
     bash "$PROJECT_ROOT/upgrade-gitlab" -y --ready-timeout=4 > "$MOCK_STATE_DIR/out.log" 2>&1 &
     pid=$!
     wait_for_marker "$MOCK_STATE_DIR/rename_args"   # the replacement is up, the wait has begun
@@ -1595,6 +1582,45 @@ _inspect_patch_full='
     [ "$status" -eq 1 ]
     grep -q "Interrupt received. The container is already running" "$MOCK_STATE_DIR/out.log"
     grep -q "gave up waiting for" "$MOCK_STATE_DIR/out.log"
+}
+
+# ---------- A terminal Ctrl+C reaches the whole process group (#31) ----------
+# _swap_group_signal <marker> — one hop, signalled group-wide while the mock holds at <marker>; the
+# swap must finish and the run stop at the next checkpoint.
+_swap_group_signal() {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    run_and_group_signal "$1" -y
+    [ "$status" -eq 130 ]
+    [[ "$(<"$MOCK_STATE_DIR/out.log")" != *"FATAL ERROR"* ]]
+    grep -q "gitlab is running 18.0.1-ce.0\.$" "$MOCK_STATE_DIR/out.log"
+}
+
+@test "swap: a group-wide signal during docker stop does not kill the client" {
+    # A killed client would let the swap go on to rm while the daemon may still be stopping.
+    export MOCK_STOP_SLEEP=1
+    _swap_group_signal stop_held
+    [ -f "$MOCK_STATE_DIR/stop_done" ]
+}
+
+@test "swap: a group-wide signal during docker start does not end the run as fatal" {
+    export MOCK_START_SLEEP=1
+    _swap_group_signal start_held
+}
+
+@test "swap: a group-wide signal during a check run inside \$(...) is deferred too" {
+    # check_secrets_integrity captures run_with_bouncing_bar with $(...); the subshell's traps
+    # revert to the defaults, so without its own trap it died and the check was retried.
+    export MOCK_SECRETS_SLEEP=1 _SECRETS_RETRY_SLEEP=0
+    _swap_group_signal secrets_held
+    [[ "$(<"$MOCK_STATE_DIR/out.log")" != *"Secrets check did not complete"* ]]
+}
+
+@test "swap: a group-wide signal during the readiness wait's death check is not a dead container" {
+    # A killed inspect left running empty, which read as a stopped container: FATAL, holds kept.
+    # The boot reconfigure keeps the first check from passing, so the wait reaches its death check.
+    export MOCK_RUNNING_SLEEP=1 MOCK_BOOT_RECONFIGURE_POLLS=2
+    _swap_group_signal running_held
 }
 
 @test "ready wait: the boot reconfigure must finish before the container counts as ready" {

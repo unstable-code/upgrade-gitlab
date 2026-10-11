@@ -53,6 +53,23 @@ wait_for_marker() {
     return 1
 }
 
+# run_and_group_signal <marker> <script args...> — run the script in its own process group (output
+# in $MOCK_STATE_DIR/out.log), signal the whole group once the mock writes <marker>, as a terminal
+# Ctrl+C does, and set status. SIGTERM stands in for SIGINT, which background jobs ignore;
+# _handle_signal traps both.
+run_and_group_signal() {
+    local marker=$1 pid
+    shift
+    set -m                                        # own process group: pgid == pid
+    timeout -s KILL 120 bash "$PROJECT_ROOT/upgrade-gitlab" "$@" > "$MOCK_STATE_DIR/out.log" 2>&1 &
+    pid=$!
+    set +m
+    wait_for_marker "$MOCK_STATE_DIR/$marker"
+    kill -TERM -- "-$pid"
+    status=0
+    wait "$pid" || status=$?
+}
+
 teardown_mock_state() {
     [ -n "$MOCK_STATE_DIR" ] && rm -rf "$MOCK_STATE_DIR"
     unset MOCK_STATE_DIR
