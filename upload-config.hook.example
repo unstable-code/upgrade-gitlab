@@ -34,10 +34,12 @@
 # contains private keys and secrets (mode 600 inside the container), so keep
 # the upload target private, and apart from the application backup: an
 # encrypted database and its key should not live in the same place.
-# Set UPGRADE_GITLAB_CONFIG_RECIPIENT so that only an encrypted copy reaches
-# this hook: an age recipient (age1…), a file of age recipients, or a file
-# holding an armored PGP public key. Keep the private key away from the upload
-# target; without it the archive, and so the backup, cannot be restored.
+# Set UPGRADE_GITLAB_CONFIG_RECIPIENT, or put a file named
+# upload-config.recipients next to upgrade-gitlab, so that only an encrypted
+# copy reaches this hook: an age recipient (age1…), a file of age recipients,
+# or a file holding an armored PGP public key. Keep the private key away from
+# the upload target; without it the archive, and so the backup, cannot be
+# restored.
 #
 # Hooks copied from an earlier version of this template `docker cp` two files,
 # $UPGRADE_GITLAB_BACKUP_DIR/gitlab.rb.<version>-backup and

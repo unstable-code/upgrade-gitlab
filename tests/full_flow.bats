@@ -611,6 +611,27 @@ HOOK
     [ ! -f "$MOCK_STATE_DIR/rm_args" ]
 }
 
+@test "config encryption: upload-config.recipients next to the script is used, the env var wins over it" {
+    # sudo drops env vars (env_reset), so a file next to the script is the dependable way on DSM.
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    unset UPGRADE_GITLAB_CONFIG_RECIPIENT
+    mkdir "$MOCK_STATE_DIR/bin"
+    cp "$PROJECT_ROOT/upgrade-gitlab" "$MOCK_STATE_DIR/bin/upgrade-gitlab"
+    echo "age1fromsiblingfile" > "$MOCK_STATE_DIR/bin/upload-config.recipients"
+    _capture_hook
+    run bash "$MOCK_STATE_DIR/bin/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Auto-detected configuration archive recipients: $MOCK_STATE_DIR/bin/upload-config.recipients"* ]]
+    grep -qx "config_archive=$_ARCHIVE.age" "$MOCK_STATE_DIR/hook.env"
+    grep -q " -r age1fromsiblingfile$" "$MOCK_STATE_DIR/age_run_args"
+
+    UPGRADE_GITLAB_CONFIG_RECIPIENT=age1fromenv run bash "$MOCK_STATE_DIR/bin/upgrade-gitlab" --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"Auto-detected configuration archive recipients"* ]]
+    [[ "$output" == *"Config archive encryption: age"* ]]
+}
+
 @test "config encryption: a recipient without a hook encrypts nothing" {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0" UPGRADE_GITLAB_CONFIG_RECIPIENT=age1testrecipient
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"

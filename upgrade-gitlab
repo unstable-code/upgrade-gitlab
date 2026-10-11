@@ -923,7 +923,7 @@ if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
     echo -e '\n\e[0;1mENV VALUES\e[m'
     echo -e "DISCORD_URL=http\tSame as --discord-url flag."
     echo -e "UPGRADE_GITLAB_CONFIG_HOOK=PATH\tExecutable run after the /etc/gitlab archive is created and old config backups are pruned. If unset, an executable file named 'upload-config.hook' next to this script is auto-detected. Receives env vars UPGRADE_GITLAB_CONFIG_ARCHIVE and UPGRADE_GITLAB_BACKUP_DIR (container-side paths; use 'docker cp' to extract), UPGRADE_GITLAB_VERSION, UPGRADE_GITLAB_CONTAINER, UPGRADE_GITLAB_SCRIPT_DIR. Hook failure logs a warning but does not abort the upgrade. See upload-config.hook.example."
-    echo -e "UPGRADE_GITLAB_CONFIG_RECIPIENT=KEY\tEncrypt the configuration archive before the hook gets it, so only an encrypted copy is uploaded: an age recipient (age1...), a file of age recipients, or a file holding an armored PGP public key (encrypted with the gpg in the GitLab image). The hook then receives <archive>.age or <archive>.gpg, removed after it runs. Unset with a hook: interactive runs ask before uploading unencrypted, -y warns."
+    echo -e "UPGRADE_GITLAB_CONFIG_RECIPIENT=KEY\tEncrypt the configuration archive before the hook gets it, so only an encrypted copy is uploaded: an age recipient (age1...), a file of age recipients, or a file holding an armored PGP public key (encrypted with the gpg in the GitLab image). If unset, a file named 'upload-config.recipients' next to this script is used. The hook then receives <archive>.age or <archive>.gpg, removed after it runs. Unset with a hook: interactive runs ask before uploading unencrypted, -y warns."
     echo -e "UPGRADE_GITLAB_IMAGE_HOOK=PATH\tExecutable that builds the image to run for each hop, for instances running an official image plus local patches. If unset, an executable file named 'build-image.hook' next to this script is auto-detected. Receives UPGRADE_GITLAB_BASE_IMAGE (e.g. gitlab/gitlab-ee:19.4.1-ee.0), UPGRADE_GITLAB_VERSION, UPGRADE_GITLAB_EDITION, UPGRADE_GITLAB_CONTAINER, UPGRADE_GITLAB_SCRIPT_DIR; must print the image to run as the last stdout line, and that image must carry the label ${_BASE_LABEL}=<base image>. See build-image.hook.example. It runs before the old container is stopped, and a failure stops the upgrade with the current version still running. A container running such a derived image without a hook would drop its patches: interactive runs ask (y/N), -y refuses."
     echo -e "UPGRADE_GITLAB_LOG_DRIVER=NAME\tLog driver for the recreated container. By default the current container's driver and options are preserved, except Synology ContainerManager's 'db' driver which is replaced with json-file (max-size=50m, max-file=3) because it deadlocks dockerd when a container is stopped while 'docker logs --follow' is attached. Set to 'db' to keep it anyway."
     exit 0
@@ -3551,7 +3551,12 @@ if [ "$DETECTED_EDITION" != "$GITLAB_EDITION" ]; then
 fi
 
 # 수신자는 형식만 여기서 본다(호스트에서 끝나 --dry-run에서도 설정 실수를 잡는다). 실제로 암호화되는지는
-# 확인 화면 앞에서 본다.
+# 확인 화면 앞에서 본다. env가 없으면 hook처럼 스크립트 옆 파일을 쓴다: DSM에서는 docker 때문에 sudo로
+# 돌리는데, sudo는 env를 지우므로(env_reset) 셸에서 export한 값이 스크립트까지 오지 않는다.
+if [ -z "$config_recipient" ] && [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/upload-config.recipients" ]; then
+    config_recipient=$SCRIPT_DIR/upload-config.recipients
+    echo "Auto-detected configuration archive recipients: $config_recipient"
+fi
 _parse_config_recipient "$config_recipient" || exit 1
 
 if [ $dry_run -eq 1 ]; then
