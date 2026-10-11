@@ -263,6 +263,7 @@ Scenarios verified this way on 19.2.6 EE (unlicensed: maintenance mode reports `
 - An uninterrupted run: a full 19.2.6 → 19.4.0 upgrade succeeded.
 - A CI job running with `--running-jobs=abort`: the job is listed, the runner is paused, the run aborts with exit 1, the runner is resumed, and the job keeps running untouched.
 - A CI job running with the default wait: while waiting, the runner showed `active=false` and the job `running`. **A paused runner finishes the job it already has**, which is what makes waiting meaningful. The job ended `success`, the script reported `All running CI jobs have finished.` and went on to the backup. The psql runner pause/resume works on 19.2.6 as well.
+- Restoring from the configuration archive (19.3.3-ce, #26): with a Gitaly signing key, a global server hook, an encrypted settings file and a `from_file` include with a certificate outside `/etc/gitlab` seeded, an upgrade run archived all of them plus the container definition. Into fresh volumes, `tar -xpf <archive> -C /` before the first start, a container started with the archived `GITLAB_OMNIBUS_CONFIG` and shm size, and `gitlab-backup restore` of the run's app backup gave back the same SSH host key fingerprint (sshd serving it, so no client warning), a web commit still `verified_system`, and a working API token.
 
 ## CI Pipeline (.gitlab-ci.yml)
 

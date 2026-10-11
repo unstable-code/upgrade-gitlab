@@ -23,12 +23,15 @@
 #   UPGRADE_GITLAB_SCRIPT_DIR     — directory holding the upgrade-gitlab script
 #                                   (handy for sibling files like rclone.conf)
 #
-# The archive holds everything GitLab's own backup leaves out of /etc/gitlab:
-# gitlab.rb, gitlab-secrets.json, the SSH host keys, TLS keys and
-# certificates, the Gitaly commit signing key, the license file. It contains
-# private keys and secrets (mode 600 inside the container), so keep the
-# upload target private, and apart from the application backup: an encrypted
-# database and its key should not live in the same place.
+# The archive holds what GitLab's own backup leaves out: the whole /etc/gitlab
+# volume (gitlab.rb, gitlab-secrets.json, the SSH host keys, TLS keys and
+# certificates, the Gitaly commit signing key, the license file), plus the
+# encrypted settings and global server hooks under /var/opt/gitlab, file
+# hooks, files outside /etc/gitlab that gitlab.rb points to, and the
+# container definition (docker inspect, GITLAB_OMNIBUS_CONFIG included). It
+# contains private keys and secrets (mode 600 inside the container), so keep
+# the upload target private, and apart from the application backup: an
+# encrypted database and its key should not live in the same place.
 #
 # Hooks copied from an earlier version of this template `docker cp` two files,
 # $UPGRADE_GITLAB_BACKUP_DIR/gitlab.rb.<version>-backup and
@@ -41,8 +44,13 @@
 # regardless of how the container's volumes are mounted on the host
 # (bind mount, named volume, tmpfs, Docker Desktop VM, etc.).
 #
-# To restore: extract it at the root of a new container's /etc/gitlab volume
-# (`tar -xf gitlab_config_*.tar -C /`, the member names start with etc/gitlab/).
+# To restore: member names are absolute (/etc/gitlab/..., /var/opt/gitlab/...)
+# and GNU tar strips the leading /, so extracting at the root puts every file
+# back in place. With the new container's volumes mounted, run
+#   tar -xpf gitlab_config_*.tar -C /
+# before its first start, then restore the application backup. The container
+# definition lands in /etc/gitlab/config_backup/upgrade-gitlab-container.json;
+# its Config.Env and HostConfig recreate the original `docker run`.
 #
 # Uncomment ONE of the upload sections below and fill in credentials
 # / bucket names. The first four backends mirror what GitLab itself
