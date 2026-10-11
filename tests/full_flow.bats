@@ -878,6 +878,17 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     [[ "$output" == *"Added to the archive: $def"* ]]
 }
 
+@test "full-flow: encrypted settings and global server hooks are appended to the archive" {
+    # Both live under /var/opt/gitlab but outside the app backup (#26 B).
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_DATA_PATHS=$'/var/opt/gitlab/gitlab-rails/shared/encrypted_settings\n/var/opt/gitlab/gitaly/custom_hooks\n/var/opt/gitlab/gitaly/custom_hooks'   # reported twice
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    grep -qx /var/opt/gitlab/gitlab-rails/shared/encrypted_settings "$MOCK_STATE_DIR/config_append_args"
+    [ "$(grep -cx /var/opt/gitlab/gitaly/custom_hooks "$MOCK_STATE_DIR/config_append_args")" -eq 1 ]
+}
+
 @test "full-flow: a failed append to the archive only warns" {
     # /etc/gitlab is already archived; the files outside it are an addition.
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"

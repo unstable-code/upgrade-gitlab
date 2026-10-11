@@ -183,6 +183,12 @@ case "$args" in
     *"exec"*"dpkg -l"*)
         echo "ii  gitlab-${MOCK_EDITION}  ${MOCK_GITLAB_VERSION}  amd64  GitLab ${MOCK_EDITION^^}"
         ;;
+    *"exec"*"custom_hooks_dir"*)
+        # Pre-backup discovery of files outside /etc/gitlab (#26). MOCK_DATA_PATHS: newline-separated
+        # paths it reports, as the tagged lines the script parses.
+        [ -n "${MOCK_DATA_PATHS:-}" ] && printf 'path\t%s\n' $MOCK_DATA_PATHS
+        exit 0
+        ;;
     *"exec"*"--dereference -rf"*)
         # Files outside /etc/gitlab appended to the configuration archive (#26). Records the paths;
         # MOCK_CONFIG_APPEND_FAIL=1 makes the append fail.

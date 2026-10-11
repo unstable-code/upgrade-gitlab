@@ -3457,6 +3457,50 @@ if [ ${#UPGRADE_POINTS_ARRAY[@]} -eq 0 ]; then
     exit 0
 fi
 
+# 설정 아카이브에 덧붙일 /etc/gitlab 밖의 파일을 찾는다(#26). 앱 백업이 빼는 것을 담기 위해서다. 백업 전,
+# 확인 화면 앞에서 찾는다: 무엇이 담기는지와 경고가 백업을 시작하기 전에 보여야 한다. 컨테이너가 떠 있는
+# 뒤라야 하므로 시작 시 docker start보다 뒤다. 탐지는 컨테이너 안의 스니펫 하나가 맡고, 결과는 태그를
+# 붙인 줄이다(path<TAB>경로). 있는 파일이거나 비어 있지 않은 디렉터리이고 /etc/gitlab 밖인 것만 낸다.
+#
+# 대상: /var/opt/gitlab 중 앱 백업에 안 들어가는 암호화 설정(SMTP·LDAP·incoming email 자격증명 등. 복호화
+# 키는 gitlab-secrets.json에 있다)과 Gitaly의 글로벌 서버 훅. 경로는 gitlab.rb가 아니라 렌더된 설정에서
+# 읽는다: 기본값은 gitlab.rb에 적히지 않는다. rails를 부팅하지 않고 파일만 읽으면 된다.
+_CONFIG_DISCOVER_SH=$(cat <<'EOF'
+emit() {
+    case "$1" in ''|/etc/gitlab|/etc/gitlab/*) return 0 ;; esac
+    if [ -d "$1" ]; then
+        [ -n "$(ls -A "$1")" ] || return 0
+    elif [ ! -f "$1" ]; then
+        return 0
+    fi
+    printf 'path\t%s\n' "$1"
+}
+emit "$(awk '/^[[:space:]]*encrypted_settings:[[:space:]]*$/ { f = 1; next }
+             f && /^[[:space:]]*path:/ { sub(/^[[:space:]]*path:[[:space:]]*/, ""); print; exit }' \
+            /var/opt/gitlab/gitlab-rails/etc/gitlab.yml 2>/dev/null)"
+emit "$(awk '/^\[/ { f = ($0 == "[hooks]"); next }
+             f && $1 == "custom_hooks_dir" { sub(/^[^=]*=[[:space:]]*"/, ""); sub(/"[[:space:]]*$/, ""); print; exit }' \
+            /var/opt/gitlab/gitaly/config.toml 2>/dev/null)"
+exit 0
+EOF
+)
+_config_extras=()
+declare -A _config_extra_seen=()
+if _exec_isolated sh -c "$_CONFIG_DISCOVER_SH"; then
+    while IFS=$'\t' read -r _tag _val; do
+        case "$_tag" in
+            path)
+                [ -z "${_config_extra_seen["$_val"]:-}" ] || continue
+                _config_extra_seen["$_val"]=1
+                _config_extras+=("$_val")
+                ;;
+        esac
+    done <<< "$_exec_out"
+else
+    echo "Warning: could not look for configuration files outside /etc/gitlab; the configuration archive will hold /etc/gitlab only." >&2
+fi
+[ "$_interrupted" -eq 0 ] || _handle_signal    # critical zone 밖이므로 EXIT 트랩이 hold를 푼다
+
 echo -e "\nWould you like to upgrade GitLab server from $CURRENT_VERSION to ${UPGRADE_POINTS_ARRAY[-1]}?"
 echo "This action cannot be undone. PLEASE BACKUP GitLab drive BEFORE STARTING UPDATE..."
 echo "You should update pointing releases too. ROUTING COUNT: ${#UPGRADE_POINTS_ARRAY[@]}"
@@ -3737,7 +3781,7 @@ if [ "$_config_backup_rc" -ne 0 ] || [ -z "$CONFIG_ARCHIVE" ]; then
 fi
 echo "Configuration backup archive: $CONFIG_ARCHIVE"
 
-# /etc/gitlab 밖에서 앱 백업이 빼는 것(_config_extras)을 같은 아카이브에 덧붙인다(#26). backup-etc의 tar는
+# 백업 전에 찾아 둔 /etc/gitlab 밖의 파일(_config_extras)을 같은 아카이브에 덧붙인다(#26). backup-etc의 tar는
 # 압축하지 않으므로 tar -r로 붙일 수 있고, hook은 지금처럼 아카이브 하나만 받는다. 멤버 이름은 backup-etc와
 # 같은 절대경로라 -C /로 풀면 제자리로 돌아간다. 덧붙이기에 실패해도 /etc/gitlab 아카이브는 이미 있으므로
 # 경고만 한다. $2는 덧붙인 뒤 지울 파일(컨테이너 정의)이다.
@@ -3746,7 +3790,6 @@ _CONFIG_APPEND_SH='a=$1 def=$2; shift 2
 tar --absolute-names --dereference -rf "$a" -- "$@" >&2; rc=$?
 [ -z "$def" ] || rm -f "$def"
 exit $rc'
-_config_extras=()
 
 # 컨테이너 정의: GITLAB_OMNIBUS_CONFIG를 포함한 env, 마운트, 포트, shm 크기, 네트워크. hop 사이에는
 # CONTAINER_SPEC으로 재현하지만 그 값은 메모리에만 있어 호스트를 잃으면 함께 사라진다. env에 비밀이 있을
