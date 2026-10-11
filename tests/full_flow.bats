@@ -62,8 +62,7 @@ teardown() {
 
 # ---------- Test 5b: edition switch with no version hop (#21) ----------
 @test "full-flow: an edition switch alone reports the switch and exits 0" {
-    # The switch tag is dropped from UPGRADE_POINTS_ARRAY once handled, so with no hop
-    # after it the array ends up empty; the completion message used to index it.
+    # A switch-only run still reports the whole route from the starting version.
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export CI=true
@@ -73,6 +72,38 @@ teardown() {
     [[ "$output" == *"Successfully updated GitLab server from 17.11.3-ce.0 to 17.11.3-ee.0"* ]]
     [[ "$output" == *"Updated traceroute: 17.11.3-ee.0"* ]]
     [ "$(wc -l < "$MOCK_STATE_DIR/api_create")" -eq 1 ]
+}
+
+# ---------- Test 5c: the switch is the first hop of the loop (#27) ----------
+@test "full-flow: the edition switch hop removes the old edition's image, later hops the new one's" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export CI=true
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --no-step-limit --edition=ee --target-url=http://mock
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Switching edition at current version: 17.11.3-ce.0 -> 17.11.3-ee.0 (1/"* ]]
+    [ "$(wc -l < "$MOCK_STATE_DIR/image_rm_args")" -ge 2 ]
+    [ "$(sed -n 1p "$MOCK_STATE_DIR/image_rm_args")" = "gitlab/gitlab-ce:17.11.3-ce.0" ]
+    [ "$(sed -n 2p "$MOCK_STATE_DIR/image_rm_args")" = "gitlab/gitlab-ee:17.11.3-ee.0" ]
+    # The report covers the whole route from the starting version, switch included.
+    [[ "$output" == *"Successfully updated GitLab server from 17.11.3-ce.0 to "* ]]
+    [[ "$output" == *"Updated traceroute: 17.11.3-ee.0 "* ]]
+}
+
+@test "full-flow: an interrupt during the edition switch stops after it and reports the switch tag" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export CI=true
+    bash "$PROJECT_ROOT/upgrade-gitlab" -y --no-step-limit --edition=ee --target-url=http://mock > "$MOCK_STATE_DIR/out.log" 2>&1 &
+    pid=$!
+    wait_for_marker "$MOCK_STATE_DIR/api_create"
+    kill -TERM "$pid"   # SIGINT is ignored by background jobs; _handle_signal traps both
+    status=0
+    wait "$pid" || status=$?
+    [ "$status" -eq 130 ]
+    [ "$(wc -l < "$MOCK_STATE_DIR/api_create")" -eq 1 ]
+    [ "$(cat "$MOCK_STATE_DIR/current_version")" = "17.11.3-ee.0" ]
+    grep -q "gitlab is running 17.11.3-ee.0\.$" "$MOCK_STATE_DIR/out.log"
 }
 
 # ---------- Test 6: 2-step upgrade ----------

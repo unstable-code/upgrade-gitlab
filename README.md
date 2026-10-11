@@ -110,31 +110,28 @@ Pre-checks:
   4. Optional post-config-backup hook (UPGRADE_GITLAB_CONFIG_HOOK)
   5. Secrets integrity baseline check
 
-Edition switch (if CE -> EE):
-  6. Same-version edition migration (on the hook-built image, if configured)
-
-For each version in upgrade path:
-  7. Prepare the image to run: pull it, then build it via UPGRADE_GITLAB_IMAGE_HOOK if configured (a failure stops here, before the swap)
-  8. Pre-pull next version image (background)
-  9. Health check current container
-  10. Wait for background migrations to complete (with stuck detection)
-  11. Container swap (stop -> rm -> run)
-  12. Wait for HTTP 200 + healthy status
-  13. Wait for background migrations to complete (with stuck detection)
-  14. Verify migration status (no 'down' states)
+For each step in upgrade path (a CE -> EE switch is the first step, at the same version):
+  6. Prepare the image to run: pull it, then build it via UPGRADE_GITLAB_IMAGE_HOOK if configured (a failure stops here, before the swap)
+  7. Pre-pull next version image (background)
+  8. Health check current container
+  9. Wait for background migrations to complete (with stuck detection)
+  10. Container swap (stop -> rm -> start the prepared replacement)
+  11. Wait for HTTP 200 + healthy status
+  12. Wait for background migrations to complete (with stuck detection)
+  13. Verify migration status (no 'down' states)
 
 Post-upgrade:
-  15. Final health check
-  16. Secrets integrity verification
-  17. Resume any runners that were paused before the upgrade
+  14. Final health check
+  15. Secrets integrity verification
+  16. Resume any runners that were paused before the upgrade
 ```
 
 ## Signal Handling
 
 The whole upgrade flow from the post-secrets-check point through runner-resume is a single critical zone. SIGINT/SIGTERM/SIGTSTP/SIGHUP inside that zone are deferred — set a flag and return; the script reaches the next safe checkpoint (start of next loop iteration) and breaks early, then still runs post-upgrade verification (final health check, secrets check, runner resume) before exiting 130. This means an aborted upgrade still leaves GitLab in a consistent, verified state at whichever version step had completed.
 
-| Signal | Outside critical (backup, prompts, RestartPolicy) | Inside critical (CE→EE, upgrade loop, post-upgrade) | During docker pull |
-|--------|---------------------------------------------------|-----------------------------------------------------|--------------------|
+| Signal | Outside critical (backup, prompts, RestartPolicy) | Inside critical (upgrade loop incl. CE→EE, post-upgrade) | During docker pull |
+|--------|---------------------------------------------------|----------------------------------------------------------|--------------------|
 | SIGINT (Ctrl+C) | Exit immediately | Deferred → finish current iteration → break loop → post-upgrade → exit 130 | Restart pull |
 | SIGTERM | Exit immediately | Deferred (same as SIGINT) | Restart pull |
 | SIGTSTP (Ctrl+Z) | Exit immediately | Deferred (same as SIGINT) | Restart pull |
