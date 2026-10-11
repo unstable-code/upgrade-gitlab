@@ -183,6 +183,13 @@ case "$args" in
     *"exec"*"dpkg -l"*)
         echo "ii  gitlab-${MOCK_EDITION}  ${MOCK_GITLAB_VERSION}  amd64  GitLab ${MOCK_EDITION^^}"
         ;;
+    *"exec"*"--dereference -rf"*)
+        # Files outside /etc/gitlab appended to the configuration archive (#26). Records the paths;
+        # MOCK_CONFIG_APPEND_FAIL=1 makes the append fail.
+        [ -n "$MOCK_STATE_DIR" ] && printf '%s\n' "${@:8}" >> "$MOCK_STATE_DIR/config_append_args"
+        [ "${MOCK_CONFIG_APPEND_FAIL:-0}" -eq 1 ] && { echo "tar: Cannot open: No space left on device" >&2; exit 1; }
+        exit 0
+        ;;
     *"exec"*"gitlab-ctl backup-etc"*)
         # Configuration volume archive (#26). Placed before the generic "sh -c" and "-t" cases:
         # the snippet carries `ls -t`. MOCK_CONFIG_BACKUP_FAIL=1: both backup-etc and the tar
@@ -521,6 +528,15 @@ case "$args" in
         # Record `docker stop` invocations so tests can assert on the grace period.
         if [ -n "$MOCK_STATE_DIR" ]; then
             printf '%s\n' "$args" >> "$MOCK_STATE_DIR/stop_args"
+        fi
+        exit 0
+        ;;
+    "cp "*)
+        # docker cp: records "<src> <dest>"; the source is a host temp file the script removes
+        # right after, so its content is kept as cp_content.
+        if [ -n "$MOCK_STATE_DIR" ]; then
+            printf '%s\n' "$2 $3" >> "$MOCK_STATE_DIR/cp_args"
+            [ -f "$2" ] && cp "$2" "$MOCK_STATE_DIR/cp_content"
         fi
         exit 0
         ;;

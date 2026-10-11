@@ -3737,6 +3737,48 @@ if [ "$_config_backup_rc" -ne 0 ] || [ -z "$CONFIG_ARCHIVE" ]; then
 fi
 echo "Configuration backup archive: $CONFIG_ARCHIVE"
 
+# /etc/gitlab 밖에서 앱 백업이 빼는 것(_config_extras)을 같은 아카이브에 덧붙인다(#26). backup-etc의 tar는
+# 압축하지 않으므로 tar -r로 붙일 수 있고, hook은 지금처럼 아카이브 하나만 받는다. 멤버 이름은 backup-etc와
+# 같은 절대경로라 -C /로 풀면 제자리로 돌아간다. 덧붙이기에 실패해도 /etc/gitlab 아카이브는 이미 있으므로
+# 경고만 한다. $2는 덧붙인 뒤 지울 파일(컨테이너 정의)이다.
+# shellcheck disable=SC2016
+_CONFIG_APPEND_SH='a=$1 def=$2; shift 2
+tar --absolute-names --dereference -rf "$a" -- "$@" >&2; rc=$?
+[ -z "$def" ] || rm -f "$def"
+exit $rc'
+_config_extras=()
+
+# 컨테이너 정의: GITLAB_OMNIBUS_CONFIG를 포함한 env, 마운트, 포트, shm 크기, 네트워크. hop 사이에는
+# CONTAINER_SPEC으로 재현하지만 그 값은 메모리에만 있어 호스트를 잃으면 함께 사라진다. env에 비밀이 있을
+# 수 있으므로 600 파일로 만들어 config_backup 아래(아카이브와 같은 700 디렉터리)에 둔다. 그 위치라
+# -C /로 풀어도 설정을 건드리지 않는다. 인자가 아니라 docker cp로 넣는다: docker exec의 인자는 호스트의
+# ps에 보인다.
+_container_def="${CONFIG_ARCHIVE%/*}/upgrade-gitlab-container.json"
+_container_def_tmp=$(mktemp)
+_TMPFILES+=("$_container_def_tmp")
+printf '%s\n' "$_container_json" > "$_container_def_tmp"
+if docker cp "$_container_def_tmp" "$CONTAINER_NAME:$_container_def" > /dev/null; then
+    _config_extras+=("$_container_def")
+else
+    echo "Warning: could not copy the container definition into $CONTAINER_NAME; it is not in the archive." >&2
+    _container_def=""
+fi
+rm -f "$_container_def_tmp"
+
+if [ ${#_config_extras[@]} -gt 0 ]; then
+    if _exec_isolated sh -c "$_CONFIG_APPEND_SH" _ "$CONFIG_ARCHIVE" "$_container_def" "${_config_extras[@]}"; then
+        printf 'Added to the archive: %s\n' "${_config_extras[@]}"
+    else
+        echo "Warning: could not add files outside /etc/gitlab to the archive. Last lines of its output:" >&2
+        _print_exec_err_tail
+        send_discord_webhook "WARN" "Configuration archive incomplete" "/etc/gitlab was archived, but files outside it could not be added"
+    fi
+    if [ "$_interrupted" -eq 1 ]; then
+        echo "Interrupted while extending the configuration archive; releasing runners and maintenance mode." >&2
+        _handle_signal    # critical zone 밖이므로 EXIT 트랩이 hold를 푼다
+    fi
+fi
+
 # config backup 정리: gitlab.rb의 backup_keep_time(초) 기준으로 오래된 파일 삭제.
 # GitLab 본체 *.tar 백업과 동일한 retention 정책. 0/미설정이면 영구 보관.
 # backup-etc도 같은 값으로 아카이브를 정리하지만, tar로 대신한 경우를 위해 여기서도 함께 본다.

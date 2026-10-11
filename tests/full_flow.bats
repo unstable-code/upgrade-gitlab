@@ -865,6 +865,31 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     [ ! -f "$MOCK_STATE_DIR/api_create" ]                # the container was never recreated
 }
 
+@test "full-flow: the container definition is appended to the /etc/gitlab archive" {
+    # The recreate spec lives only in memory; losing the host loses GITLAB_OMNIBUS_CONFIG (#26 E).
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    def=/etc/gitlab/config_backup/upgrade-gitlab-container.json
+    grep -q " gitlab:$def$" "$MOCK_STATE_DIR/cp_args"
+    jq -e '.Config.Env' "$MOCK_STATE_DIR/cp_content" > /dev/null   # the inspect JSON itself
+    grep -qx "$def" "$MOCK_STATE_DIR/config_append_args"
+    [[ "$output" == *"Added to the archive: $def"* ]]
+}
+
+@test "full-flow: a failed append to the archive only warns" {
+    # /etc/gitlab is already archived; the files outside it are an addition.
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_CONFIG_APPEND_FAIL=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"could not add files outside /etc/gitlab to the archive"* ]]
+    [[ "$output" == *"No space left on device"* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+}
+
 # ---------- Test 31d: non-signal abort before the critical zone resumes paused runners ----------
 @test "full-flow: abort on pre-upgrade secrets failure resumes the paused runners (EXIT trap)" {
     # #10 follow-up, non-signal path: the pre-upgrade secrets check runs after the pause and
