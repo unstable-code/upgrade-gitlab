@@ -402,6 +402,18 @@ teardown() {
     [[ "$output" == *"failed(4)"* ]]
 }
 
+# ---------- Config hook fixtures ----------
+# _capture_hook — a config hook that records the archive it was given, in $MOCK_STATE_DIR/hook.env.
+_capture_hook() {
+    cat > "$MOCK_STATE_DIR/hook.sh" <<'HOOK'
+#!/usr/bin/env bash
+echo "config_archive=$UPGRADE_GITLAB_CONFIG_ARCHIVE" > "$MOCK_STATE_DIR/hook.env"
+HOOK
+    chmod +x "$MOCK_STATE_DIR/hook.sh"
+    export UPGRADE_GITLAB_CONFIG_HOOK="$MOCK_STATE_DIR/hook.sh"
+}
+_ARCHIVE=/etc/gitlab/config_backup/gitlab_config_1700000000_2026_01_01.tar
+
 # ---------- Test 18: post-config-backup hook receives expected env ----------
 @test "full-flow: post-config-backup hook is invoked with expected env vars" {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
@@ -429,7 +441,7 @@ HOOK
     # Hook receives the container-side BACKUP_DIR (use `docker cp` from there).
     grep -q "^backup_dir=/var/opt/gitlab/backups$" "$HOOK_OUT"
     # ...and the container-side path of the whole /etc/gitlab archive (#26).
-    grep -qx "config_archive=/etc/gitlab/config_backup/gitlab_config_1700000000_2026_01_01.tar" "$HOOK_OUT"
+    grep -qx "config_archive=$_ARCHIVE" "$HOOK_OUT"
 
     rm -rf "$HOOK_DIR"
     unset UPGRADE_GITLAB_CONFIG_HOOK
@@ -504,6 +516,109 @@ HOOK
     [[ "$output" == *"Successfully updated"* ]]
 
     rm -rf "$SCRIPT_DIR_TEST"
+}
+
+# ---------- Configuration archive encryption (#32) ----------
+@test "config encryption: an age recipient gives the hook an encrypted copy, removed afterwards" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" UPGRADE_GITLAB_CONFIG_RECIPIENT=age1testrecipient
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    _capture_hook
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    grep -qx "config_archive=$_ARCHIVE.age" "$MOCK_STATE_DIR/hook.env"
+    # Checked before the backup by encrypting nothing, then the archive itself, through the pinned image.
+    [ "$(sed -n 1p "$MOCK_STATE_DIR/encrypted_out")" = /dev/null ]
+    [ "$(sed -n 2p "$MOCK_STATE_DIR/encrypted_out")" = "$_ARCHIVE.age" ]
+    grep -q "upgrade-gitlab/age@sha256:[0-9a-f]\{64\} -r age1testrecipient$" "$MOCK_STATE_DIR/age_run_args"
+    grep -qx "age(plain:$_ARCHIVE)" "$MOCK_STATE_DIR/encrypted_content"
+    grep -qx "$_ARCHIVE.age" "$MOCK_STATE_DIR/rm_args"
+    [[ "$output" != *"upload the configuration archive unencrypted"* ]]
+}
+
+@test "config encryption: a PGP public key file uses the gpg inside the container" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" UPGRADE_GITLAB_CONFIG_RECIPIENT="$MOCK_STATE_DIR/backup.asc"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    printf -- '-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nmDMEZ...\n-----END PGP PUBLIC KEY BLOCK-----\n' > "$UPGRADE_GITLAB_CONFIG_RECIPIENT"
+    _capture_hook
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    grep -qx "config_archive=$_ARCHIVE.gpg" "$MOCK_STATE_DIR/hook.env"
+    grep -qx "/dev/null /dev/null /tmp/upgrade-gitlab-recipient.asc" "$MOCK_STATE_DIR/gpg_args"
+    grep -qx "$_ARCHIVE $_ARCHIVE.gpg /tmp/upgrade-gitlab-recipient.asc" "$MOCK_STATE_DIR/gpg_args"
+    grep -qx "$UPGRADE_GITLAB_CONFIG_RECIPIENT gitlab:/tmp/upgrade-gitlab-recipient.asc" "$MOCK_STATE_DIR/cp_args"
+    grep -qx "$_ARCHIVE.gpg" "$MOCK_STATE_DIR/rm_args"
+    [ ! -f "$MOCK_STATE_DIR/age_run_args" ]
+}
+
+@test "config encryption: an unusable recipient stops the run before anything changes, --dry-run too" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" UPGRADE_GITLAB_CONFIG_RECIPIENT="$MOCK_STATE_DIR/not-a-key.txt"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    echo "hello" > "$UPGRADE_GITLAB_CONFIG_RECIPIENT"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"UPGRADE_GITLAB_CONFIG_RECIPIENT must be an age recipient"* ]]
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 1 ]
+    [ ! -f "$MOCK_STATE_DIR/backup_args" ]
+}
+
+@test "config encryption: a recipient that cannot encrypt stops the run before the backup" {
+    # e.g. the age image cannot be pulled, or the key file holds no usable key.
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" UPGRADE_GITLAB_CONFIG_RECIPIENT=age1testrecipient MOCK_ENCRYPT_FAIL=1
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    _capture_hook
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"could not encrypt with UPGRADE_GITLAB_CONFIG_RECIPIENT (age)"* ]]
+    [[ "$output" == *"age: error: failed to encrypt"* ]]
+    [ ! -f "$MOCK_STATE_DIR/backup_args" ]
+}
+
+@test "config encryption: a failed encryption of the archive skips the hook instead of uploading plaintext" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" UPGRADE_GITLAB_CONFIG_RECIPIENT=age1testrecipient MOCK_ENCRYPT_FAIL=archive
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    _capture_hook
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"the post-config-backup hook is skipped so nothing leaves unencrypted"* ]]
+    [ ! -f "$MOCK_STATE_DIR/hook.env" ]
+    grep -qx "$_ARCHIVE.age" "$MOCK_STATE_DIR/rm_args"     # the partial output is removed
+    [[ "$output" == *"Successfully updated"* ]]
+}
+
+@test "config encryption: Ctrl+C while encrypting stops the run and removes the encrypted copy" {
+    # Outside the critical zone, so the run ends at once with 130; the encryption is not reported as
+    # failed, the hook does not run, and the EXIT trap removes the copy.
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" UPGRADE_GITLAB_CONFIG_RECIPIENT=age1testrecipient MOCK_ENCRYPT_SLEEP=1
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    _capture_hook
+    run_and_group_signal encrypt_held -y
+    [ "$status" -eq 130 ]
+    [[ "$(<"$MOCK_STATE_DIR/out.log")" != *"could not encrypt"* ]]
+    [ ! -f "$MOCK_STATE_DIR/hook.env" ]
+    grep -qx "$_ARCHIVE.age" "$MOCK_STATE_DIR/rm_args"
+}
+
+@test "config encryption: without a recipient an unattended run warns and uploads the plain archive" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    unset UPGRADE_GITLAB_CONFIG_RECIPIENT
+    _capture_hook
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"UPGRADE_GITLAB_CONFIG_RECIPIENT is not set, so $MOCK_STATE_DIR/hook.sh will upload the configuration archive unencrypted"* ]]
+    grep -qx "config_archive=$_ARCHIVE" "$MOCK_STATE_DIR/hook.env"
+    [ ! -f "$MOCK_STATE_DIR/rm_args" ]
+}
+
+@test "config encryption: a recipient without a hook encrypts nothing" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" UPGRADE_GITLAB_CONFIG_RECIPIENT=age1testrecipient
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    unset UPGRADE_GITLAB_CONFIG_HOOK
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"there is no post-config-backup hook; nothing is uploaded, so nothing is encrypted"* ]]
+    [ ! -f "$MOCK_STATE_DIR/age_run_args" ]
 }
 
 # ---------- Test 22: background-migration check skipped only when table truly absent ----------

@@ -191,6 +191,36 @@ case "$args" in
     *"inspect"*"ExitCode"*)
         echo "${MOCK_EXIT_CODE:-0}"
         ;;
+    # Configuration archive encryption (#32). age runs as a pipe: `exec <c> cat <in>` | `run --rm -i
+    # --network none <AGE_IMAGE> -r ...` | `exec -i <c> sh -c 'umask 077 && cat > "$1"' _ <out>`; gpg is
+    # one in-container snippet. Each records what it was given. MOCK_ENCRYPT_FAIL=1 fails every
+    # encryption, =archive only that of the archive (the pre-backup check encrypts /dev/null).
+    "exec ${MOCK_CONTAINER} cat "*)
+        echo "plain:${args##* }"
+        ;;
+    "run --rm -i --network none "*)
+        _in=$(cat)
+        [ -n "$MOCK_STATE_DIR" ] && printf '%s\n' "$args" >> "$MOCK_STATE_DIR/age_run_args"
+        # MOCK_ENCRYPT_SLEEP: hold while encrypting the archive (marker encrypt_held).
+        [[ $_in == *gitlab_config_* ]] && _mock_hold encrypt "${MOCK_ENCRYPT_SLEEP:-}"
+        case "${MOCK_ENCRYPT_FAIL:-0}:$_in" in
+            1:*|archive:*gitlab_config_*) echo "age: error: failed to encrypt" >&2; exit 1 ;;
+        esac
+        printf 'age(%s)\n' "$_in"
+        ;;
+    "exec -i ${MOCK_CONTAINER} sh -c umask 077"*)
+        [ -n "$MOCK_STATE_DIR" ] && { printf '%s\n' "${!#}" >> "$MOCK_STATE_DIR/encrypted_out"; cat >> "$MOCK_STATE_DIR/encrypted_content"; }
+        ;;
+    *"exec"*"--trust-model always"*)
+        # _CONFIG_GPG_SH: $7 input, $8 output, $9 the copied public key.
+        [ -n "$MOCK_STATE_DIR" ] && printf '%s %s %s\n' "$7" "$8" "$9" >> "$MOCK_STATE_DIR/gpg_args"
+        case "${MOCK_ENCRYPT_FAIL:-0}:$7" in
+            1:*|archive:*gitlab_config_*) echo "gpg: encryption failed: No public key" >&2; exit 1 ;;
+        esac
+        ;;
+    "exec ${MOCK_CONTAINER} rm -f "*)
+        [ -n "$MOCK_STATE_DIR" ] && printf '%s\n' "${!#}" >> "$MOCK_STATE_DIR/rm_args"
+        ;;
     *"exec"*"dpkg -l"*)
         echo "ii  gitlab-${MOCK_EDITION}  ${MOCK_GITLAB_VERSION}  amd64  GitLab ${MOCK_EDITION^^}"
         ;;

@@ -5,7 +5,12 @@ DISCORD_URL=${DISCORD_URL:-}
 GITLAB_EDITION=
 PULL_PID=
 config_backup_hook=${UPGRADE_GITLAB_CONFIG_HOOK:-}
+config_recipient=${UPGRADE_GITLAB_CONFIG_RECIPIENT:-}
 image_hook=${UPGRADE_GITLAB_IMAGE_HOOK:-}
+# 설정 아카이브를 age로 암호화하는 이미지(#32). distroless/static 위에 정적 age 바이너리 하나만 얹은
+# 것으로, 이 프로젝트의 CI(age-image 잡, ci/build-age-image.sh)가 만든다. 다시 만들면 digest를 바꾼다:
+# 태그는 덮어쓸 수 있어 고정이 아니다.
+AGE_IMAGE=registry.gggames.synology.me/peter/gitlab/upgrade-gitlab/age@sha256:83d31ca315df22aae657c2a1498938760d7e3e1e8ffcb87d61e991d7e1f9eb7c
 # 파생 이미지(공식 이미지 + 로컬 패치)가 자기 베이스를 적어 두는 label(#20).
 # 컨테이너 감지와 hook 결과 검증이 모두 이 값을 본다.
 _BASE_LABEL=org.upgrade-gitlab.base
@@ -199,6 +204,8 @@ _cleanup_on_exit() {
     if [ "${_next_container_created:-0}" = 1 ] && docker container inspect "$CONTAINER_NAME" &> /dev/null; then
         docker container rm "$_NEXT_CONTAINER" &> /dev/null
     fi
+    # 암호화하다 멈춘 설정 아카이브 사본(#32).
+    command -v _remove_config_encrypted >/dev/null 2>&1 && _remove_config_encrypted
     # 안전망: critical zone 진입 전(러너 pause ~ 백업 ~ 사전 시크릿 검사)에 종료되면 — 시그널,
     # 사전검사 실패/거부, 백업 실패, 사용자 abort 등 무엇이든 — 일시정지한 러너가 방치된다(#10).
     # 그 구간은 아직 컨테이너를 스왑하지 않아 살아 있으므로 여기서 재개한다.
@@ -416,6 +423,95 @@ _confirm_drop() {
         echo "Aborted: the $1 were kept." >&2
         exit 1
     fi
+}
+
+# --- 설정 아카이브 암호화(#32) ---
+# hook이 원격에 올리는 사본만 암호화한다. config_backup의 평문 아카이브는 남긴다: 같은 디스크의
+# /etc/gitlab 원본도 평문이라 암호화로 얻는 것이 적고, 로컬 복원이 쉽다. 수신자 형식이 도구를 정한다:
+# age 수신자(age1…, 또는 그런 줄이 담긴 파일. ssh 공개키도 age 수신자다)는 AGE_IMAGE로, armored PGP
+# 공개키 파일은 GitLab 이미지에 들어 있는 gpg로 암호화한다.
+_parse_config_recipient() {
+    local line
+    _recipient_tool=""
+    _recipient_args=()
+    [ -n "$1" ] || return 0
+    if [[ $1 == age1* ]]; then
+        _recipient_tool=age
+        _recipient_args=(-r "$1")
+        return 0
+    fi
+    if [ -f "$1" ] && [ -r "$1" ]; then
+        if grep -q -- '-----BEGIN PGP PUBLIC KEY BLOCK-----' "$1"; then
+            _recipient_tool=gpg
+            return 0
+        fi
+        while IFS= read -r line || [ -n "$line" ]; do
+            line=${line%%#*}
+            line=${line#"${line%%[![:space:]]*}"}
+            line=${line%"${line##*[![:space:]]}"}
+            case $line in
+                '') ;;
+                age1*|ssh-ed25519\ *|ssh-rsa\ *) _recipient_args+=(-r "$line") ;;
+                *) _recipient_args=(); break ;;
+            esac
+        done < "$1"
+        if [ ${#_recipient_args[@]} -gt 0 ]; then
+            _recipient_tool=age
+            return 0
+        fi
+    fi
+    echo "Error: UPGRADE_GITLAB_CONFIG_RECIPIENT must be an age recipient (age1...), or a file holding age recipients (one per line) or an armored PGP public key: $1" >&2
+    return 1
+}
+
+# gpg는 공개키를 가져온 임시 GNUPGHOME으로 돌린다: 컨테이너의 키링을 건드리지 않는다. 파일에 든 키 모두를
+# 수신자로 쓴다(fpr은 pub 바로 뒤의 것만, 부키는 빼고). 끝나면 키 사본과 임시 디렉터리를 지운다.
+# shellcheck disable=SC2016
+_CONFIG_GPG_SH='in=$1 out=$2 key=$3
+gpg=/opt/gitlab/embedded/bin/gpg
+[ -x "$gpg" ] || gpg=gpg
+h=$(mktemp -d) || exit 1
+trap '\''rm -rf "$h" "$key"'\'' EXIT
+"$gpg" --homedir "$h" --batch --quiet --import "$key" >&2 || exit 1
+set --
+for f in $("$gpg" --homedir "$h" --batch --with-colons --list-keys | awk -F: '\''$1 == "pub" { p = 1; next } $1 == "fpr" && p { print $10; p = 0 }'\''); do
+    set -- "$@" --recipient "$f"
+done
+[ $# -gt 0 ] || { echo "no public key in $key" >&2; exit 1; }
+umask 077
+"$gpg" --homedir "$h" --batch --yes --trust-model always "$@" --output "$out" --encrypt "$in" >&2'
+
+# _encrypt_config_archive <입력> <출력> — 컨테이너 안의 <입력>을 암호화해 컨테이너 안의 <출력>(600)으로
+# 쓴다. 백업 전 검증은 /dev/null을 넣어 부른다: age는 그때 이미지를 받아 두고, 둘 다 수신자를 확인한다.
+# 실패하면 1을 돌려준다(오류는 _exec_err). 클라이언트는 모두 _check_isolated로 띄운다(#31): Ctrl+C가
+# "암호화 실패"로 보고되지 않고, critical zone 밖이라 미뤄진 시그널은 그 자리에서 처리된다. 쓰는 <출력>은
+# _config_encrypted에 적어 두어, 실패하면 여기서, 중단되면 EXIT 트랩이, 끝나면 hook 뒤에 지운다.
+_config_encrypted=""
+_remove_config_encrypted() {
+    [ -n "$_config_encrypted" ] || return 0
+    docker exec "$CONTAINER_NAME" rm -f "$_config_encrypted" > /dev/null 2>&1
+    _config_encrypted=""
+}
+_encrypt_config_archive() {
+    local in=$1 out=$2 key=/tmp/upgrade-gitlab-recipient.asc
+    [ "$out" = /dev/null ] || _config_encrypted=$out
+    if [ "$_recipient_tool" = age ]; then
+        # 아카이브는 파이프로만 지나간다: age 컨테이너는 볼륨도 네트워크도 없다.
+        # shellcheck disable=SC2016
+        _check_isolated bash -c 'set -o pipefail
+            c=$1 in=$2 out=$3 img=$4
+            shift 4
+            docker exec "$c" cat "$in" \
+                | docker run --rm -i --network none "$img" "$@" \
+                | docker exec -i "$c" sh -c "umask 077 && cat > \"\$1\"" _ "$out"' \
+            _ "$CONTAINER_NAME" "$in" "$out" "$AGE_IMAGE" "${_recipient_args[@]}"
+    else
+        _check_isolated docker cp "$config_recipient" "$CONTAINER_NAME:$key" \
+            && _check_isolated docker exec "$CONTAINER_NAME" sh -c "$_CONFIG_GPG_SH" _ "$in" "$out" "$key"
+    fi || {
+        _remove_config_encrypted
+        return 1
+    }
 }
 
 # _official_image_of <이미지> — 이미지가 어느 공식 이미지(gitlab/gitlab-(ce|ee)[:TAG])인지 전역
@@ -827,6 +923,7 @@ if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
     echo -e '\n\e[0;1mENV VALUES\e[m'
     echo -e "DISCORD_URL=http\tSame as --discord-url flag."
     echo -e "UPGRADE_GITLAB_CONFIG_HOOK=PATH\tExecutable run after the /etc/gitlab archive is created and old config backups are pruned. If unset, an executable file named 'upload-config.hook' next to this script is auto-detected. Receives env vars UPGRADE_GITLAB_CONFIG_ARCHIVE and UPGRADE_GITLAB_BACKUP_DIR (container-side paths; use 'docker cp' to extract), UPGRADE_GITLAB_VERSION, UPGRADE_GITLAB_CONTAINER, UPGRADE_GITLAB_SCRIPT_DIR. Hook failure logs a warning but does not abort the upgrade. See upload-config.hook.example."
+    echo -e "UPGRADE_GITLAB_CONFIG_RECIPIENT=KEY\tEncrypt the configuration archive before the hook gets it, so only an encrypted copy is uploaded: an age recipient (age1...), a file of age recipients, or a file holding an armored PGP public key (encrypted with the gpg in the GitLab image). The hook then receives <archive>.age or <archive>.gpg, removed after it runs. Unset with a hook: interactive runs ask before uploading unencrypted, -y warns."
     echo -e "UPGRADE_GITLAB_IMAGE_HOOK=PATH\tExecutable that builds the image to run for each hop, for instances running an official image plus local patches. If unset, an executable file named 'build-image.hook' next to this script is auto-detected. Receives UPGRADE_GITLAB_BASE_IMAGE (e.g. gitlab/gitlab-ee:19.4.1-ee.0), UPGRADE_GITLAB_VERSION, UPGRADE_GITLAB_EDITION, UPGRADE_GITLAB_CONTAINER, UPGRADE_GITLAB_SCRIPT_DIR; must print the image to run as the last stdout line, and that image must carry the label ${_BASE_LABEL}=<base image>. See build-image.hook.example. It runs before the old container is stopped, and a failure stops the upgrade with the current version still running. A container running such a derived image without a hook would drop its patches: interactive runs ask (y/N), -y refuses."
     echo -e "UPGRADE_GITLAB_LOG_DRIVER=NAME\tLog driver for the recreated container. By default the current container's driver and options are preserved, except Synology ContainerManager's 'db' driver which is replaced with json-file (max-size=50m, max-file=3) because it deadlocks dockerd when a container is stopped while 'docker logs --follow' is attached. Set to 'db' to keep it anyway."
     exit 0
@@ -3453,6 +3550,10 @@ if [ "$DETECTED_EDITION" != "$GITLAB_EDITION" ]; then
     fi
 fi
 
+# 수신자는 형식만 여기서 본다(호스트에서 끝나 --dry-run에서도 설정 실수를 잡는다). 실제로 암호화되는지는
+# 확인 화면 앞에서 본다.
+_parse_config_recipient "$config_recipient" || exit 1
+
 if [ $dry_run -eq 1 ]; then
     echo ""
     echo "=== DRY-RUN: Upgrade Path ==="
@@ -3460,6 +3561,7 @@ if [ $dry_run -eq 1 ]; then
     echo "Current: $CURRENT_VERSION"
     echo "Edition: $GITLAB_EDITION"
     echo "Image hook: ${image_hook:-none (official images)}"
+    echo "Config archive encryption: ${_recipient_tool:-none}"
     echo "Target: ${target_version_tag:-$LATEST_VERSION_TAG}"
     echo "Steps: ${#UPGRADE_POINTS_ARRAY[@]}"
     for idx in "${!UPGRADE_POINTS_ARRAY[@]}"; do
@@ -3651,6 +3753,37 @@ if [ ${#_file_hooks[@]} -gt 0 ]; then
     printf '  %s\n' "${_file_hooks[@]}" >&2
     echo "They are saved in the configuration archive. To keep them running, build them into the image with UPGRADE_GITLAB_IMAGE_HOOK (build-image.hook.example only applies patches; add a COPY for them)." >&2
     _confirm_drop "file hooks"
+fi
+
+# 설정 아카이브를 올리는 hook과 그 암호화(#32). 백업 전에 정한다: 수신자가 틀렸거나 age 이미지를 받을 수
+# 없다는 것은 설정 문제이니 아무것도 하기 전에 멈추고, 수신자 없이 평문을 올릴지는 확인 화면과 함께
+# 묻는다. 평문 업로드를 거절하면 hook만 건너뛴다(config_backup_hook을 비운다): 업그레이드와 로컬
+# 아카이브는 그대로다.
+if _find_hook "$config_backup_hook" UPGRADE_GITLAB_CONFIG_HOOK upload-config.hook "post-config-backup hook"; then
+    config_backup_hook=$_hook_path
+else
+    config_backup_hook=""
+fi
+if [ -z "$config_backup_hook" ]; then
+    [ -z "$_recipient_tool" ] || echo "Note: UPGRADE_GITLAB_CONFIG_RECIPIENT is set but there is no post-config-backup hook; nothing is uploaded, so nothing is encrypted."
+elif [ -n "$_recipient_tool" ]; then
+    echo "Checking the configuration archive encryption ($_recipient_tool)..."
+    if ! _encrypt_config_archive /dev/null /dev/null; then
+        echo "Error: could not encrypt with UPGRADE_GITLAB_CONFIG_RECIPIENT ($_recipient_tool). Last lines of its output:" >&2
+        _print_exec_err_tail
+        [ "$_recipient_tool" = gpg ] || echo "age runs from $AGE_IMAGE; check that this host can pull it." >&2
+        exit 1
+    fi
+else
+    echo "Warning: UPGRADE_GITLAB_CONFIG_RECIPIENT is not set, so $config_backup_hook will upload the configuration archive unencrypted: gitlab-secrets.json, private keys, the container's env." >&2
+    if [ "$auto_yes" -eq 0 ]; then
+        echo -n "Upload it unencrypted? (y/N) > "
+        read -r _answer < "$_tty"
+        if [ "$_answer" != "y" ] && [ "$_answer" != "Y" ]; then
+            config_backup_hook=""
+            echo "The hook will not run; the archive stays in the container only."
+        fi
+    fi
 fi
 
 echo -e "\nWould you like to upgrade GitLab server from $CURRENT_VERSION to ${UPGRADE_POINTS_ARRAY[-1]}?"
@@ -3985,26 +4118,43 @@ if [[ "$backup_keep_time" =~ ^[0-9]+$ ]] && [ "$backup_keep_time" -gt 0 ]; then
     keep_minutes=$((backup_keep_time / 60))
     if [ "$keep_minutes" -gt 0 ]; then
         docker exec "$CONTAINER_NAME" sh -c \
-            "find '$BACKUP_DIR' '${CONFIG_ARCHIVE%/*}' -maxdepth 1 -type f \( -name 'gitlab.rb.*-backup' -o -name 'gitlab-secrets.json.*-backup' -o -name 'gitlab_config_*.tar' \) -mmin +$keep_minutes -delete 2>/dev/null" || true
+            "find '$BACKUP_DIR' '${CONFIG_ARCHIVE%/*}' -maxdepth 1 -type f \( -name 'gitlab.rb.*-backup' -o -name 'gitlab-secrets.json.*-backup' -o -name 'gitlab_config_*.tar*' \) -mmin +$keep_minutes -delete 2>/dev/null" || true
         echo "Pruned config backups older than ${backup_keep_time}s (backup_keep_time)"
     fi
 fi
 
-# 사용자 hook: config 백업 직후 임의 처리 (예: 원격지 업로드).
-# UPGRADE_GITLAB_CONFIG_HOOK 환경변수로 지정 가능. 미설정이면
-# upgrade-gitlab 스크립트와 같은 디렉토리의 upload-config.hook을 자동 탐지.
+# 사용자 hook: config 백업 직후 임의 처리 (예: 원격지 업로드). 찾는 것은 백업 전에 끝났다.
 # 실패 시 warning만 찍고 업그레이드는 계속 진행 (config 사본은 로컬에 남아있음).
 # Hook은 컨테이너 측 BACKUP_DIR 경로를 받음 — host 경로 해석은 docker cp 등에 위임.
-if _find_hook "$config_backup_hook" UPGRADE_GITLAB_CONFIG_HOOK upload-config.hook "post-config-backup hook"; then
-    config_backup_hook=$_hook_path
-    echo "Running post-config-backup hook: $config_backup_hook"
-    if ! UPGRADE_GITLAB_BACKUP_DIR="$BACKUP_DIR" \
-         UPGRADE_GITLAB_CONFIG_ARCHIVE="$CONFIG_ARCHIVE" \
-         UPGRADE_GITLAB_VERSION="$CURRENT_VERSION" \
-         UPGRADE_GITLAB_CONTAINER="$CONTAINER_NAME" \
-         UPGRADE_GITLAB_SCRIPT_DIR="$SCRIPT_DIR" \
-         "$config_backup_hook"; then
-        echo "Warning: post-config-backup hook exited non-zero (continuing upgrade)" >&2
+# 수신자가 있으면 hook은 암호본(<아카이브>.age|.gpg)을 받고, 끝나면 지운다(#32). 암호화에 실패하면 평문을
+# 대신 넘기지 않고 hook을 건너뛴다: 수신자를 둔 것은 평문을 내보내지 않겠다는 뜻이다. 평문을 올린다는 -y의
+# WARN 웹훅은 여기서 보낸다: 그 전에 실행이 멈추면 아무것도 올라가지 않는다.
+if [ -n "$config_backup_hook" ]; then
+    _hook_archive=$CONFIG_ARCHIVE
+    if [ -n "$_recipient_tool" ]; then
+        _hook_archive="$CONFIG_ARCHIVE.$_recipient_tool"
+        if _encrypt_config_archive "$CONFIG_ARCHIVE" "$_hook_archive"; then
+            echo "Encrypted the configuration archive for the hook: $_hook_archive"
+        else
+            echo "Warning: could not encrypt the configuration archive; the post-config-backup hook is skipped so nothing leaves unencrypted. Last lines of its output:" >&2
+            _print_exec_err_tail
+            send_discord_webhook "WARN" "Configuration archive not uploaded" "Encrypting it ($_recipient_tool) failed, so the hook was skipped; the archive is still in $CONTAINER_NAME"
+            _hook_archive=""
+        fi
+    elif [ "$auto_yes" -eq 1 ]; then
+        send_discord_webhook "WARN" "Configuration archive uploaded unencrypted" "Set UPGRADE_GITLAB_CONFIG_RECIPIENT to an age recipient or a PGP public key file"
+    fi
+    if [ -n "$_hook_archive" ]; then
+        echo "Running post-config-backup hook: $config_backup_hook"
+        if ! UPGRADE_GITLAB_BACKUP_DIR="$BACKUP_DIR" \
+             UPGRADE_GITLAB_CONFIG_ARCHIVE="$_hook_archive" \
+             UPGRADE_GITLAB_VERSION="$CURRENT_VERSION" \
+             UPGRADE_GITLAB_CONTAINER="$CONTAINER_NAME" \
+             UPGRADE_GITLAB_SCRIPT_DIR="$SCRIPT_DIR" \
+             "$config_backup_hook"; then
+            echo "Warning: post-config-backup hook exited non-zero (continuing upgrade)" >&2
+        fi
+        _remove_config_encrypted
     fi
 fi
 

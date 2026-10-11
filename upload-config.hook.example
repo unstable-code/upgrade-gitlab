@@ -11,10 +11,12 @@
 #     export UPGRADE_GITLAB_CONFIG_HOOK=/absolute/path/to/upload-config.hook
 #
 # Receives via environment:
-#   UPGRADE_GITLAB_CONFIG_ARCHIVE — container-side path to the archive of the
-#                                   whole /etc/gitlab volume, made by
-#                                   `gitlab-ctl backup-etc` (e.g.
-#                                   "/etc/gitlab/config_backup/gitlab_config_1791452138_2026_10_08.tar")
+#   UPGRADE_GITLAB_CONFIG_ARCHIVE — container-side path to the configuration
+#                                   archive (e.g.
+#                                   "/etc/gitlab/config_backup/gitlab_config_1791452138_2026_10_08.tar").
+#                                   With UPGRADE_GITLAB_CONFIG_RECIPIENT set, it is
+#                                   the encrypted copy instead (….tar.age or
+#                                   ….tar.gpg), removed again after this hook.
 #   UPGRADE_GITLAB_BACKUP_DIR     — container-side path to GitLab's backup
 #                                   directory (e.g. "/var/opt/gitlab/backups")
 #   UPGRADE_GITLAB_VERSION        — version tag of the just-created snapshots
@@ -32,6 +34,10 @@
 # contains private keys and secrets (mode 600 inside the container), so keep
 # the upload target private, and apart from the application backup: an
 # encrypted database and its key should not live in the same place.
+# Set UPGRADE_GITLAB_CONFIG_RECIPIENT so that only an encrypted copy reaches
+# this hook: an age recipient (age1…), a file of age recipients, or a file
+# holding an armored PGP public key. Keep the private key away from the upload
+# target; without it the archive, and so the backup, cannot be restored.
 #
 # Hooks copied from an earlier version of this template `docker cp` two files,
 # $UPGRADE_GITLAB_BACKUP_DIR/gitlab.rb.<version>-backup and
@@ -51,6 +57,9 @@
 # before its first start, then restore the application backup. The container
 # definition lands in /etc/gitlab/config_backup/upgrade-gitlab-container.json;
 # its Config.Env and HostConfig recreate the original `docker run`.
+# For an encrypted copy, decrypt into the same command:
+#   age -d -i key.txt gitlab_config_*.tar.age | tar -xpf - -C /
+#   gpg -d gitlab_config_*.tar.gpg | tar -xpf - -C /
 #
 # Uncomment ONE of the upload sections below and fill in credentials
 # / bucket names. The first four backends mirror what GitLab itself
