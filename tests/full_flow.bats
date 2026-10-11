@@ -14,7 +14,7 @@ teardown() {
 @test "full-flow: 1-step upgrade succeeds" {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"Successfully updated"* ]]
 }
@@ -24,7 +24,7 @@ teardown() {
     export MOCK_GITLAB_VERSION="16.11.0-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export CI=true
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --no-step-limit --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --no-step-limit
     [ "$status" -eq 0 ]
     [[ "$output" == *"Successfully updated"* ]]
     [[ "$output" == *"ROUTING COUNT: 6"* ]]
@@ -34,7 +34,7 @@ teardown() {
 @test "full-flow: already up-to-date shows satisfied message" {
     export MOCK_GITLAB_VERSION="18.0.1-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"Requirements already satisfied"* ]]
 }
@@ -44,7 +44,7 @@ teardown() {
     export MOCK_GITLAB_VERSION="16.11.0-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export CI=true
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 1 ]
     [[ "$output" == *"Too many steps"* ]]
 }
@@ -54,7 +54,7 @@ teardown() {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export CI=true
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --no-step-limit --edition=ee --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --no-step-limit --edition=ee
     [ "$status" -eq 0 ]
     [[ "$output" == *"Successfully updated"* ]]
     [[ "$output" == *"Edition switch"* ]]
@@ -66,7 +66,7 @@ teardown() {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export CI=true
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --no-step-limit --edition=ee --version=17.11.3 --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --no-step-limit --edition=ee --version=17.11.3
     [ "$status" -eq 0 ]
     [[ "$output" != *"bad array subscript"* ]]
     [[ "$output" == *"Successfully updated GitLab server from 17.11.3-ce.0 to 17.11.3-ee.0"* ]]
@@ -79,7 +79,7 @@ teardown() {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export CI=true
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --no-step-limit --edition=ee --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --no-step-limit --edition=ee
     [ "$status" -eq 0 ]
     [[ "$output" == *"Switching edition at current version: 17.11.3-ce.0 -> 17.11.3-ee.0 (1/"* ]]
     [ "$(wc -l < "$MOCK_STATE_DIR/image_rm_args")" -ge 2 ]
@@ -94,7 +94,7 @@ teardown() {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export CI=true
-    bash "$PROJECT_ROOT/upgrade-gitlab" -y --no-step-limit --edition=ee --target-url=http://mock > "$MOCK_STATE_DIR/out.log" 2>&1 &
+    bash "$PROJECT_ROOT/upgrade-gitlab" -y --no-step-limit --edition=ee > "$MOCK_STATE_DIR/out.log" 2>&1 &
     pid=$!
     wait_for_marker "$MOCK_STATE_DIR/api_create"
     kill -TERM "$pid"   # SIGINT is ignored by background jobs; _handle_signal traps both
@@ -110,20 +110,9 @@ teardown() {
 @test "full-flow: 2-step upgrade succeeds within step limit" {
     export MOCK_GITLAB_VERSION="17.7.4-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"Successfully updated"* ]]
-}
-
-# ---------- Test 7: Missing TARGET_URL ----------
-@test "full-flow: missing TARGET_URL errors in unattended mode" {
-    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
-    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
-    unset TARGET_URL
-    unset CI
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
-    [ "$status" -eq 1 ]
-    [[ "$output" == *"TARGET_URL is required"* ]]
 }
 
 # ---------- Test 7b: Missing DISCORD_URL ----------
@@ -132,7 +121,7 @@ teardown() {
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     unset CI
     unset DISCORD_URL
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 1 ]
     [[ "$output" == *"DISCORD_URL is required"* ]]
 }
@@ -141,7 +130,7 @@ teardown() {
 @test "full-flow: upgrade shows backup creation messages" {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"Creating backups"* ]]
 }
@@ -150,7 +139,7 @@ teardown() {
 @test "full-flow: EE 2-step upgrade succeeds" {
     export MOCK_GITLAB_VERSION="17.7.4-ee.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"Successfully updated"* ]]
 }
@@ -160,7 +149,7 @@ teardown() {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_RUNNER_COUNT=2
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"Resumed previously paused runners"* ]]
 }
@@ -170,7 +159,7 @@ teardown() {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_PROJECT_COUNT=5
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"Creating backups"* ]]
     [[ "$output" == *"Successfully updated"* ]]
@@ -183,7 +172,7 @@ teardown() {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_PSQL_STATS_FAIL=1
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"Creating backups"* ]]
     [[ "$output" == *"Successfully updated"* ]]
@@ -194,7 +183,7 @@ teardown() {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_OBJECT_STORAGE="lfs artifacts packages"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock --skip-object-storage
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --skip-object-storage
     [ "$status" -eq 0 ]
     [[ "$output" == *"will be skipped during backup"* ]]
     # detected components reach gitlab-backup as a single SKIP= env, in detection order
@@ -206,7 +195,7 @@ teardown() {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_OBJECT_STORAGE="lfs uploads"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock --skip-lfs --skip-object-storage
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --skip-lfs --skip-object-storage
     [ "$status" -eq 0 ]
     # --skip-lfs seeds lfs; detection adds uploads but must not re-add lfs
     grep -q "SKIP=lfs,uploads" "$MOCK_STATE_DIR/backup_args"
@@ -218,7 +207,7 @@ teardown() {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_DEPRECATIONS="nginx['listen_port'] has been deprecated. Please use gitlab_rails['nginx']['listen_port'] instead."
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"Deprecations reported by gitlab-ctl reconfigure (1)"* ]]
     [[ "$output" == *"[17.11.3-ce.0] nginx['listen_port'] has been deprecated."* ]]
@@ -231,7 +220,7 @@ teardown() {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     unset MOCK_DEPRECATIONS
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" != *"Deprecations reported by gitlab-ctl reconfigure"* ]]
 }
@@ -243,7 +232,7 @@ teardown() {
     # agent_plan_content is both a gitlab-backup target and an object storage type,
     # so detection must let it through to SKIP= instead of dropping it.
     export MOCK_OBJECT_STORAGE="artifacts agent_plan_content"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock --skip-object-storage
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --skip-object-storage
     [ "$status" -eq 0 ]
     grep -q "SKIP=artifacts,agent_plan_content" "$MOCK_STATE_DIR/backup_args"
 }
@@ -255,7 +244,7 @@ teardown() {
     # dependency_proxy uses object storage but has no lib/backup/tasks/ entry, so
     # SKIP=dependency_proxy would be meaningless; the whitelist must filter it out.
     export MOCK_OBJECT_STORAGE="dependency_proxy lfs"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock --skip-object-storage
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --skip-object-storage
     [ "$status" -eq 0 ]
     grep -q "SKIP=lfs" "$MOCK_STATE_DIR/backup_args"
     ! grep -q "dependency_proxy" "$MOCK_STATE_DIR/backup_args"
@@ -265,7 +254,7 @@ teardown() {
 @test "full-flow: backup passes no SKIP when no skip flags are given" {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     ! grep -q "SKIP=" "$MOCK_STATE_DIR/backup_args"
 }
@@ -280,7 +269,7 @@ teardown() {
     export MOCK_PACK_SLEEP=1
     export MOCK_PACK_TOTAL=1000000
     export MOCK_BACKUP_TAR_SIZE=500000
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"Creating backup archive"* ]]
     [[ "$output" == *"Successfully updated"* ]]
@@ -292,7 +281,7 @@ teardown() {
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_PACK_SLEEP=1
     export MOCK_PACK_TOTAL_FAIL=1
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"Creating backup archive"* ]]
     [[ "$output" == *"Successfully updated"* ]]
@@ -302,7 +291,7 @@ teardown() {
 @test "full-flow: lfs progress denominator queries lfs_objects, not project_statistics" {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [ -f "$MOCK_STATE_DIR/lfs_disk_query" ]
     [[ "$output" == *"Successfully updated"* ]]
@@ -313,7 +302,7 @@ teardown() {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_LFS_DISK_FAIL=1
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [ -f "$MOCK_STATE_DIR/lfs_disk_query" ]
     [[ "$output" == *"Dumping lfs objects"* ]]
@@ -326,7 +315,7 @@ teardown() {
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     # id|job|table|column|jargs|status|age_sec  (1209600 sec = 14 days)
     export MOCK_STUCK_MIGRATIONS="42|FailingMigration|some_table|id|[]|4|1209600"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 1 ]
     [[ "$output" == *"FATAL ERROR! MANUAL INTERVENTION REQUIRED"* ]]
     [[ "$output" == *"failed(4)"* ]]
@@ -340,7 +329,7 @@ teardown() {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_STUCK_MIGRATIONS="12|BackfillShardingKeyAndCleanLabelLinksTable|label_links|id|[]|5|1209600"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 1 ]
     [[ "$output" == *"FATAL ERROR! MANUAL INTERVENTION REQUIRED"* ]]
     [[ "$output" == *"finalizing(5)"* ]]
@@ -355,7 +344,7 @@ teardown() {
     export MOCK_STUCK_MIGRATIONS="12|BackfillShardingKeyAndCleanLabelLinksTable|label_links|id|[]|5|1209600"
     # After auto-reset, the next stuck poll should return empty.
     export MOCK_STUCK_RESOLVE_AFTER=1
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --reset-stuck-finalizing --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --reset-stuck-finalizing
     [ "$status" -eq 0 ]
     [[ "$output" == *"Auto-resetting stuck finalizing(5)"* ]]
     [[ "$output" == *"reset to active(1)"* ]]
@@ -367,7 +356,7 @@ teardown() {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_STUCK_MIGRATIONS="7|SlowActiveMigration|t|c|[]|1|1209600"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"appears stale but is not finalized"* ]]
     [[ "$output" == *"id=7"* ]]
@@ -379,7 +368,7 @@ teardown() {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_STUCK_MIGRATIONS="42|FailingMigration|t|c|[]|4|1209600"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --reset-stuck-finalizing --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --reset-stuck-finalizing
     [ "$status" -eq 1 ]
     [[ "$output" == *"FATAL ERROR! MANUAL INTERVENTION REQUIRED"* ]]
     [[ "$output" == *"failed(4)"* ]]
@@ -403,7 +392,7 @@ HOOK
     chmod +x "$HOOK_DIR/hook.sh"
     export UPGRADE_GITLAB_CONFIG_HOOK="$HOOK_DIR/hook.sh"
 
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"Running post-config-backup hook"* ]]
     [ -f "$HOOK_OUT" ]
@@ -430,7 +419,7 @@ HOOK
     chmod +x "$HOOK_DIR/hook.sh"
     export UPGRADE_GITLAB_CONFIG_HOOK="$HOOK_DIR/hook.sh"
 
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"hook exited non-zero"* ]]
     [[ "$output" == *"Successfully updated"* ]]
@@ -459,7 +448,7 @@ HOOK
     chmod +x "$SCRIPT_DIR_TEST/upload-config.hook"
 
     unset UPGRADE_GITLAB_CONFIG_HOOK
-    run bash "$SCRIPT_DIR_TEST/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$SCRIPT_DIR_TEST/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"Auto-detected post-config-backup hook"* ]]
     [ -f "$HOOK_OUT" ]
@@ -481,7 +470,7 @@ HOOK
     # intentionally NOT chmod +x
 
     unset UPGRADE_GITLAB_CONFIG_HOOK
-    run bash "$SCRIPT_DIR_TEST/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$SCRIPT_DIR_TEST/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"exists but is not executable"* ]]
     [[ "$output" == *"Successfully updated"* ]]
@@ -494,7 +483,7 @@ HOOK
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_BBM_TABLE=missing
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     # Accurate "table not present (GitLab < 13.10)" wording, NOT the old generic one
     [[ "$output" == *"table not present (GitLab < 13.10)"* ]]
@@ -508,7 +497,7 @@ HOOK
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_SECRETS=bad
     # Rake exits 0 but reports "Total: 2 row(s) affected"; pre-upgrade check aborts in -y mode.
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -ne 0 ]
     [[ "$output" == *"found 2 undecryptable row(s) (pre-upgrade)"* ]]
     # The captured rake output is now shown (was hidden behind "review manually" before)
@@ -524,7 +513,7 @@ HOOK
     export MOCK_SECRETS=ok
     export MOCK_SECRETS_CRASH_BEFORE=2
     export _SECRETS_RETRY_SLEEP=0
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"retrying in 0s"* ]]
     [[ "$output" == *"Successfully updated"* ]]
@@ -539,7 +528,7 @@ HOOK
     # First 2 status reads return no up/down table (restart window), then recover.
     export MOCK_MIGRATE_STATUS_CRASH_BEFORE=2
     export _MIGRATE_STATUS_RETRY_SLEEP=0
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"Migration status not available yet"* ]]
     [[ "$output" == *"Successfully updated"* ]]
@@ -554,7 +543,7 @@ HOOK
     # status fails twice (services still starting), then comes up.
     export MOCK_CTL_STATUS_CRASH_BEFORE=2
     export _HEALTH_STATUS_RETRY_SLEEP=0
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"gitlab-ctl status not ready yet"* ]]
     [[ "$output" == *"Successfully updated"* ]]
@@ -565,7 +554,7 @@ HOOK
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_RUNNER_QUERY_FAIL=1
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"could not query the runner table"* ]]
     [[ "$output" == *"Successfully updated"* ]]
@@ -578,7 +567,7 @@ HOOK
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_NO_BACKUP_PATH=1
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"using GitLab default /var/opt/gitlab/backups"* ]]
     [[ "$output" == *"Successfully updated"* ]]
@@ -594,7 +583,7 @@ HOOK
     export _HEALTH_STATUS_RETRY_SLEEP=0
     export MOCK_LOGS="WARN: mattermost has been deprecated since 19.0 and was removed in 19.0.
 Removed configurations found in gitlab.rb. Aborting reconfigure."
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -ne 0 ]
     # Accurate guidance: the stock-install trigger lives in gitlab-secrets.json, not gitlab.rb
     [[ "$output" == *"gitlab-secrets.json"* ]]
@@ -614,7 +603,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     mkdir -p "$(dirname "$sf")"
     printf '3\n7\n' > "$sf"
 
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"Resuming post-upgrade checks"* ]]
     [[ "$output" == *"Resumed previously paused runners: 3,7"* ]]
@@ -628,7 +617,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_EXIT_CODE=137
     # No state file is seeded → RUNNER_STATE_FILE does not exist (empty leftover case).
 
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"Resuming post-upgrade checks"* ]]
     # No file → must not touch runners we never paused (e.g. admin-paused ones).
@@ -647,10 +636,10 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_EXIT_CODE=1                  # _prev_exit != 0 → recovery branch
     touch "$MOCK_STATE_DIR/stopped"          # container exited → absent from `docker ps`
 
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     # The stopped-container branch was actually taken (early "GitLab server" health wait ran)...
-    [[ "$output" == *"waiting until GitLab server container is ready"* ]]
+    [[ "$output" == *"waiting until GitLab server is ready"* ]]
     # ...without the function-ordering bug...
     [[ "$output" != *"poll_with_bouncing_bar"* ]]
     [[ "$output" != *"command not found"* ]]
@@ -670,7 +659,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_BACKUP_SLEEP=5                    # hold inside backup so we can signal mid-backup
     sf="$RUNNER_STATE_FILE"                        # persistent-first state path (see test_helper)
 
-    bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock > "$MOCK_STATE_DIR/out.log" 2>&1 &
+    bash "$PROJECT_ROOT/upgrade-gitlab" -y > "$MOCK_STATE_DIR/out.log" 2>&1 &
     pid=$!
     # wait deterministically until the backup has started (runners are already paused by now)
     wait_for_marker "$MOCK_STATE_DIR/backup_started"   # sanity: execution reached the backup
@@ -698,7 +687,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_RUNNING_JOBS=2
     export MOCK_RUNNING_JOBS_FINISH_AFTER=3      # notice, post-pause recount, one wait poll
     export _RUNNING_JOBS_POLL=0
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"2 CI job(s) are running right now (--running-jobs=wait"* ]]
     [[ "$output" == *"group/app"* ]]                                   # the job list is shown
@@ -718,7 +707,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_RUNNING_JOBS=1                    # never finishes
     export MOCK_MAINTENANCE=enabled
     export _RUNNING_JOBS_POLL=1
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock --running-jobs-timeout=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --running-jobs-timeout=1
     [ "$status" -eq 1 ]
     [[ "$output" == *"Aborted: 1 CI job(s) still running (not finished within --running-jobs-timeout=1s)"* ]]
     [[ "$output" == *"Resumed previously paused runners: 1,2"* ]]
@@ -731,7 +720,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_RUNNER_COUNT=2
     export MOCK_RUNNING_JOBS=1
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock --running-jobs=abort
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --running-jobs=abort
     [ "$status" -eq 1 ]
     [[ "$output" == *"Aborted: 1 CI job(s) still running (--running-jobs=abort)"* ]]
     [[ "$output" != *"Running CI jobs: ["* ]]
@@ -746,7 +735,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_RUNNING_JOBS=1
     export MOCK_RUNNING_JOBS_FINISH_AFTER=1       # only the notice sees it
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"1 CI job(s) are running right now"* ]]
     [[ "$output" != *"Running CI jobs: ["* ]]
@@ -754,10 +743,10 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
 }
 
 @test "full-flow: invalid --running-jobs values are rejected" {
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock --running-jobs=cancel
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --running-jobs=cancel
     [ "$status" -eq 1 ]
     [[ "$output" == *"--running-jobs must be 'wait' or 'abort'"* ]]
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock --running-jobs-timeout=30m
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --running-jobs-timeout=30m
     [ "$status" -eq 1 ]
     [[ "$output" == *"--running-jobs-timeout must be a whole number of seconds"* ]]
 }
@@ -774,7 +763,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_PSQL_STATS_FAIL=1                 # simple (bouncing-bar) backup branch
     export MOCK_BACKUP_SLEEP=2                    # only needs to outlast the signal below
 
-    bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock > "$MOCK_STATE_DIR/out.log" 2>&1 &
+    bash "$PROJECT_ROOT/upgrade-gitlab" -y > "$MOCK_STATE_DIR/out.log" 2>&1 &
     pid=$!
     wait_for_marker "$MOCK_STATE_DIR/backup_started"
     kill -TERM "$pid"
@@ -802,7 +791,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_BACKUP_IGNORES_TERM=1
     export _BACKUP_STOP_TIMEOUT=2
 
-    bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock > "$MOCK_STATE_DIR/out.log" 2>&1 &
+    bash "$PROJECT_ROOT/upgrade-gitlab" -y > "$MOCK_STATE_DIR/out.log" 2>&1 &
     pid=$!
     wait_for_marker "$MOCK_STATE_DIR/backup_started"
     kill -TERM "$pid"
@@ -822,7 +811,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_RUNNER_COUNT=2
     export MOCK_BACKUP_FAIL=1
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 1 ]
     [[ "$output" == *"backup failed (exit code 1)"* ]]
     [[ "$output" == *"not upgrading without a complete backup"* ]]
@@ -839,7 +828,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_RUNNER_COUNT=2
     export MOCK_CONFIG_BACKUP_FAIL=1
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 1 ]
     [[ "$output" == *"configuration backup of /etc/gitlab failed"* ]]
     [[ "$output" == *"No space left on device"* ]]        # the command's own output is shown
@@ -859,7 +848,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_SECRETS=bad                       # pre-upgrade secrets integrity check fails
     sf="$RUNNER_STATE_FILE"                        # persistent-first state path (see test_helper)
 
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 1 ]                                            # aborted on secrets failure
     [[ "$output" == *"secrets integrity check failure"* ]]
     [[ "$output" == *"Resumed previously paused runners: 1,2"* ]]  # EXIT trap caught the abort
@@ -876,7 +865,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     mkdir -p "$(dirname "$sf")"
     printf '9\n' > "$sf"                         # leftover from a prior aborted run
 
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     # union {9} ∪ {1,2}, sorted-unique = 1,2,9 → proves the file is merged AND used as source of truth
     # (the in-memory fallback alone would yield only 1,2).
@@ -889,7 +878,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_GITLAB_VERSION="17.11.3-ee.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_MAINTENANCE=enabled
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"Maintenance mode enabled"* ]]
     [[ "$output" == *"Maintenance mode disabled."* ]]
@@ -905,7 +894,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_GITLAB_VERSION="17.11.3-ee.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_MAINTENANCE=already
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"Maintenance mode is already enabled."* ]]
     [ ! -f "$MOCK_STATE_DIR/maintenance_disabled" ]
@@ -915,7 +904,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_MAINTENANCE=unavailable
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"Maintenance mode is not available"* ]]
     [[ "$output" == *"Successfully updated"* ]]
@@ -926,7 +915,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_GITLAB_VERSION="17.11.3-ee.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_MAINTENANCE=fail
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"could not enable maintenance mode"* ]]
     [[ "$output" == *"Successfully updated"* ]]
@@ -936,7 +925,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_GITLAB_VERSION="17.11.3-ee.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_MAINTENANCE=enabled
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock --no-maintenance-mode
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --no-maintenance-mode
     [ "$status" -eq 0 ]
     [ ! -f "$MOCK_STATE_DIR/maintenance_probe" ]
     [ ! -f "$MOCK_STATE_DIR/rails_runner_calls" ]   # no flag needs rails → no boot at all
@@ -948,7 +937,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_MAINTENANCE=enabled
     export MOCK_OBJECT_STORAGE="lfs artifacts"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock --skip-object-storage
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --skip-object-storage
     [ "$status" -eq 0 ]
     # the maintenance_mode= result line must not leak into SKIP=
     grep -q "SKIP=lfs,artifacts" "$MOCK_STATE_DIR/backup_args"
@@ -962,7 +951,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_MAINTENANCE=enabled
     export MOCK_SECRETS=bad                       # pre-upgrade secrets check fails after the backup
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 1 ]
     [[ "$output" == *"secrets integrity check failure"* ]]
     [[ "$output" == *"Maintenance mode disabled."* ]]
@@ -974,7 +963,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     mkdir -p "$(dirname "$MAINTENANCE_STATE_FILE")"
     : > "$MAINTENANCE_STATE_FILE"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"Requirements already satisfied"* ]]
     [[ "$output" == *"Maintenance mode disabled."* ]]
@@ -994,7 +983,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_RAILS_SLEEP=3                     # hold inside the enable boot
 
     set -m                                        # own process group: pgid == pid
-    bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock > "$MOCK_STATE_DIR/out.log" 2>&1 &
+    bash "$PROJECT_ROOT/upgrade-gitlab" -y > "$MOCK_STATE_DIR/out.log" 2>&1 &
     pid=$!
     set +m
     wait_for_marker "$MOCK_STATE_DIR/maintenance_probe"   # sanity: the enable is in flight
@@ -1022,7 +1011,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     : > "$MAINTENANCE_STATE_FILE"
     printf '5\n' > "$RUNNER_STATE_FILE"
 
-    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run
     [ "$status" -eq 0 ]
     [[ "$output" == *"DRY-RUN: Upgrade Path"* ]]
     [ -f "$MAINTENANCE_STATE_FILE" ]
@@ -1036,7 +1025,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_MAINTENANCE=enabled
     export MOCK_MAINTENANCE_DISABLE_FAIL=1
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [[ "$output" == *"could not disable maintenance mode"* ]]
     [ -f "$MAINTENANCE_STATE_FILE" ]
     # The kept state file would otherwise make the EXIT trap retry immediately; a second
@@ -1052,7 +1041,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_LOG_DRIVER=db                    # Synology ContainerManager default
 
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"recreated with json-file"* ]]
     # db deadlocks dockerd when stop races an attached `docker logs --follow`, so it must not survive.
@@ -1066,7 +1055,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_LOG_DRIVER=syslog
     export MOCK_LOG_OPTS='{"syslog-address":"udp://1.2.3.4:514"}'
 
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     # Previously the recreate dropped log settings, silently reverting to the daemon default.
     jq -e '.HostConfig.LogConfig == {Type: "syslog", Config: {"syslog-address": "udp://1.2.3.4:514"}}' \
@@ -1080,7 +1069,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_LOG_DRIVER=db
     export UPGRADE_GITLAB_LOG_DRIVER=db          # opt back in despite the deadlock risk
 
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     jq -e '.HostConfig.LogConfig.Type == "db"' "$MOCK_STATE_DIR/api_create"
 }
@@ -1090,7 +1079,7 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"   # 1-step upgrade
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
 
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     # The 10s default SIGKILLs GitLab (ExitCode 137); a real shutdown measures 32-55s.
     grep -q -- 'stop -t 300' "$MOCK_STATE_DIR/stop_args"
@@ -1129,7 +1118,7 @@ HOOK
     export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_DERIVED_IMAGE=1
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     _write_image_hook ok
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"Container runs a derived image: gitlab-ce-patched:17.11.3-ce.0"* ]]
     [[ "$output" == *"Successfully updated"* ]]
@@ -1145,7 +1134,7 @@ HOOK
     export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_DERIVED_IMAGE=1
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     unset UPGRADE_GITLAB_IMAGE_HOOK
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 1 ]
     [[ "$output" == *"runs a derived image (gitlab-ce-patched:17.11.3-ce.0) but no image hook is configured"* ]]
     [[ "$output" == *"refusing to drop the patches in unattended mode (-y)"* ]]
@@ -1168,7 +1157,7 @@ HOOK
     export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_DERIVED_IMAGE=1
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     _write_image_hook fail
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 1 ]
     [[ "$output" == *"image hook failed for gitlab/gitlab-ce:"* ]]
     # The hook's own output is shown so the cause is visible.
@@ -1183,7 +1172,7 @@ HOOK
     export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_DERIVED_IMAGE=1
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     _write_image_hook official
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 1 ]
     [[ "$output" == *"which is not derived from gitlab/gitlab-ce:"* ]]
     [ ! -f "$MOCK_STATE_DIR/stop_args" ]
@@ -1194,7 +1183,7 @@ HOOK
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     echo '#!/bin/bash' > "$MOCK_STATE_DIR/build-image.hook"
     export UPGRADE_GITLAB_IMAGE_HOOK="$MOCK_STATE_DIR/build-image.hook"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 1 ]
     [[ "$output" == *"UPGRADE_GITLAB_IMAGE_HOOK is not executable"* ]]
     [ ! -f "$MOCK_STATE_DIR/backup_args" ]
@@ -1215,7 +1204,7 @@ HOOK
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export CI=true
     _write_image_hook ok
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --no-step-limit --edition=ee --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --no-step-limit --edition=ee
     [ "$status" -eq 0 ]
     [[ "$output" == *"Edition switch"* ]]
     grep -q "^base=gitlab/gitlab-ee:17.11.3-ee.0 edition=ee " "$MOCK_STATE_DIR/image_hook_calls"
@@ -1225,7 +1214,7 @@ HOOK
 @test "image prep: a failed pull stops before the old container is stopped" {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_PULL_FAIL=1
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 1 ]
     [[ "$output" == *"could not pull gitlab/gitlab-ce:"* ]]
     [[ "$output" == *"is still running 17.11.3-ce.0"* ]]
@@ -1255,7 +1244,7 @@ _inspect_patch_full='
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_INSPECT_PATCH="$_inspect_patch_full"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     body=$(tail -n1 "$MOCK_STATE_DIR/api_create")
     # Only what the user added; PATH/LANG from the old image would pin it onto the new one.
@@ -1286,7 +1275,7 @@ _inspect_patch_full='
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_INSPECT_PATCH='.HostConfig.ShmSize = 67108864'
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     [[ "$output" == *"runs with a 64MB /dev/shm"*"recreated with 256MB"* ]]
     jq -e '.HostConfig.ShmSize == 268435456' "$MOCK_STATE_DIR/api_create"
@@ -1296,7 +1285,7 @@ _inspect_patch_full='
     export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_DERIVED_IMAGE=1
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     _write_image_hook ok
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     # Copied onto the container, the old base would outlive the new image's own label.
     jq -e '.Labels == {}' "$MOCK_STATE_DIR/api_create"
@@ -1305,7 +1294,7 @@ _inspect_patch_full='
 @test "recreate: a rejected create stops before the old container is stopped" {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_CREATE_FAIL=1
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 1 ]
     [[ "$output" == *"could not create the replacement container (HTTP 400): mock create rejected"* ]]
     [[ "$output" == *"is still running 17.11.3-ce.0"* ]]
@@ -1315,7 +1304,7 @@ _inspect_patch_full='
 
 @test "recreate: a non-unix Docker endpoint is refused before anything runs" {
     export MOCK_DOCKER_ENDPOINT="ssh://admin@nas"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 1 ]
     [[ "$output" == *"'ssh://admin@nas' is not a unix socket"* ]]
     [ ! -f "$MOCK_STATE_DIR/backup_args" ]
@@ -1323,7 +1312,7 @@ _inspect_patch_full='
 
 @test "recreate: an unreachable Engine API is refused before anything runs" {
     export MOCK_API_UNREACHABLE=1
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 1 ]
     [[ "$output" == *"cannot call the Docker Engine API on /var/run/docker.sock (API version: 1.43)"* ]]
     [ ! -f "$MOCK_STATE_DIR/backup_args" ]
@@ -1333,7 +1322,7 @@ _inspect_patch_full='
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     export MOCK_INSPECT_PATCH='.HostConfig.RestartPolicy = {Name: "on-failure", MaximumRetryCount: 3}'
-    run bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     # A new version that dies in reconfigure must not be rebooted in a loop.
     jq -e '.HostConfig.RestartPolicy == {Name: "no", MaximumRetryCount: 0}' "$MOCK_STATE_DIR/api_create"
@@ -1347,7 +1336,7 @@ _inspect_patch_full='
     # the next checkpoint with the hop-1 container (created with no) up and verified.
     export MOCK_GITLAB_VERSION="17.3.7-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
-    bash "$PROJECT_ROOT/upgrade-gitlab" -y --no-step-limit --target-url=http://mock > "$MOCK_STATE_DIR/out.log" 2>&1 &
+    bash "$PROJECT_ROOT/upgrade-gitlab" -y --no-step-limit > "$MOCK_STATE_DIR/out.log" 2>&1 &
     pid=$!
     wait_for_marker "$MOCK_STATE_DIR/api_create"
     kill -TERM "$pid"   # SIGINT is ignored by background jobs; _handle_signal traps both
@@ -1361,7 +1350,7 @@ _inspect_patch_full='
     grep -q "gitlab is running $now\.$" "$MOCK_STATE_DIR/out.log"
 }
 
-# ---------- CI-mode HTTP readiness follows the healthcheck rc (#24) ----------
+# ---------- HTTP readiness is checked inside the container, at the healthcheck rc address (#24) ----------
 @test "http ready: the in-container check uses the address from gitlab-healthcheck-rc" {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
@@ -1371,7 +1360,7 @@ _inspect_patch_full='
     export MOCK_HEALTHCHECK_RC="$MOCK_STATE_DIR/healthcheck-rc"
     export MOCK_READY_URL="https://localhost:8443/gitlab/users/sign_in"
     # SIGKILL: a SIGTERM inside the critical zone is only deferred, so it would not end a hung poll.
-    run timeout -s KILL 120 bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run timeout -s KILL 120 bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     grep -q -- "--insecure $MOCK_READY_URL$" "$MOCK_STATE_DIR/sign_in_curl_args"
 }
@@ -1382,7 +1371,7 @@ _inspect_patch_full='
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     unset MOCK_HEALTHCHECK_RC
     export MOCK_READY_URL="http://localhost/users/sign_in"
-    run timeout -s KILL 120 bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run timeout -s KILL 120 bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 0 ]
     grep -q "http://localhost/users/sign_in$" "$MOCK_STATE_DIR/sign_in_curl_args"
 }
@@ -1392,11 +1381,11 @@ _inspect_patch_full='
     export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_RENAME_FAIL=1
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     # SIGKILL: a SIGTERM inside the critical zone is only deferred, so it would not end a hung poll.
-    run timeout -s KILL 120 bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock
+    run timeout -s KILL 120 bash "$PROJECT_ROOT/upgrade-gitlab" -y
     [ "$status" -eq 1 ]
     [[ "$output" == *"could not start the replacement container"* ]]
     [[ "$output" == *"FATAL ERROR: MANUAL INTERVENTION IS REQUIRED"* ]]
-    [[ "$output" != *"waiting until"*"server boots"* ]]
+    [[ "$output" != *"waiting until"*"is ready"* ]]
 }
 
 @test "recreate: a run logging to a file keeps the whole log" {
@@ -1407,10 +1396,60 @@ _inspect_patch_full='
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     status=0
-    timeout -s KILL 120 bash "$PROJECT_ROOT/upgrade-gitlab" -y --target-url=http://mock \
+    timeout -s KILL 120 bash "$PROJECT_ROOT/upgrade-gitlab" -y \
         > "$MOCK_STATE_DIR/run.log" 2>&1 || status=$?
     [ "$status" -eq 0 ]
     [ -f "$MOCK_STATE_DIR/api_create" ]                       # the API was called
     grep -q "Detected gitlab container" "$MOCK_STATE_DIR/run.log"   # logged before that call
     grep -q "Successfully updated" "$MOCK_STATE_DIR/run.log"
+}
+
+# ---------- Readiness waits end (#25) ----------
+@test "ready wait: a container that never turns healthy stops the run at --ready-timeout" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_HEALTH_STATUS=starting
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    # SIGKILL: a SIGTERM inside the critical zone is only deferred, so it would not end a hung poll.
+    run timeout -s KILL 120 bash "$PROJECT_ROOT/upgrade-gitlab" -y --ready-timeout=2
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"gave up waiting for"*"after 2s (--ready-timeout)"* ]]
+    [[ "$output" == *"FATAL ERROR: MANUAL INTERVENTION IS REQUIRED"* ]]
+    [[ "$output" == *"Runners stay paused and maintenance mode stays on"* ]]
+    # Holds are kept like a fatal error: the restart policy is not restored.
+    [ ! -f "$MOCK_STATE_DIR/update_args" ]
+}
+
+@test "ready wait: a container stopped with exit code 0 is treated as dead" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_HEALTH_STATUS=starting MOCK_RUNNING=false
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    run timeout -s KILL 120 bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"gitlab container is not running (exit code 0)"* ]]
+    [[ "$output" == *"FATAL ERROR: MANUAL INTERVENTION IS REQUIRED"* ]]
+}
+
+@test "ready wait: an image without a health check relies on the HTTP check" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_HEALTH_STATUS=none
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    run timeout -s KILL 120 bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"has no health check; relying on the HTTP check only."* ]]
+    [[ "$output" == *"Successfully updated"* ]]
+}
+
+@test "ready wait: an interrupt during the wait is announced and the wait goes on" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_HEALTH_STATUS=starting
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    # Signal the script alone, as the other interrupt tests do. A group-wide signal (a terminal's
+    # Ctrl+C, or `timeout` forwarding one) also kills the docker client of the swap itself; that is
+    # a separate gap (#31), not what this test covers. --ready-timeout bounds the run.
+    bash "$PROJECT_ROOT/upgrade-gitlab" -y --ready-timeout=4 > "$MOCK_STATE_DIR/out.log" 2>&1 &
+    pid=$!
+    wait_for_marker "$MOCK_STATE_DIR/rename_args"   # the replacement is up, the wait has begun
+    kill -TERM "$pid"   # SIGINT is ignored by background jobs; _handle_signal traps both
+    status=0
+    wait "$pid" || status=$?
+    # The wait did not break on the signal; the timeout ended it.
+    [ "$status" -eq 1 ]
+    grep -q "Interrupt received. The container is already running" "$MOCK_STATE_DIR/out.log"
+    grep -q "gave up waiting for" "$MOCK_STATE_DIR/out.log"
 }

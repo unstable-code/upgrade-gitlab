@@ -134,12 +134,25 @@ setup() {
     [[ "$output" == *"=== DRY-RUN: Upgrade Path ==="* ]]
 }
 
-# ---------- Test 13: --discord-url and --target-url are accepted ----------
-@test "--discord-url and --target-url set variables correctly" {
+# ---------- Test 13: --discord-url is accepted, --target-url is removed (#25) ----------
+@test "--discord-url sets the variable correctly" {
     export MOCK_GITLAB_VERSION="18.0.1-ce.0"
-    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --discord-url=https://discord.test/hook --target-url=http://gitlab.test
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --discord-url=https://discord.test/hook
     [ "$status" -eq 0 ]
     [[ "$output" == *"=== DRY-RUN: Upgrade Path ==="* ]]
+}
+
+@test "--target-url is rejected as removed" {
+    export MOCK_GITLAB_VERSION="18.0.1-ce.0"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --target-url=http://gitlab.test
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"--target-url has been removed"* ]]
+}
+
+@test "--ready-timeout rejects a non-numeric value" {
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --ready-timeout=10m
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"--ready-timeout must be a whole number of seconds"* ]]
 }
 
 # ---------- Test 14: --source flag is removed ----------

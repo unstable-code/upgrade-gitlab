@@ -37,6 +37,9 @@ use_maintenance_mode=1
 _maintenance_enabled_by_us=0
 running_jobs_mode="wait"
 running_jobs_timeout=0
+# 교체한 컨테이너가 준비되기를 기다리는 상한(초, 0 = 무제한). Docker 이미지는 부팅하면서 reconfigure와
+# 마이그레이션을 함께 돌리므로, 큰 인스턴스의 메이저 hop은 수십 분이 걸릴 수 있다(#25).
+ready_timeout=3600
 reset_stuck_finalizing=0
 max_tier_flag=
 _interrupted=0
@@ -608,6 +611,17 @@ _release_upgrade_holds() {
     _restore_restart_policy
 }
 
+# FATAL 배너. critical zone 안에서 끝나는 FATAL은 hold를 풀지 않으므로(EXIT 트랩이 건드리지 않는다)
+# 무엇이 남는지와 어떻게 푸는지를 함께 알린다. 러너와 maintenance mode는 상태 파일이 있어 다음
+# 실행이 풀고, 재시작 정책은 상태 파일이 없어 손으로 되돌려야 한다(#30). critical zone 밖이면
+# EXIT 트랩이 풀어 주므로 배너만 낸다.
+_fatal_banner_keep_holds() {
+    echo -e '\e[1;5;37;41mFATAL ERROR: MANUAL INTERVENTION IS REQUIRED\e[0m' >&2
+    [ "$_trap_active" -eq 1 ] || return 0
+    echo "Runners stay paused and maintenance mode stays on; re-run this script once GitLab is up to release them." >&2
+    [ "$auto_restart_enabled" = no ] || echo "The container runs with RestartPolicy no; set it back by hand: docker update --restart=$auto_restart_enabled $CONTAINER_NAME" >&2
+}
+
 # --- 실행 중인 CI 작업(#17) ---
 # 러너 일시정지는 새 작업 할당만 막으므로, 이미 도는 작업은 백업과 업그레이드 도중에도 계속
 # 쓴다. 이 스크립트는 작업을 끊지 않는다 — 끝날 때까지 기다리거나(wait), 업그레이드를
@@ -738,7 +752,7 @@ _wait_for_running_jobs() {
 }
 
 if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
-    echo "Usage: $0 [-y] [--edition=ce|ee] [--target-url=http] [--discord-url=http] [--version=0.0.0] [--skip-latest] [--skip-lfs] [--skip-object-storage] [--no-maintenance-mode] [--running-jobs=wait|abort] [--running-jobs-timeout=SECONDS] [--no-step-limit] [--dry-run] [--reset-stuck-finalizing] [--max-tier=core|starter|premium|ultimate]"
+    echo "Usage: $0 [-y] [--edition=ce|ee] [--discord-url=http] [--version=0.0.0] [--skip-latest] [--skip-lfs] [--skip-object-storage] [--no-maintenance-mode] [--running-jobs=wait|abort] [--running-jobs-timeout=SECONDS] [--ready-timeout=SECONDS] [--no-step-limit] [--dry-run] [--reset-stuck-finalizing] [--max-tier=core|starter|premium|ultimate]"
 
     echo -e '\n\e[0;1mOPTIONS\e[m'
     echo -e "-y, --yes\t\tAuto-confirm prompts for unattended/cron usage. Aborts on safety warnings and if upgrade path >= 3 steps. Requires DISCORD_URL unless CI=true."
@@ -748,18 +762,17 @@ if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
     echo -e "--skip-latest\t\tTarget the latest patch of the previous minor version (N-1 strategy). Can combine with major-only --version (e.g. --version=18 --skip-latest). (alias: --n-1)"
     echo -e "--dry-run\t\tCompute and display upgrade path without executing. Implies -y."
     echo -e "--no-step-limit\t\tDisable the 3-step safety limit for -y mode. Requires CI=true."
-    echo -e "--target-url=http\tPerform a simple connection test for your GitLab server."
     echo -e "--skip-lfs\t\tSkip LFS objects during backup (passes SKIP=lfs to gitlab-backup)."
     echo -e "--skip-object-storage\tSkip every resource already offloaded to object storage (detected via gitlab-rails) from the backup. Assumes the bucket is backed up separately; prints exactly what it skips."
     echo -e "--no-maintenance-mode\tDo not enable GitLab maintenance mode for the upgrade. By default it is enabled right before the backup when the instance supports it (checked at runtime; CE/unlicensed instances are skipped silently) and disabled when the run ends. A mode that was already on is left on."
     echo -e "--running-jobs=MODE\tWhat to do with CI jobs still running once the runners are paused: 'wait' (default) until they finish, or 'abort' the upgrade without touching them. Interactive runs ask, with this as the default. CI jobs are never cancelled by this script."
     echo -e "--running-jobs-timeout=SECONDS\tUpper bound for --running-jobs=wait. 0 (default) waits indefinitely so a deployment job is never cut off; when exceeded, the upgrade is aborted before the backup."
+    echo -e "--ready-timeout=SECONDS\tUpper bound for waiting until a started container is ready (HTTP sign-in page and Docker health check, both checked inside the container). Default 3600; 0 waits indefinitely. When exceeded, interactive runs ask whether to keep waiting; -y stops with exit 1 and leaves the runners paused and maintenance mode on, like a fatal error."
     echo -e "--reset-stuck-finalizing\tReset batched_background_migrations rows stuck in status=finalizing(5) for >7 days back to active(1) so GitLab can re-finalize them. Does NOT execute the finalize rake task itself."
     echo -e "--max-tier=TIER\t\tUpper tier bound for the 'What is new since' link in the completion webhook. One of core/starter/premium/ultimate. Default: core for CE, ultimate for EE."
     echo -e "--discord-url=http\tNotify via Discord webhook."
 
     echo -e '\n\e[0;1mENV VALUES\e[m'
-    echo -e "TARGET_URL=http\t\tSame as --target-url flag."
     echo -e "DISCORD_URL=http\tSame as --discord-url flag."
     echo -e "UPGRADE_GITLAB_CONFIG_HOOK=PATH\tExecutable run after the /etc/gitlab archive is created and old config backups are pruned. If unset, an executable file named 'upload-config.hook' next to this script is auto-detected. Receives env vars UPGRADE_GITLAB_CONFIG_ARCHIVE and UPGRADE_GITLAB_BACKUP_DIR (container-side paths; use 'docker cp' to extract), UPGRADE_GITLAB_VERSION, UPGRADE_GITLAB_CONTAINER, UPGRADE_GITLAB_SCRIPT_DIR. Hook failure logs a warning but does not abort the upgrade. See upload-config.hook.example."
     echo -e "UPGRADE_GITLAB_IMAGE_HOOK=PATH\tExecutable that builds the image to run for each hop, for instances running an official image plus local patches. If unset, an executable file named 'build-image.hook' next to this script is auto-detected. Receives UPGRADE_GITLAB_BASE_IMAGE (e.g. gitlab/gitlab-ee:19.4.1-ee.0), UPGRADE_GITLAB_VERSION, UPGRADE_GITLAB_EDITION, UPGRADE_GITLAB_CONTAINER, UPGRADE_GITLAB_SCRIPT_DIR; must print the image to run as the last stdout line, and that image must carry the label ${_BASE_LABEL}=<base image>. See build-image.hook.example. It runs before the old container is stopped, and a failure stops the upgrade with the current version still running. A container running such a derived image without a hook would drop its patches: interactive runs ask (y/N), -y refuses."
@@ -843,10 +856,14 @@ else
                 # Edition suffix will be applied after GITLAB_EDITION is determined
                 target_version_tag=$temp
             elif [[ "${params[$i]}" == "--target-url"* ]]; then
-                if [ -n "$TARGET_URL" ]; then
-                    echo "Warning: Overriding TARGET_URL from $TARGET_URL to $temp"
+                echo "Error: --target-url has been removed. Readiness is now checked inside the container, at the address GitLab itself renders for its health check." >&2
+                exit 1
+            elif [[ "${params[$i]}" == "--ready-timeout"* ]]; then
+                if ! [[ "$temp" =~ ^[0-9]+$ ]]; then
+                    echo "Error: --ready-timeout must be a whole number of seconds (0 = wait indefinitely)" >&2
+                    exit 1
                 fi
-                TARGET_URL=$temp
+                ready_timeout=$temp
             elif [[ "${params[$i]}" == "--discord-url"* ]]; then
                 if [ -n "$DISCORD_URL" ]; then
                     echo "Warning: Overriding DISCORD_URL from $DISCORD_URL to $temp"
@@ -1291,14 +1308,13 @@ _swap_container() {
     fi
 
     if ! _start_next_container; then
-        echo -e '\e[1;5;37;41mFATAL ERROR: MANUAL INTERVENTION IS REQUIRED\e[0m' >&2
+        _fatal_banner_keep_holds
         send_discord_webhook "ERR" "Replacement container did not start" "$cur was removed and $label could not be started. Check 'docker ps -a' on the host."
         exit 1
     fi
     RUNNING_IMAGE=$_run_image
 
-    wait_for_http_ready "$label"
-    wait_for_healthy "$label"
+    wait_for_ready "$label"
 }
 
 send_discord_webhook() {
@@ -1871,39 +1887,38 @@ _HTTP_READY_SH='url=http://localhost/help; flags=()
 [ -f "$1" ] && . "$1"
 curl -sf -m 3 -o /dev/null -w "%{http_code}" "${flags[@]}" "${url%/help}/users/sign_in"'
 
-wait_for_http_ready() {
-    local label=$1
-    echo "waiting until $label server boots..."
-    # shellcheck disable=SC2329
-    if [ "${CI:-}" = "true" ]; then
-        # CI/DinD: 컨테이너 내부에서 curl (네트워크 격리 및 IP 변경 문제 회피)
-        # 주소는 컨테이너의 HEALTHCHECK(gitlab-healthcheck)가 쓰는 rc 파일에서 얻는다(#24). omnibus가
-        # reconfigure 때 nginx의 실제 listen 포트, https 여부, 상대 경로를 반영해 렌더하므로,
-        # external_url에 포트를 주거나 https를 쓰는 구성에서도 맞는다. localhost:80 고정이던 때는
-        # 그런 구성에서 이 대기가 끝나지 않았다. rc는 이미지가 아니라 reconfigure가 만드는 파일이라
-        # 새 컨테이너에서는 처음에 없다. 그동안과 rc가 없는 옛 버전에서는 예전 주소를 쓴다.
-        _http_ready_check() {
-            [ "$(docker exec "$CONTAINER_NAME" bash -c "$_HTTP_READY_SH" _ /opt/gitlab/etc/gitlab-healthcheck-rc 2>/dev/null)" = '200' ]
-        }
-    else
-        _http_ready_check() {
-            [ "$(curl -sf -m 3 -o /dev/null "$TARGET_URL/users/sign_in" -w "%{http_code}" 2>/dev/null)" = '200' ]
-        }
-    fi
-    poll_with_bouncing_bar "HTTP Ready" _http_ready_check
-    unset -f _http_ready_check
-    echo 'done'
+# 컨테이너 안에서 sign_in 페이지가 200인지 본다. 호스트에서 묻지 않는다: 사용자가 준 URL은 이
+# 컨테이너가 아닌 다른 서버(같은 호스트의 다른 GitLab, 점검 페이지를 200으로 내는 프록시)를
+# 가리킬 수 있고, external_url은 NAT loopback이 없는 호스트에서 닿지 않는다(#25). 주소는
+# 컨테이너의 HEALTHCHECK(gitlab-healthcheck)가 쓰는 rc 파일에서 얻는다(#24). omnibus가
+# reconfigure 때 nginx의 실제 listen 포트, https 여부, 상대 경로를 반영해 렌더하므로,
+# external_url에 포트를 주거나 https를 쓰는 구성에서도 맞는다. rc는 이미지가 아니라 reconfigure가
+# 만드는 파일이라 새 컨테이너에서는 처음에 없다. 그동안과 rc가 없는 옛 버전에서는 예전 주소를 쓴다.
+_http_ready_check() {
+    [ "$(docker exec "$CONTAINER_NAME" bash -c "$_HTTP_READY_SH" _ /opt/gitlab/etc/gitlab-healthcheck-rc 2>/dev/null)" = '200' ]
 }
 
-wait_for_healthy() {
+# Docker health 상태. HEALTHCHECK가 없는 이미지(파생 이미지의 HEALTHCHECK NONE 등)는 none이다.
+_health_status() {
+    docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER_NAME" 2>/dev/null
+}
+
+# shellcheck disable=SC2329
+_ready_check() {
+    case "$(_health_status)" in
+        healthy|none) _http_ready_check ;;
+        *) return 1 ;;
+    esac
+}
+
+# wait_for_ready <label> — 컨테이너가 준비될 때까지 기다린다: 컨테이너 안에서 sign_in이 200이고,
+# HEALTHCHECK가 있으면 healthy일 것. 두 조건을 한 대기에서 보므로 --ready-timeout은 컨테이너
+# 하나에 상한 하나다. HEALTHCHECK가 없으면 HTTP 확인만으로 판단한다.
+wait_for_ready() {
     local label=$1
-    echo "waiting until $label container is ready..."
-    # shellcheck disable=SC2329
-    _healthy_check() {
-        [ "$(docker inspect --format='{{.State.Health.Status}}' "$CONTAINER_NAME" | grep -v unhealthy | grep -c healthy)" -eq 1 ]
-    }
-    poll_with_bouncing_bar "Health Check" _healthy_check
-    unset -f _healthy_check
+    echo "waiting until $label is ready..."
+    [ "$(_health_status)" != none ] || echo "$label has no health check; relying on the HTTP check only."
+    poll_with_bouncing_bar "Ready" _ready_check
     echo 'done'
 }
 
@@ -2024,14 +2039,19 @@ print_stacktrace_errors() {
     if [ $_in_stacktrace -eq 1 ]; then
         return 0
     fi
-    if [ "$(docker inspect --format='{{.State.ExitCode}}' "$CONTAINER_NAME")" -ne 0 ]; then
+    # 0으로 끝난 컨테이너(대기 중에 누가 docker stop 한 경우 등)도 죽은 것이다: 종료 코드만 보면
+    # 통과해서, 준비 대기가 영영 오지 않을 조건을 기다리게 된다(#25). 실행 중인 컨테이너의
+    # 종료 코드는 시작할 때 0으로 초기화된다.
+    local running exit_code
+    read -r running exit_code < <(docker inspect --format='{{.State.Running}} {{.State.ExitCode}}' "$CONTAINER_NAME")
+    if [ "$running" != true ] || [ "${exit_code:-0}" -ne 0 ]; then
         _in_stacktrace=1
-        echo -e "\nError: gitlab container died with the following status code: $(docker inspect --format='{{.State.ExitCode}}' "$CONTAINER_NAME")" >&2
+        echo -e "\nError: gitlab container is not running (exit code $exit_code)" >&2
 
         local logs
         logs=$(docker logs --tail 200 "$CONTAINER_NAME" 2>&1)
         echo "$logs" >&2
-        echo -e '\e[1;5;37;41mFATAL ERROR: MANUAL INTERVENTION IS REQUIRED\e[0m' >&2
+        _fatal_banner_keep_holds
 
         if echo "$logs" | grep -q "Removed configurations found in gitlab.rb"; then
             # 메이저 업그레이드에서 제거된 설정 키 때문에 reconfigure가 중단된 경우.
@@ -2740,8 +2760,34 @@ run_with_progress_bar() {
     return $rc
 }
 
+# 준비 대기가 --ready-timeout을 넘었을 때. 대화형 실행은 더 기다릴지 묻고(기본은 기다림), -y는
+# 묻지 않고 멈춘다. 0을 돌려주면 같은 시간만큼 더 기다린다.
+_ready_timeout_keep_waiting() {
+    echo "Warning: $1 has not become ready within ${ready_timeout}s." >&2
+    [ "$auto_yes" -eq 0 ] || return 1
+    local answer
+    echo -n "[w]ait another ${ready_timeout}s or [a]bort the upgrade? (default: wait) > "
+    read -r answer < "$_tty"
+    case "$answer" in
+        a|A) return 1 ;;
+    esac
+}
+
+# 타임아웃으로 멈춘다. 컨테이너는 살아 있지만 준비됐는지 모르는 상태라, print_stacktrace_errors의
+# FATAL처럼 hold를 남긴 채 끝낸다(_fatal_banner_keep_holds). 준비된 뒤 다시 실행하면 already-satisfied
+# 경로가 푼다.
+_ready_timeout_fatal() {
+    echo "Error: gave up waiting for $1 after ${ready_timeout}s (--ready-timeout). Last container logs:" >&2
+    docker logs --tail 50 "$CONTAINER_NAME" 2>&1 | sed 's/^/  /' >&2
+    _fatal_banner_keep_holds
+    send_discord_webhook "ERR" "Container not ready after ${ready_timeout}s" "$1 did not become ready. Holds are kept; re-run the script once GitLab is ready."
+    exit 1
+}
+
 # poll_with_bouncing_bar <label> <check_cmd...>
-# check_cmd가 성공(exit 0)할 때까지 바운싱 바 + docker logs 표시
+# check_cmd가 성공(exit 0)할 때까지 바운싱 바 + docker logs 표시. 준비 대기(wait_for_ready)의 바탕이라
+# --ready-timeout과 대기 중 인터럽트 안내도 여기서 다룬다. check_cmd는 docker exec를 부르므로 바를
+# 그리는 0.2초마다가 아니라 사망 검사와 같은 ~1초마다 실행한다.
 poll_with_bouncing_bar() {
     local label=$1
     shift
@@ -2758,6 +2804,7 @@ poll_with_bouncing_bar() {
     local bg_color bar_width padding_left padding_right bar_line
     local last_line_count=0
     local tick=0
+    local deadline=$((SECONDS + ready_timeout)) interrupt_noted=0 timed_out=0
 
     # docker logs --follow --tail 0: 새로운 로그만 스트리밍 (CI/DinD에서는 TCP hang 방지를 위해 생략)
     local logs_pid=
@@ -2766,7 +2813,11 @@ poll_with_bouncing_bar() {
         logs_pid=$!
     fi
 
-    while ! "${cond[@]}" 2>/dev/null; do
+    while true; do
+        if [ $((tick % 5)) -eq 0 ] && "${cond[@]}" 2>/dev/null; then
+            break
+        fi
+
         # 새 로그 출력 확인 및 표시
         local current_lines
         current_lines=$(wc -l < "$tmpfile")
@@ -2811,6 +2862,24 @@ poll_with_bouncing_bar() {
             print_stacktrace_errors
         fi
 
+        # 대기 중 Ctrl+C: 교체한 컨테이너가 이미 떠 있으므로 준비될 때까지 기다린 뒤에 멈춘다.
+        # 여기서 빠지면 사후 검증이 준비되지 않은 서버를 상대한다. 상한은 아래 타임아웃이다.
+        if [ "$_interrupted" -eq 1 ] && [ $interrupt_noted -eq 0 ]; then
+            interrupt_noted=1
+            printf '\r\033[K' > "$_tty"
+            echo "Interrupt received. The container is already running, so the upgrade stops once it is ready (--ready-timeout=$ready_timeout). Press Ctrl+\\ to exit now." >&2
+        fi
+
+        if [ "$ready_timeout" -gt 0 ] && [ $SECONDS -ge $deadline ]; then
+            printf '\r\033[K' > "$_tty"
+            if _ready_timeout_keep_waiting "$label"; then
+                deadline=$((SECONDS + ready_timeout))
+            else
+                timed_out=1
+                break
+            fi
+        fi
+
         sleep 0.2
     done
 
@@ -2830,6 +2899,7 @@ poll_with_bouncing_bar() {
 
     printf '\r\033[K' > "$_tty"
     rm -f "$tmpfile"
+    [ $timed_out -eq 0 ] || _ready_timeout_fatal "$label"
 }
 
 # --- 업그레이드 경로 데이터 소스 결정 ---
@@ -3208,14 +3278,14 @@ _fetch_upgrade_path() {
 
 # 컨테이너가 멈춰 있으면 기동한 뒤 현재 설치 버전을 감지한다.
 # 이 블록은 반드시 모든 헬퍼 함수 정의 뒤에 와야 한다:
-# wait_for_healthy → poll_with_bouncing_bar 를 호출하므로, 그 정의들보다
+# wait_for_ready → poll_with_bouncing_bar 를 호출하므로, 그 정의들보다
 # 앞에서 실행되면 "poll_with_bouncing_bar: command not found"가 난다
 # (컨테이너가 멈춰 있는 크래시-복구 경로에서만 docker start 분기가 타져 드러났던 버그).
 _prev_exit=$(docker inspect --format='{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null || echo 0)
 
 if ! docker ps --format "{{.Names}}" | grep -q "^$CONTAINER_NAME$"; then
     docker start "$CONTAINER_NAME" &> /dev/null
-    wait_for_healthy "GitLab server"
+    wait_for_ready "GitLab server"
 fi
 
 CURRENT_VERSION=$(docker exec "$CONTAINER_NAME" dpkg -l 2>/dev/null | awk '/^ii/ && $2 ~ /^gitlab-(ce|ee)$/ { print $3 }' | head -n1)
@@ -3316,21 +3386,6 @@ if [ $dry_run -eq 1 ]; then
     exit 0
 fi
 
-if [ -z "$TARGET_URL" ] && [ "${CI:-}" != "true" ]; then
-    if [ $auto_yes -eq 1 ]; then
-        echo "Error: TARGET_URL is required for unattended mode (-y). Use --target-url or TARGET_URL env." >&2
-        exit 1
-    fi
-    echo 'TARGET_URL is not configured yet. Please enter your GitLab server URL.'
-    echo 'e.g.: https://gitlab.com'
-    echo -n '> '
-    read -r TARGET_URL < "$_tty"
-    if [ -z "$TARGET_URL" ]; then
-        echo 'User abort'
-        exit 1
-    fi
-fi
-
 # -y 모드는 FATAL 등 중대 이벤트가 알림 없이 로그에 묻히지 않도록 Discord 알림을 필수화
 if [ $auto_yes -eq 1 ] && [ "${CI:-}" != "true" ] && [ -z "$DISCORD_URL" ]; then
     echo "Error: DISCORD_URL is required for unattended mode (-y) so fatal events can be surfaced. Use --discord-url or DISCORD_URL env." >&2
@@ -3348,8 +3403,7 @@ if [ ${#UPGRADE_POINTS_ARRAY[@]} -eq 0 ]; then
     if [ "${_prev_exit:-0}" -ne 0 ]; then
         echo "Resuming post-upgrade checks for $CURRENT_VERSION..."
         enter_critical
-        wait_for_http_ready "Recovery"
-        wait_for_healthy "Recovery"
+        wait_for_ready "the GitLab server"
         wait_for_background_migrations
         check_migration_status
         check_gitlab_server_healthy 1
@@ -3367,7 +3421,7 @@ if [ ${#UPGRADE_POINTS_ARRAY[@]} -eq 0 ]; then
         echo "(This recovery pass ran because the previous run had exited with code $_prev_exit; that condition is now resolved — no action needed.)"
     else
         echo "Requirements already satisfied: v$CURRENT_VERSION"
-        if curl -sf -o /dev/null "$TARGET_URL/users/sign_in"; then
+        if _http_ready_check; then
             # 이전 실행이 남긴 hold가 있으면 해제 (멱등; 상태 파일이 없으면 no-op)
             _release_upgrade_holds
         else
@@ -3432,7 +3486,6 @@ if _running_list=$(_list_running_jobs); then
 else
     echo -e "\t- Warning: could not query running CI jobs (DB error); skipping the running-jobs check." >&2
 fi
-echo -e "\t- I checked TARGET_URL is valid: $TARGET_URL"
 
 if [ $auto_yes -eq 1 ]; then
     echo -e "\nAuto-confirmed (-y mode)."
@@ -3769,7 +3822,7 @@ for ver in "${UPGRADE_POINTS_ARRAY[@]}"; do
 
     if ! docker ps --format "{{.Names}}" | grep -q "^$CONTAINER_NAME$"; then
         docker start "$CONTAINER_NAME" &> /dev/null
-        wait_for_healthy "$(_official_image_for_tag "$CNT_VERSION")"
+        wait_for_ready "$(_official_image_for_tag "$CNT_VERSION")"
     fi
 
     wait_for_background_migrations

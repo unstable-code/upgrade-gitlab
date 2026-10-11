@@ -64,14 +64,13 @@ EOS (end-of-support) versions are checked via GitLab releases API but not exhaus
 | `--no-step-limit` | Disable the 3-step safety limit for `-y` mode. Requires `CI=true`. |
 | `--reset-stuck-finalizing` | Reset batched_background_migrations rows stuck in `finalizing(5)` state for >7 days back to `active(1)` so GitLab can re-finalize them. Does NOT execute the finalize rake task itself. |
 | `--max-tier=TIER` | Upper tier bound (`core`/`starter`/`premium`/`ultimate`) for the "What is new since" link in the completion webhook. Default: `core` for CE, `ultimate` for EE. |
-| `--target-url=URL` | GitLab server URL for connection testing |
+| `--ready-timeout=SECONDS` | Upper bound for waiting until a started container is ready (the sign-in page and the Docker health check, both checked inside the container). Default `3600`; `0` waits indefinitely. When exceeded, interactive runs ask whether to keep waiting; `-y` stops with exit 1 and, like a fatal error, leaves the runners paused and maintenance mode on until a later run releases them. |
 | `--discord-url=URL` | Discord webhook URL for notifications (required in `-y` mode unless `CI=true`) |
 
 ### Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `TARGET_URL` | Same as `--target-url` |
 | `DISCORD_URL` | Same as `--discord-url` |
 | `UPGRADE_GITLAB_CONFIG_HOOK` | Path to an executable run after the `/etc/gitlab` archive is made and old config backups are pruned. If unset, an executable file named `upload-config.hook` next to the script is auto-detected. Receives `UPGRADE_GITLAB_CONFIG_ARCHIVE` (the archive) and `UPGRADE_GITLAB_BACKUP_DIR` (container-side paths; use `docker cp` to extract), `UPGRADE_GITLAB_VERSION`, `UPGRADE_GITLAB_CONTAINER`, `UPGRADE_GITLAB_SCRIPT_DIR` env vars. Hook failure logs a warning but does not abort the upgrade. A hook copied from the earlier template, which `docker cp`s `gitlab.rb.<version>-backup` and `gitlab-secrets.json.<version>-backup` from the backup directory, now fails because those copies are no longer made: replace that part with a `docker cp` of `$UPGRADE_GITLAB_CONFIG_ARCHIVE`, as in the current template. See [`upload-config.hook.example`](upload-config.hook.example) for a template covering S3 / GCS / Azure Blob / OpenStack Swift / Google Drive uploads. |
 | `UPGRADE_GITLAB_IMAGE_HOOK` | Path to an executable that builds the image to run for each hop. If unset, an executable file named `build-image.hook` next to the script is auto-detected. Receives `UPGRADE_GITLAB_BASE_IMAGE` (e.g. `gitlab/gitlab-ee:19.4.1-ee.0`), `UPGRADE_GITLAB_VERSION`, `UPGRADE_GITLAB_EDITION`, `UPGRADE_GITLAB_CONTAINER`, `UPGRADE_GITLAB_SCRIPT_DIR`. Must print the image to run as the last line of stdout (build logs go to stderr), and that image must carry the label `org.upgrade-gitlab.base=<base image>`. Unlike the config hook, a failure or a configured-but-not-executable hook stops the upgrade. See [`build-image.hook.example`](build-image.hook.example) for a template. |
@@ -80,21 +79,21 @@ EOS (end-of-support) versions are checked via GitLab releases API but not exhaus
 
 ```bash
 # Auto-detect everything and upgrade to latest
-./upgrade-gitlab --target-url=https://gitlab.example.com
+./upgrade-gitlab
 
 # Upgrade to a specific version with Discord notifications
-./upgrade-gitlab --version=17.0.0 --target-url=https://gitlab.example.com --discord-url=https://discord.com/api/webhooks/...
+./upgrade-gitlab --version=17.0.0 --discord-url=https://discord.com/api/webhooks/...
 
 # Switch from CE to EE during upgrade
-./upgrade-gitlab --edition=ee --target-url=https://gitlab.example.com
+./upgrade-gitlab --edition=ee
 
 # Upgrade to the latest patch of the previous minor (N-1 strategy)
 # e.g. if latest is 18.9.x, targets the latest 18.8.x patch
-./upgrade-gitlab --skip-latest --target-url=https://gitlab.example.com
+./upgrade-gitlab --skip-latest
 
 # N-1 within a specific major version
 # e.g. if latest in major 18 is 18.9.x, targets the latest 18.8.x patch
-./upgrade-gitlab --version=18 --skip-latest --target-url=https://gitlab.example.com
+./upgrade-gitlab --version=18 --skip-latest
 
 # Preview upgrade path without executing
 ./upgrade-gitlab --dry-run

@@ -161,11 +161,17 @@ case "$args" in
         fi
         exit 0
         ;;
+    # MOCK_HEALTH_STATUS: the Docker health status (default healthy); "none" = the image has no
+    # HEALTHCHECK, which is what the script's format prints for an absent .State.Health.
     *"inspect"*"Health.Status"*)
-        echo "healthy"
+        echo "${MOCK_HEALTH_STATUS:-healthy}"
         ;;
     *"inspect"*"NetworkSettings.Ports"*)
         echo "443/tcp -> 443 80/tcp -> 80 22/tcp -> 22"
+        ;;
+    # MOCK_RUNNING=false: the container has stopped (with MOCK_EXIT_CODE, default 0).
+    *"inspect"*"State.Running"*)
+        echo "${MOCK_RUNNING:-true} ${MOCK_EXIT_CODE:-0}"
         ;;
     *"inspect"*"ExitCode"*)
         echo "${MOCK_EXIT_CODE:-0}"
@@ -438,15 +444,10 @@ case "$args" in
         exit 0
         ;;
     *"exec"*"gitlab-healthcheck-rc"*)
-        # CI-mode HTTP readiness (#24): run the in-container snippet here, against
+        # HTTP readiness (#24): run the in-container snippet here, against
         # MOCK_HEALTHCHECK_RC (unset = no rc, as on an old version or before reconfigure).
         # Its curl reaches the curl mock, which MOCK_READY_URL can restrict to one address.
         bash -c "$5" _ "${MOCK_HEALTHCHECK_RC:-/nonexistent}"
-        ;;
-    *"exec"*"curl"*)
-        # Run it against the curl mock, so an in-container request obeys MOCK_READY_URL too.
-        shift 2
-        exec "$@"
         ;;
     *"exec"*"sh -c"*"du -sb"*)
         # staging total: denominator for the "Creating backup archive" progress bar
