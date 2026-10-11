@@ -187,6 +187,8 @@ case "$args" in
         # Pre-backup discovery of files outside /etc/gitlab (#26). MOCK_DATA_PATHS: newline-separated
         # paths it reports, as the tagged lines the script parses.
         [ -n "${MOCK_DATA_PATHS:-}" ] && printf 'path\t%s\n' $MOCK_DATA_PATHS
+        # MOCK_FILE_HOOKS: file hooks present inside the container (#26 C), to archive.
+        for _f in ${MOCK_FILE_HOOKS:-}; do printf 'path\t%s\n' "$_f"; done
         exit 0
         ;;
     *"exec"*"--dereference -rf"*)
@@ -535,6 +537,12 @@ case "$args" in
         if [ -n "$MOCK_STATE_DIR" ]; then
             printf '%s\n' "$args" >> "$MOCK_STATE_DIR/stop_args"
         fi
+        exit 0
+        ;;
+    "diff "*)
+        # MOCK_ADDED_FILE_HOOKS: file hooks in the writable layer, i.e. added after the container was
+        # created, which a hop drops (#26 C).
+        for _f in ${MOCK_ADDED_FILE_HOOKS:-}; do echo "A $_f"; done
         exit 0
         ;;
     "cp "*)

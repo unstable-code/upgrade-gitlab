@@ -1178,6 +1178,33 @@ HOOK
     export UPGRADE_GITLAB_IMAGE_HOOK="$MOCK_STATE_DIR/build-image.hook"
 }
 
+@test "file hooks: -y refuses to drop file hooks added to the container, even with an image hook" {
+    # file_hooks/ is an image path: one added after the container was created (docker cp) is in the
+    # writable layer, which every hop discards. The example image hook only applies patches (#26 C).
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    hook=/opt/gitlab/embedded/service/gitlab-rails/file_hooks/notify.rb
+    export MOCK_FILE_HOOKS=$hook MOCK_ADDED_FILE_HOOKS=$hook
+    _write_image_hook ok
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"file hooks that were added to the container, not the image"* ]]
+    [[ "$output" == *"  $hook"* ]]
+    [[ "$output" == *"refusing to drop the file hooks in unattended mode"* ]]
+    [ ! -f "$MOCK_STATE_DIR/backup_args" ]               # stopped before the backup
+}
+
+@test "file hooks: hooks that are part of the image are archived without asking" {
+    # Not in the writable layer: a derived image carries them, and its hook rebuilds it.
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_FILE_HOOKS=/opt/gitlab/embedded/service/gitlab-rails/file_hooks/notify.rb
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"the first hop will drop them"* ]]
+    grep -qx /opt/gitlab/embedded/service/gitlab-rails/file_hooks/notify.rb "$MOCK_STATE_DIR/config_append_args"
+}
+
 @test "image hook: a derived container is upgraded onto the image the hook builds" {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_DERIVED_IMAGE=1
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
