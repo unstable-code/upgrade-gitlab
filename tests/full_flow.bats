@@ -1542,7 +1542,7 @@ _inspect_patch_full='
     # SIGKILL: a SIGTERM inside the critical zone is only deferred, so it would not end a hung poll.
     run timeout -s KILL 120 bash "$PROJECT_ROOT/upgrade-gitlab" -y --ready-timeout=2
     [ "$status" -eq 1 ]
-    [[ "$output" == *"gave up waiting for"*"after 2s (--ready-timeout)"* ]]
+    [[ "$output" == *"gave up waiting for gitlab/gitlab-ce:18.0.1-ce.0 after 2s (--ready-timeout)"* ]]
     [[ "$output" == *"FATAL ERROR: MANUAL INTERVENTION IS REQUIRED"* ]]
     [[ "$output" == *"Runners stay paused and maintenance mode stays on"* ]]
     # Holds are kept like a fatal error: the restart policy is not restored.

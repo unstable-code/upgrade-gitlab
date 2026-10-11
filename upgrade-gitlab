@@ -1981,7 +1981,7 @@ wait_for_ready() {
     local label=$1
     echo "waiting until $label is ready..."
     [ "$(_health_status)" != none ] || echo "$label has no health check; relying on the HTTP check only."
-    poll_with_bouncing_bar "Ready" _ready_check
+    poll_with_bouncing_bar "$label" _ready_check
     echo 'done'
 }
 
