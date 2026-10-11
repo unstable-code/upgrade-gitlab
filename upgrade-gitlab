@@ -612,14 +612,21 @@ _stop_container_backup() {
 }
 
 # 교체한 컨테이너는 재시작 정책 no로 띄우므로(_CONTAINER_SPEC_JQ) 원래 정책(auto_restart_enabled)으로
-# 되돌린다. 다른 hold와 같은 시점에 풀린다: 사후 검증을 통과한 실행은 인터럽트·이미지 준비 실패로 끝나도
-# 모두 여기에 오고, critical zone 안의 FATAL은 EXIT 트랩이 건너뛰므로 no로 남는다(고장 난 컨테이너를
-# 재부팅 루프에 넣지 않는다). 교체 전이나 교체가 없었던 실행에서는 정책이 원래 값 그대로라 하는 일이 없다.
+# 되돌린다. 다른 hold와 같은 시점에 풀린다: critical zone 안의 FATAL은 EXIT 트랩이 건너뛰므로 no로 남고
+# (고장 난 컨테이너를 재부팅 루프에 넣지 않는다), 상태 파일이 다음 실행에 넘긴다. 지금 정책이 no가
+# 아니면 교체 전이거나 사용자가 바꾼 것이라 상태 파일만 지운다.
 _restore_restart_policy() {
+    local cur
     [ "$auto_restart_enabled" != no ] || return 0
-    [ "$(docker inspect --format='{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER_NAME" 2>/dev/null)" = no ] || return 0
-    echo "Restoring gitlab RestartPolicy to $auto_restart_enabled"
-    docker update --restart="$auto_restart_enabled" "$CONTAINER_NAME" &> /dev/null
+    cur=$(docker inspect --format='{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER_NAME" 2>/dev/null) || return 0
+    if [ "$cur" = no ]; then
+        echo "Restoring gitlab RestartPolicy to $auto_restart_enabled"
+        if ! docker update --restart="$auto_restart_enabled" "$CONTAINER_NAME" &> /dev/null; then
+            echo "Warning: could not restore RestartPolicy $auto_restart_enabled; state file kept for the next run." >&2
+            return 0
+        fi
+    fi
+    rm -f "$_restart_policy_state_file"
 }
 
 # shellcheck disable=SC2329
@@ -630,14 +637,19 @@ _release_upgrade_holds() {
 }
 
 # FATAL 배너. critical zone 안에서 끝나는 FATAL은 hold를 풀지 않으므로(EXIT 트랩이 건드리지 않는다)
-# 무엇이 남는지와 어떻게 푸는지를 함께 알린다. 러너와 maintenance mode는 상태 파일이 있어 다음
-# 실행이 풀고, 재시작 정책은 상태 파일이 없어 손으로 되돌려야 한다(#30). critical zone 밖이면
-# EXIT 트랩이 풀어 주므로 배너만 낸다.
+# 무엇이 남는지와 어떻게 푸는지를 함께 알린다. 셋 다 상태 파일이 있어 다음 실행이 푼다. 재시작
+# 정책의 상태 파일을 쓰지 못했을 때만 손으로 되돌리는 명령을 낸다. critical zone 밖이면 EXIT 트랩이
+# 풀어 주므로 배너만 낸다.
 _fatal_banner_keep_holds() {
     echo -e '\e[1;5;37;41mFATAL ERROR: MANUAL INTERVENTION IS REQUIRED\e[0m' >&2
     [ "$_trap_active" -eq 1 ] || return 0
     echo "Runners stay paused and maintenance mode stays on; re-run this script once GitLab is up to release them." >&2
-    [ "$auto_restart_enabled" = no ] || echo "The container runs with RestartPolicy no; set it back by hand: docker update --restart=$auto_restart_enabled $CONTAINER_NAME" >&2
+    [ "$auto_restart_enabled" != no ] || return 0
+    if [ -f "$_restart_policy_state_file" ]; then
+        echo "The container runs with RestartPolicy no until then; that run restores $auto_restart_enabled." >&2
+    else
+        echo "The container runs with RestartPolicy no; set it back by hand: docker update --restart=$auto_restart_enabled $CONTAINER_NAME" >&2
+    fi
 }
 
 # --- 실행 중인 CI 작업(#17) ---
@@ -1025,6 +1037,9 @@ fi
 _runner_state_file="$_runner_state_dir/upgrade-gitlab-${CONTAINER_NAME}.paused-runners"
 # 같은 이유(실행 간 지속)로 maintenance mode를 "우리가" 켰다는 기록도 나란히 둔다.
 _maintenance_state_file="$_runner_state_dir/upgrade-gitlab-${CONTAINER_NAME}.maintenance-mode"
+# 교체용 컨테이너를 만들기 전의 재시작 정책(#30). 교체용은 no로 만드므로, hold를 남긴 채 끝난 뒤의
+# 다음 실행은 컨테이너에서 원래 값을 읽을 수 없다.
+_restart_policy_state_file="$_runner_state_dir/upgrade-gitlab-${CONTAINER_NAME}.restart-policy"
 
 # --------------------------
 # 에디션 자동 감지 (CE/EE)
@@ -1206,6 +1221,16 @@ elif [ "$_log_driver" = 'db' ]; then
     echo "        while 'docker logs --follow' is attached. This container will be recreated with json-file." >&2
     echo "        Logs stay available via 'docker logs' but no longer appear in the DSM UI." >&2
     echo "        Set UPGRADE_GITLAB_LOG_DRIVER=db to keep the original driver." >&2
+fi
+# 원래 재시작 정책. docker update --restart 형식으로 담는다: on-failure의 재시도 횟수도 함께 되돌려야
+# 한다. 지금 no인데 상태 파일이 있으면, 그 no는 hold를 남기고 끝난 이전 실행이 넣은 값이다(#30). 복구
+# 경로와 already-satisfied 경로도 hold를 풀므로 여기서 정한다.
+auto_restart_enabled=$(jq -r '.HostConfig.RestartPolicy | (.Name // "") as $n
+    | if $n == "" then "no"
+      elif $n == "on-failure" and (.MaximumRetryCount // 0) > 0 then "on-failure:\(.MaximumRetryCount)"
+      else $n end' <<<"$_container_json")
+if [ "$auto_restart_enabled" = no ] && [ -s "$_restart_policy_state_file" ]; then
+    auto_restart_enabled=$(<"$_restart_policy_state_file")
 fi
 
 if ! CONTAINER_SPEC=$(jq -c --argjson img "$_image_config" --argjson log "$_log_config" \
@@ -3715,11 +3740,11 @@ if [ "$running_jobs" -gt 0 ]; then
 fi
 
 send_discord_webhook "NOTE" "Updating GitLab now!" "GitLab will be upgraded from $CURRENT_VERSION to ${UPGRADE_POINTS_ARRAY[-1]}"
-# docker update --restart 형식으로 담는다: on-failure의 재시도 횟수도 함께 되돌려야 한다.
-auto_restart_enabled=$(jq -r '.HostConfig.RestartPolicy | (.Name // "") as $n
-    | if $n == "" then "no"
-      elif $n == "on-failure" and (.MaximumRetryCount // 0) > 0 then "on-failure:\(.MaximumRetryCount)"
-      else $n end' <<<"$_container_json")
+# 원래 재시작 정책을 상태 파일에 남긴다(#30). 지우는 것은 _restore_restart_policy다.
+if [ "$auto_restart_enabled" != no ] \
+   && ! printf '%s\n' "$auto_restart_enabled" > "$_restart_policy_state_file" 2>/dev/null; then
+    echo "Warning: could not persist the restart policy to $_restart_policy_state_file; restoring it will rely on this run staying alive." >&2
+fi
 
 # 0. 디스크 여유 공간 사전 검증
 check_disk_space

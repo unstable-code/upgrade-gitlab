@@ -1434,6 +1434,44 @@ _inspect_patch_full='
     # Restored once verification passed, retry count included.
     grep -qx "update --restart=on-failure:3 gitlab" "$MOCK_STATE_DIR/update_args"
     [[ "$output" == *"Restoring gitlab RestartPolicy to on-failure:3"* ]]
+    [ ! -f "$RESTART_POLICY_STATE_FILE" ]         # consumed once restored (#30)
+}
+
+@test "recreate: after a fatal stop the next run restores the restart policy from the state file" {
+    # The run that ends like a FATAL keeps its holds, the restart policy no included; the original
+    # used to live only in memory, so the next run read no as the original (#30).
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_HEALTH_STATUS=starting
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_INSPECT_PATCH='.HostConfig.RestartPolicy = {Name: "on-failure", MaximumRetryCount: 3}'
+    run timeout -s KILL 120 bash "$PROJECT_ROOT/upgrade-gitlab" -y --ready-timeout=2
+    [ "$status" -eq 1 ]
+    [ ! -f "$MOCK_STATE_DIR/update_args" ]
+    [ "$(cat "$RESTART_POLICY_STATE_FILE")" = "on-failure:3" ]
+    [[ "$output" == *"RestartPolicy no until then; that run restores on-failure:3."* ]]
+
+    # The next run, once the container is up: it now reports no, and exited abnormally (recovery).
+    unset MOCK_HEALTH_STATUS
+    export MOCK_INSPECT_PATCH='.HostConfig.RestartPolicy = {Name: "no", MaximumRetryCount: 0}'
+    export MOCK_EXIT_CODE=137
+    run timeout -s KILL 120 bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Resuming post-upgrade checks"* ]]
+    grep -qx "update --restart=on-failure:3 gitlab" "$MOCK_STATE_DIR/update_args"
+    [ ! -f "$RESTART_POLICY_STATE_FILE" ]
+}
+
+@test "recreate: a restart policy changed by hand between runs is left alone" {
+    # A leftover state file only counts while the container still runs with no.
+    export MOCK_GITLAB_VERSION="18.0.1-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_INSPECT_PATCH='.HostConfig.RestartPolicy = {Name: "always", MaximumRetryCount: 0}'
+    mkdir -p "$(dirname "$RESTART_POLICY_STATE_FILE")"
+    echo "on-failure:3" > "$RESTART_POLICY_STATE_FILE"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Requirements already satisfied"* ]]
+    [ ! -f "$MOCK_STATE_DIR/update_args" ]
+    [ ! -f "$RESTART_POLICY_STATE_FILE" ]
 }
 
 @test "recreate: an interrupted run still restores the restart policy" {

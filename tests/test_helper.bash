@@ -31,6 +31,7 @@ mkdir -p "$XDG_RUNTIME_DIR"
 # Convenience for tests that read/seed the state file:
 export RUNNER_STATE_FILE="$XDG_STATE_HOME/upgrade-gitlab/upgrade-gitlab-gitlab.paused-runners"
 export MAINTENANCE_STATE_FILE="$XDG_STATE_HOME/upgrade-gitlab/upgrade-gitlab-gitlab.maintenance-mode"
+export RESTART_POLICY_STATE_FILE="$XDG_STATE_HOME/upgrade-gitlab/upgrade-gitlab-gitlab.restart-policy"
 
 # Note: UID is a readonly bash variable, no need to set it
 
