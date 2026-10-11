@@ -189,6 +189,8 @@ case "$args" in
         [ -n "${MOCK_DATA_PATHS:-}" ] && printf 'path\t%s\n' $MOCK_DATA_PATHS
         # MOCK_FILE_HOOKS: file hooks present inside the container (#26 C), to archive.
         for _f in ${MOCK_FILE_HOOKS:-}; do printf 'path\t%s\n' "$_f"; done
+        # MOCK_CONFIG_WARNINGS: one "<where><TAB><text>" for a gitlab.rb path that cannot be resolved (#26 D).
+        [ -z "${MOCK_CONFIG_WARNINGS:-}" ] || printf 'warn\t%s\n' "$MOCK_CONFIG_WARNINGS"
         exit 0
         ;;
     *"exec"*"--dereference -rf"*)

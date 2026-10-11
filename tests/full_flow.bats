@@ -889,6 +889,20 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     [ "$(grep -cx /var/opt/gitlab/gitaly/custom_hooks "$MOCK_STATE_DIR/config_append_args")" -eq 1 ]
 }
 
+@test "full-flow: gitlab.rb paths that cannot be resolved are named before the backup" {
+    # The archive cannot include them; saying so before the backup keeps it from passing as complete (#26 D).
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_CONFIG_WARNINGS=$'gitlab.rb:7\tnginx[\'ssl_certificate\'] = ENV[\'CERT_PATH\']'
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"these settings point to files the configuration archive cannot include"* ]]
+    [[ "$output" == *"  gitlab.rb:7: nginx['ssl_certificate'] = ENV['CERT_PATH']"* ]]
+    warned=$(grep -n "cannot include" <<< "$output" | cut -d: -f1)
+    backup=$(grep -n "Creating backups" <<< "$output" | cut -d: -f1)
+    [ "$warned" -lt "$backup" ]
+}
+
 @test "full-flow: a failed append to the archive only warns" {
     # /etc/gitlab is already archived; the files outside it are an addition.
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
