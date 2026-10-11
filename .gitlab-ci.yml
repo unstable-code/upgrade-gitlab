@@ -1,6 +1,7 @@
 stages:
   - lint
   - test
+  - image
   - promote
 
 shellcheck:
@@ -35,6 +36,26 @@ logic-test:
     - if: $CI_COMMIT_BRANCH == "develop"
     - if: $CI_COMMIT_BRANCH == "master"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# The age image the script encrypts the configuration archive with (#32). Run by hand when
+# AGE_VERSION changes, then pin the printed digest in the script's AGE_IMAGE. Manual and allowed to
+# fail, so it never holds up promotion.
+age-image:
+  stage: image
+  image: golang:1.26
+  variables:
+    AGE_VERSION: v1.3.2
+    CRANE_VERSION: v0.22.1
+  before_script:
+    - go install "github.com/google/go-containerregistry/cmd/crane@${CRANE_VERSION}"
+    - export PATH="$(go env GOPATH)/bin:$PATH"
+    - crane auth login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
+  script:
+    - IMAGE="$CI_REGISTRY_IMAGE/age" sh ci/build-age-image.sh
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop" && $CI_SERVER_HOST == "gitlab.gggames.synology.me"
+      when: manual
+      allow_failure: true
 
 promote-to-master:
   stage: promote
