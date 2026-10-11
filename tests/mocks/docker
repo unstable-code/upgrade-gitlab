@@ -161,6 +161,10 @@ case "$args" in
         fi
         exit 0
         ;;
+    # Start time, for reading back the boot log with docker logs --since (#29).
+    *"inspect"*"State.StartedAt"*)
+        echo "2026-01-01T00:00:00.000000000Z"
+        ;;
     # MOCK_HEALTH_STATUS: the Docker health status (default healthy); "none" = the image has no
     # HEALTHCHECK, which is what the script's format prints for an absent .State.Health.
     *"inspect"*"Health.Status"*)
@@ -198,6 +202,14 @@ case "$args" in
         if [ "${MOCK_BACKUP_IGNORES_TERM:-0}" -eq 1 ]; then exit 124; fi
         [ -n "$MOCK_STATE_DIR" ] && rm -f "$MOCK_STATE_DIR/backup_running"
         exit 0
+        ;;
+    *"exec"*"pgrep -f [g]itlab-ctl reconfigure"*)
+        # The reconfigure the image runs at start (#29). Placed before the "gitlab-ctl reconfigure"
+        # case, which this pattern would otherwise hit. MOCK_BOOT_RECONFIGURE_POLLS=N: still running
+        # for the first N checks; "always": never finishes.
+        [ "${MOCK_BOOT_RECONFIGURE_POLLS:-}" = always ] && exit 0
+        _mock_crash_before boot_reconfigure "${MOCK_BOOT_RECONFIGURE_POLLS:-}" && exit 0
+        exit 1
         ;;
     *"exec"*"pgrep -f gitlab[:]backup[:]create"*)
         # "Running" while the held gitlab-backup mock (MOCK_BACKUP_SLEEP) has its marker.
@@ -515,6 +527,11 @@ case "$args" in
     "logs "*)
         # MOCK_LOGS lets tests feed container log content to print_stacktrace_errors.
         [ -n "${MOCK_LOGS:-}" ] && printf '%s\n' "$MOCK_LOGS"
+        # MOCK_BOOT_DEPRECATIONS: the "Deprecations:" block of the reconfigure the image runs at
+        # start (#29), read back with --since <StartedAt>.
+        if [[ "$args" == *"--since "* ]] && [ -n "${MOCK_BOOT_DEPRECATIONS:-}" ]; then
+            printf '\nDeprecations:\n%s\n\nRunning handlers complete\n' "$MOCK_BOOT_DEPRECATIONS"
+        fi
         exit 0
         ;;
     # container rm, plain container inspect and anything else: accepted, no output.

@@ -225,6 +225,34 @@ teardown() {
     [[ "$output" != *"Deprecations reported by gitlab-ctl reconfigure"* ]]
 }
 
+# ---------- the boot reconfigure of each new container is collected too (#29) ----------
+@test "full-flow: deprecations from the new container's boot are tagged with its version" {
+    # The pre-swap reconfigure only sees the version running before each hop, so a warning that
+    # only the new version prints used to be lost on the last hop.
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    unset MOCK_DEPRECATIONS
+    export MOCK_BOOT_DEPRECATIONS="gitlab_exporter['server_name'] is deprecated and has no effect."
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    first=$(sed -n 's/^Updated traceroute: \([^ ]*\).*/\1/p' <<< "$output")
+    [ -n "$first" ]
+    [[ "$output" == *"Deprecations reported by gitlab-ctl reconfigure (1)"* ]]
+    [[ "$output" == *"[$first] gitlab_exporter['server_name'] is deprecated"* ]]
+}
+
+@test "full-flow: the recovery path collects the deprecations of the running boot" {
+    # Recovery never runs a reconfigure of its own, so it used to report nothing.
+    export MOCK_GITLAB_VERSION="18.0.1-ce.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_EXIT_CODE=137                    # _prev_exit != 0 → recovery branch
+    export MOCK_BOOT_DEPRECATIONS="gitlab_exporter['server_name'] is deprecated and has no effect."
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Resuming post-upgrade checks"* ]]
+    [[ "$output" == *"[18.0.1-ce.0] gitlab_exporter['server_name'] is deprecated"* ]]
+}
+
 # ---------- --skip-object-storage: agent_plan_content survives the whitelist ----------
 @test "full-flow: --skip-object-storage skips agent_plan_content" {
     export MOCK_GITLAB_VERSION="17.11.3-ce.0"
@@ -1452,4 +1480,22 @@ _inspect_patch_full='
     [ "$status" -eq 1 ]
     grep -q "Interrupt received. The container is already running" "$MOCK_STATE_DIR/out.log"
     grep -q "gave up waiting for" "$MOCK_STATE_DIR/out.log"
+}
+
+@test "ready wait: the boot reconfigure must finish before the container counts as ready" {
+    # Services answer while the image's start-up reconfigure is still running; it then restarts
+    # them once more and prints its Deprecations block (#29).
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_BOOT_RECONFIGURE_POLLS=3
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    run timeout -s KILL 120 bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    [ "$(cat "$MOCK_STATE_DIR/boot_reconfigure_count")" -gt 3 ]
+}
+
+@test "ready wait: a boot reconfigure that never ends stops the run at --ready-timeout" {
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_BOOT_RECONFIGURE_POLLS=always
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    run timeout -s KILL 120 bash "$PROJECT_ROOT/upgrade-gitlab" -y --ready-timeout=2
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"gave up waiting for"* ]]
 }
