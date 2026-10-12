@@ -57,7 +57,7 @@ EOS (end-of-support) versions are checked via GitLab releases API but not exhaus
 | `--help` | Show help message |
 | `--edition=ce\|ee` | Force GitLab edition (auto-detected if omitted) |
 | `--version=X.Y.Z` | Upgrade to a specific version instead of latest. Partial versions (e.g. `18`) are resolved automatically. End-of-support versions are rejected via GitLab releases API. |
-| `--skip-latest`, `--n-1` | Target the latest patch of the previous minor version (N-1 strategy). Can combine with major-only `--version` (e.g. `--version=18 --skip-latest` targets N-1 within major 18). |
+| `--skip-latest[=always\|unpatched]`, `--n-1` | Target the latest patch of the previous minor version (N-1 strategy). `always` (the default) always does. `unpatched` does only while the latest minor has no patch release yet (`X.Y.0`), and targets the latest once `X.Y.1` is out: self-managed-only regressions (packaging, reconfigure, bundled services) tend to be fixed in the first patches, so an unattended run avoids a fresh `.0` without staying a minor behind for good. Can combine with major-only `--version` (e.g. `--version=18 --skip-latest` targets N-1 within major 18). |
 | `--dry-run` | Compute and display upgrade path without executing. Implies `-y`. |
 | `--skip-lfs` | Skip LFS objects during backup |
 | `--no-maintenance-mode` | Do not enable [maintenance mode](https://docs.gitlab.com/administration/maintenance_mode/). By default it is enabled right before the backup when the instance supports it (checked at runtime, so CE/unlicensed instances are skipped silently) and disabled when the run ends. A mode that was already on is left on. |
@@ -97,6 +97,10 @@ EOS (end-of-support) versions are checked via GitLab releases API but not exhaus
 # N-1 within a specific major version
 # e.g. if latest in major 18 is 18.9.x, targets the latest 18.8.x patch
 ./upgrade-gitlab --version=18 --skip-latest
+
+# N-1 only while the latest minor is still X.Y.0
+# e.g. latest 18.9.0 targets 18.8.x; latest 18.9.1 targets 18.9.1
+./upgrade-gitlab -y --skip-latest=unpatched
 
 # Preview upgrade path without executing
 ./upgrade-gitlab --dry-run

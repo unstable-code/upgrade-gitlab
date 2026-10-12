@@ -184,6 +184,70 @@ setup() {
     [[ "$output" == *"Target: 17.11.3-ce.0"* ]]
 }
 
+# ---------- --skip-latest=unpatched: N-1 only while the latest minor is still X.Y.0 (#28) ----------
+# Copies the fixtures without the given tags, so the latest of a minor becomes its .0.
+_fixtures_without() {
+    local dir="$BATS_TEST_TMPDIR/fixtures" f tag
+    cp -r "$FIXTURES_DIR" "$dir"
+    for tag in "$@"; do
+        f="$dir/dockerhub_${tag%%.*}.json"
+        jq --arg t "$tag" '.results |= map(select(.name != $t))' "$f" > "$f.new" && mv "$f.new" "$f"
+    done
+    export FIXTURES_DIR="$dir"
+}
+
+@test "--skip-latest=unpatched keeps a latest that has a patch release" {
+    export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --skip-latest=unpatched
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Skip-latest (unpatched) mode: latest 18.0.1-ce.0 already has a patch release, keeping it"* ]]
+    [[ "$output" != *"Skip-latest (N-1) mode"* ]]
+    [[ "$output" == *"Target: 18.0.1-ce.0"* ]]
+}
+
+@test "--skip-latest=unpatched targets N-1 while the latest is a new major's .0" {
+    _fixtures_without 18.0.1-ce.0
+    export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --skip-latest=unpatched
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Skip-latest (unpatched) mode: latest 18.0.0-ce.0 has no patch release yet"* ]]
+    [[ "$output" == *"Skip-latest (N-1) mode: targeting 17.11.3-ce.0"* ]]
+    [[ "$output" == *"Target: 17.11.3-ce.0"* ]]
+}
+
+@test "--version=17 --skip-latest=unpatched targets N-1 while 17.11 is .0" {
+    _fixtures_without 17.11.3-ce.0
+    export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --version=17 --skip-latest=unpatched
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Skip-latest (unpatched) mode: latest 17.11.0-ce.0 has no patch release yet"* ]]
+    [[ "$output" == *"Skip-latest (N-1) mode: targeting 17.10.2-ce.0"* ]]
+    [[ "$output" == *"Target: 17.10.2-ce.0"* ]]
+}
+
+@test "--version=17 --n-1=unpatched keeps 17.11.3" {
+    export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --version=17 --n-1=unpatched
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"latest 17.11.3-ce.0 already has a patch release, keeping it"* ]]
+    [[ "$output" == *"Target: 17.11.3-ce.0"* ]]
+}
+
+@test "--skip-latest=always behaves like --skip-latest" {
+    export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --skip-latest=always
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"(unpatched)"* ]]
+    [[ "$output" == *"Skip-latest (N-1) mode: targeting 17.11.3-ce.0"* ]]
+}
+
+@test "--skip-latest with an unknown mode produces error" {
+    export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --skip-latest=sometimes
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"--skip-latest must be 'always' (the default) or 'unpatched'"* ]]
+}
+
 # ---------- Test 17: --version=16 → EOS error ----------
 @test "--version=16 is rejected as end-of-support" {
     export MOCK_GITLAB_VERSION="15.0.0-ce.0"

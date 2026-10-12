@@ -28,7 +28,8 @@ STOP_TIMEOUT=300
 _BACKUP_PROC_PATTERN='gitlab[:]backup[:]create'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || SCRIPT_DIR=""
 
-skip_latest=0
+# --skip-latest 모드: 빈 값(끔), always(늘 N-1), unpatched(최신 minor 가 아직 X.Y.0 일 때만 N-1)
+skip_latest=
 target_version_tag=
 auto_restart_enabled=no
 _in_stacktrace=0
@@ -900,14 +901,14 @@ _wait_for_running_jobs() {
 }
 
 if [ "$1" == "--help" ] || [ "$1" == "help" ]; then
-    echo "Usage: $0 [-y] [--edition=ce|ee] [--discord-url=http] [--version=0.0.0] [--skip-latest] [--skip-lfs] [--skip-object-storage] [--no-maintenance-mode] [--running-jobs=wait|abort] [--running-jobs-timeout=SECONDS] [--ready-timeout=SECONDS] [--no-step-limit] [--dry-run] [--reset-stuck-finalizing] [--max-tier=core|starter|premium|ultimate]"
+    echo "Usage: $0 [-y] [--edition=ce|ee] [--discord-url=http] [--version=0.0.0] [--skip-latest[=always|unpatched]] [--skip-lfs] [--skip-object-storage] [--no-maintenance-mode] [--running-jobs=wait|abort] [--running-jobs-timeout=SECONDS] [--ready-timeout=SECONDS] [--no-step-limit] [--dry-run] [--reset-stuck-finalizing] [--max-tier=core|starter|premium|ultimate]"
 
     echo -e '\n\e[0;1mOPTIONS\e[m'
     echo -e "-y, --yes\t\tAuto-confirm prompts for unattended/cron usage. Aborts on safety warnings and if upgrade path >= 3 steps. Requires DISCORD_URL unless CI=true."
     echo -e "--help\t\t\tShow this help."
     echo -e "--edition=ce|ee\t\tForce GitLab edition (ce or ee). Auto-detected if omitted."
     echo -e "--version=0.0.0\t\tUse provided tag instead of latest tag. Partial versions (e.g. 18) are resolved automatically. EOS versions are rejected."
-    echo -e "--skip-latest\t\tTarget the latest patch of the previous minor version (N-1 strategy). Can combine with major-only --version (e.g. --version=18 --skip-latest). (alias: --n-1)"
+    echo -e "--skip-latest[=MODE]\tTarget the latest patch of the previous minor version (N-1 strategy). MODE 'always' (the default) always does; 'unpatched' does only while the latest minor has no patch release yet (X.Y.0), and targets the latest once X.Y.1 is out. Can combine with major-only --version (e.g. --version=18 --skip-latest). (alias: --n-1)"
     echo -e "--dry-run\t\tCompute and display upgrade path without executing. Implies -y."
     echo -e "--no-step-limit\t\tDisable the 3-step safety limit for -y mode. Requires CI=true."
     echo -e "--skip-lfs\t\tSkip LFS objects during backup (passes SKIP=lfs to gitlab-backup)."
@@ -944,12 +945,16 @@ else
                     exit 1
                 fi
                 no_step_limit=1
-            elif [ "${params[$i]}" == "--skip-latest" ] || [ "${params[$i]}" == "--n-1" ]; then
+            elif [[ "${params[$i]}" =~ ^--(skip-latest|n-1)(=|$) ]]; then
                 if [ -n "$target_version_tag" ] && ! [[ "$target_version_tag" =~ ^[0-9]+$ ]]; then
                     echo "Error: --skip-latest can only be combined with major-only --version (e.g. --version=18)." >&2
                     exit 1
                 fi
-                skip_latest=1
+                skip_latest=${temp:-always}
+                if [ "$skip_latest" != always ] && [ "$skip_latest" != unpatched ]; then
+                    echo "Error: --skip-latest must be 'always' (the default) or 'unpatched'" >&2
+                    exit 1
+                fi
             elif [ "${params[$i]}" == "--skip-lfs" ]; then
                 skip_components="${skip_components:+$skip_components,}lfs"
             elif [ "${params[$i]}" == "--skip-object-storage" ]; then
@@ -995,7 +1000,7 @@ else
                 fi
                 edition_flag=$temp
             elif [[ "${params[$i]}" == "--version"* ]]; then
-                if [ $skip_latest -eq 1 ] && ! [[ "$temp" =~ ^[0-9]+$ ]]; then
+                if [ -n "$skip_latest" ] && ! [[ "$temp" =~ ^[0-9]+$ ]]; then
                     echo "Error: --skip-latest can only be combined with major-only --version (e.g. --version=18)." >&2
                     exit 1
                 fi
@@ -3105,6 +3110,20 @@ _resolve_n1() {
     fi
 }
 
+# --skip-latest 가 이 최신 태그에서 N-1 로 내려가야 하는지. 인자는 최신 minor 의 최신 패치라,
+# 패치 번호 0 은 그 minor 에 아직 패치 릴리스가 없다는 뜻이다. 판정 이유를 출력한다.
+_wants_n1() {
+    [ "$skip_latest" = always ] && return 0
+    local patch
+    patch=$(echo "$1" | awk -F'[.-]' '{print $3}')
+    if [ "$patch" -eq 0 ]; then
+        echo "Skip-latest (unpatched) mode: latest $1 has no patch release yet"
+        return 0
+    fi
+    echo "Skip-latest (unpatched) mode: latest $1 already has a patch release, keeping it"
+    return 1
+}
+
 
 # --- EOS (End-of-Support) 체크 ---
 # 공개 Atom 피드(_RELEASE_FEED_URL)의 entry <title>에서 모든 X.Y(.Z?)를 모아 major.minor로
@@ -3378,7 +3397,7 @@ _fetch_upgrade_path() {
     LATEST_VERSION_TAG=$(echo "$_all_docker_tags" | sort -V | tail -1)
 
     # 4. N-1 전략
-    if [ $skip_latest -eq 1 ]; then
+    if [ -n "$skip_latest" ]; then
         if [[ "$target_version_tag" =~ ^[0-9]+$ ]]; then
             # major-scoped N-1
             local scoped_major=$target_version_tag
@@ -3389,7 +3408,8 @@ _fetch_upgrade_path() {
 
             if [ -z "$latest_in_major" ]; then
                 echo "Warning: No versions found for major ${scoped_major} — skipping N-1" >&2
-            else
+            # N-1 로 내려가지 않으면 partial version 해석이 major 안의 최신으로 푼다
+            elif _wants_n1 "$latest_in_major"; then
                 local n1_tag
                 n1_tag=$(_resolve_n1 "$latest_in_major" "$_all_docker_tags")
 
@@ -3404,7 +3424,7 @@ _fetch_upgrade_path() {
                     echo "Warning: Could not determine N-1 for ${scoped_major}.x — using latest ${target_version_tag}" >&2
                 fi
             fi
-        elif [ -z "$target_version_tag" ]; then
+        elif [ -z "$target_version_tag" ] && _wants_n1 "$LATEST_VERSION_TAG"; then
             # 전체 범위 N-1
             local n1_tag
             n1_tag=$(_resolve_n1 "$LATEST_VERSION_TAG" "$_all_docker_tags")
