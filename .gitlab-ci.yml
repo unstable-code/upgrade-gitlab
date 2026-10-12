@@ -80,12 +80,12 @@ age-image:
       allow_failure: true
 
 # What container_scanning scans: the amd64 image inside the pinned index (arm64 is built from the same
-# source), named by its per-arch tag. Not by digest, although that is what the script pins: Trivy
-# cannot scan an index digest (it fetches the platform manifest, then rejects it for not matching the
-# requested digest), and GitLab 19.3.3 fails to ingest findings whose image is a bare digest
-# (`…/age@sha256:…`): the vulnerability UUIDs computed at store and at ingestion no longer match, and
-# ingestion stops with NoMethodError on nil (pipeline #692). The tag must still name the pinned image,
-# so it is checked against the pinned amd64 digest first and the job fails if the tag has moved.
+# source), named by its per-arch tag. Trivy cannot scan an index digest (it fetches the platform
+# manifest, then rejects it for not matching the requested digest), so something has to resolve the
+# platform manifest anyway. A tag rather than that manifest's digest keeps the finding titles readable
+# (`…/age:<package>`, not `…/age@sha256:<package>`); changing the form now would also recompute every
+# finding UUID and bring the dismissed findings back. The tag must still name the pinned image, so it
+# is checked against the pinned amd64 digest first and the job fails if the tag has moved.
 age-scan-target:
   stage: lint
   image:
