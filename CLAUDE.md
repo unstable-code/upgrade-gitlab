@@ -289,6 +289,40 @@ There is no integration job. One existed — a real GitLab container upgraded en
 
 It also could not cross GitLab 19.0, which is worth knowing independently of CI: 19.0 dropped bundled Mattermost and its reconfigure hard-aborts with `Removed configurations found in gitlab.rb. Aborting reconfigure` when a `mattermost` key is present. On a stock install it *is* present — 18.x auto-generates a mattermost section in `gitlab-secrets.json` (salts, `sql_at_rest_encrypt_key`) even when Mattermost is unused, and regenerates it on every reconfigure, so each intermediate 18.x hop re-adds it. Crossing 19.0 cleanly would require editing secrets automatically, which is unsafe for real Mattermost users. This is an upstream GitLab issue, not a tool bug; users hit it as actionable output from `print_stacktrace_errors`' "Removed configurations found" branch (covered by a bats test).
 
+## Issue Labels
+
+The judgment rules live in the label descriptions; read `glab label list` before labelling. The set mirrors `peter/desktop/nix-configurations`, with the definitions rewritten for this tool. All labels are **`peter/gitlab` group labels**, shared with the sibling projects (custom-userscripts, update-gitlab-runner, …): create new ones on the group, not the project, or the same name splits per repository. Issue references inside a description use the full path (`peter/gitlab/upgrade-gitlab#16`), since a short `#16` resolves to whichever project is viewing it.
+
+| Axis | Labels | Nature |
+|---|---|---|
+| Type | `bug` `enhancement` `refactor` `discussion` `documentation` `wontfix` `pinned` `stale` | |
+| Area | `ci` `security` | plain labels, may stack (#34 = both) |
+| Edition | `edition::ce` / `ee` / `premium` / `ultimate` | minimum condition the issue applies under; no label = every edition. `ee` covers unlicensed EE, which this tool treats differently from CE (`License` defined, maintenance mode verdict), hence not `free`. Not set on CE→EE switch issues |
+| Confirmation | `confirmed::repro` / `cause` | `cause` includes repro, never both |
+| Triage | `need-triage` | removed once any of `priority::*`, `hold::*`, `blocked:*`, `wontfix` is set |
+| Hold | `hold::decision` / `evidence`, `blocked:upstream` / `prereq` | the release condition goes in a comment |
+| Severity | `severity::critical` / `major` / `minor` / `trivial` | **fact**, `bug` only; does not remove `need-triage` |
+| Priority | `priority::urgent` / `high` / `medium` / `low` | **decision**; not set while `blocked:*`/`hold::*` |
+
+- Severity hinges on irreversibility, because this tool performs irreversible steps (the upgrade itself, `docker rm`). `critical` = something is lost for good, or an irreversible step runs without a backup of the current version, or recovery needs a daemon restart that takes the host down (#12, #16, #22). `major` = the upgrade cannot finish or hangs, or GitLab/CI is left down, or the tool cannot run at all in an environment (#10, #25). A recovery that requires knowing the cause (editing state files, `docker update --restart`) is not a workaround.
+- Reading severity: with several symptoms, the most severe confirmed one decides, judged as it was before any fix. A workaround means using the feature while it is broken; an alternative that abandons it, or a step that does not exist yet, is not one.
+- Separator: `::` when one issue holds one value, `:` when it may hold several (`blocked:upstream` + `blocked:prereq`). Values are lowercase, edition names included. The instance is EE Ultimate, so scoped labels really are mutually exclusive: setting `priority::low` drops `priority::high` on its own.
+- Weight is a fourth axis and measures size only, never urgency (`priority::*`) or impact (`severity::*`). There is no iteration cadence on `peter/gitlab` (this project is not worked on a fixed cycle), so weight is used without a burndown, as in wshowlyrics. Size comes from verification cost and uncertainty, not line count:
+
+  | Weight | Basis |
+  |---|---|
+  | 1 | a few lines; the existing bats and shellcheck verify it |
+  | 2 | a small change plus new bats scenarios, no mock changes |
+  | 3 | several places within one concern, a mock extension, or a disposable-GitLab E2E that settles it in one run |
+  | 5 | cause still open (`confirmed::repro`), a signal or race to reproduce (`script(1)` Ctrl+C), or a real multi-hop E2E that needs fresh volumes |
+  | 8+ | not set; split into tasks |
+
+  `confirmed::repro` sits one step above `confirmed::cause` for the same symptom. Leave weight empty on `blocked:*`/`hold::*` issues, and with a hierarchy set it on the tasks only. It is an estimate made before starting: when the size changes a lot during the work, correct it and say why in a comment. Closed issues get none retroactively.
+- Relations between issues also go into Linked items, since a `#N` in the body is only an autolink and does not show up there. With `blocked:prereq`, link the prerequisite as `is_blocked_by` (`blocked:upstream` points outside this instance, so it has no link). A closed issue that recurs by another path gets a new issue linked with `relates_to`, not a reopen. `glab api projects/:id/issues/<iid>/links -X POST -f target_project_id=<id> -f target_issue_iid=<N> -f link_type=relates_to`; `target_project_id` is required even within this project.
+- Leave the basis for `severity::*` and `confirmed::*`, and the release condition for `hold::*`/`blocked:*`, in a comment. The 2026-10-12 migration did this for every retroactive judgment; #21 and #31 are borderline cases with the alternative reading recorded.
+- `PUT issues/:iid` with `add_labels` and `remove_labels` in one request applied only the addition (2026-10-12, three issues); send the removal as its own request and re-read the labels.
+- To move a project label to the group, rename it if needed (`PUT projects/:id/labels/:id` with `new_name`) and then `PUT projects/:id/labels/:id/promote`; issues keep the label, so no relabelling is needed.
+
 ## Key Flags
 
 `-y` auto-confirm (requires `DISCORD_URL` unless `CI=true`) | `--dry-run` compute path only | `--version=X[.Y[.Z]]` target version | `--skip-latest[=always|unpatched]`/`--n-1` previous minor; `unpatched` only while the latest minor (within the `--version` major, if given) is still `X.Y.0`, decided by `_wants_n1` from the newest Docker Hub tag (#28) | `--no-step-limit` (CI only) | `--skip-lfs` skip LFS in backup | `--skip-object-storage` skip every resource offloaded to object storage (detected via `gitlab-rails runner` reading `Gitlab.config.<type>.object_store` — both `enabled` *and* a non-empty `remote_directory`; merges into the same `SKIP=` list as `--skip-lfs`. See Object Storage Detection below) | `--no-maintenance-mode` do not enable maintenance mode for the run (see Maintenance Mode below) | `--running-jobs=wait|abort` / `--running-jobs-timeout=SECONDS` handling of CI jobs still running after the runner pause (see Running CI Jobs below) | `--edition=ce|ee` | `--reset-stuck-finalizing` auto-reset status=5 zombies | `--max-tier=core|starter|premium|ultimate` what's-new URL tier | `--ready-timeout=SECONDS` upper bound for each readiness wait (see HTTP Readiness and Ready Waits) | `--discord-url` webhook
