@@ -1,8 +1,23 @@
+include:
+  - template: Jobs/Container-Scanning.gitlab-ci.yml
+
 stages:
   - lint
   - test
   - image
   - promote
+
+# When the age image the script pins (AGE_IMAGE) is scanned (#34): on master, where the CycloneDX SBOM
+# feeds continuous vulnerability scanning, whenever the pin could have changed, and from the weekly
+# schedule. Continuous scanning only matches apk/deb/rpm packages, so the Go modules inside the age
+# binary are only checked by an actual scan; the schedule is what re-checks them against new advisories.
+.age-scan-rules:
+  rules:
+    - if: $CI_SERVER_HOST != "gitlab.gggames.synology.me"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: [upgrade-gitlab, ci/**/*, .gitlab-ci.yml]
 
 shellcheck:
   stage: lint
@@ -10,6 +25,8 @@ shellcheck:
   script:
     - shellcheck upgrade-gitlab
   rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
     - if: $CI_COMMIT_BRANCH == "develop"
     - if: $CI_COMMIT_BRANCH == "master"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -33,6 +50,8 @@ logic-test:
       - coverage_output/
     when: always
   rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
     - if: $CI_COMMIT_BRANCH == "develop"
     - if: $CI_COMMIT_BRANCH == "master"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -56,6 +75,31 @@ age-image:
     - if: $CI_COMMIT_BRANCH == "develop" && $CI_SERVER_HOST == "gitlab.gggames.synology.me"
       when: manual
       allow_failure: true
+
+# Trivy cannot scan by an index digest: it fetches the platform manifest and then refuses it for not
+# matching the requested digest. This resolves the amd64 manifest inside the pinned index, so the scan
+# still covers exactly the pinned image; arm64 is built from the same source.
+age-scan-target:
+  stage: lint
+  image:
+    name: gcr.io/go-containerregistry/crane/debug:v0.22.1
+    entrypoint: [""]
+  script:
+    - img=$(sed -n 's/^AGE_IMAGE=//p' upgrade-gitlab)
+    - echo "CS_IMAGE=${img%@*}@$(crane digest --platform linux/amd64 "$img")" | tee scan-target.env
+  artifacts:
+    reports:
+      dotenv: scan-target.env
+  rules: !reference [.age-scan-rules, rules]
+
+# From the Container-Scanning template. Language packages are scanned too: the default only reports
+# OS packages, which would leave out the age binary's Go modules, the part that matters here.
+container_scanning:
+  needs: [age-scan-target]
+  dependencies: [age-scan-target]
+  variables:
+    CS_DISABLE_LANGUAGE_VULNERABILITY_SCAN: "false"
+  rules: !reference [.age-scan-rules, rules]
 
 promote-to-master:
   stage: promote

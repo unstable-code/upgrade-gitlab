@@ -275,11 +275,13 @@ Scenarios verified this way on 19.2.6 EE (unlicensed: maintenance mode reports `
 
 ## CI Pipeline (.gitlab-ci.yml)
 
-Stages: `lint` → `test` → `image` → `promote`
+Stages: `lint` → `test` → `image` → `promote` (`container_scanning` comes from `Jobs/Container-Scanning.gitlab-ci.yml` and runs in `test`)
 
 - **shellcheck**: Lints on develop, master, MRs
 - **logic-test**: Runs `bats tests/` with kcov coverage on develop, master, MRs
 - **age-image**: Manual, develop on this instance only, allowed to fail. Builds and pushes the age image the script pins as `AGE_IMAGE` (`ci/build-age-image.sh`; see Config Backup Lifecycle). After a rebuild, pin the printed digest.
+- **age-scan-target** + **container_scanning** (#34): scan the pinned age image on master whenever `upgrade-gitlab`, `ci/` or `.gitlab-ci.yml` changes, and from a weekly pipeline schedule on master (the schedule skips shellcheck and logic-test). Continuous vulnerability scanning re-matches the master SBOM against new advisories without a pipeline, but only for apk/deb/rpm packages; the age binary's Go modules are only checked by an actual scan, hence the schedule. `CS_DISABLE_LANGUAGE_VULNERABILITY_SCAN` is `"false"` for the same reason (the default reports OS packages only). Trivy cannot scan by an index digest (it fetches the platform manifest, then rejects it for not matching the requested digest), so `age-scan-target` resolves the amd64 manifest inside `AGE_IMAGE` with crane and hands it over as `CS_IMAGE` through a dotenv report.
+  - When a finding comes in, check reachability before rebuilding: Trivy matches module versions, not code paths. Run `govulncheck` in source mode on `cmd/age` of the pinned `AGE_VERSION` (binary mode on our image over-reports, since `-s` strips the symbol table and it falls back to whole packages). The first scan (v1.3.2, `golang.org/x/crypto` v0.55.0) reported GO-2026-6355/6354 (`x/crypto/ssh` connection deadlocks) and GO-2026-5932 (`x/crypto/openpgp` deprecated); source-mode govulncheck found none of them called by `cmd/age`, so they are to be dismissed as not applicable in the vulnerability report. A reachable one means raising `AGE_VERSION` (or the Go image) in the `age-image` job, running it, and pinning the new digest in `AGE_IMAGE`.
 - **promote-to-master**: Auto-pushes develop → master (canonical project only, uses `PUSH_TOKEN`)
 
 There is no integration job. One existed — a real GitLab container upgraded end to end, then `batched_background_migrations` rows rewritten to status=4/5 to check stuck detection against a real PostgreSQL — but it had been failing continuously and was removed. Reviving it needs a privileged runner (it drove `docker:dind`) and a runner `maximum_timeout` above the default hour; a multi-hop upgrade of a real instance exceeds that. Real-GitLab verification is done locally instead — see "Integration Testing Against a Disposable GitLab" under Testing.
