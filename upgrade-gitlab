@@ -182,6 +182,9 @@ _handle_signal() {
     if [ -n "${_pack_probe_pid:-}" ]; then
         kill "$_pack_probe_pid" 2>/dev/null
     fi
+    if [ -n "${_rails_boot_poller_pid:-}" ]; then
+        kill "$_rails_boot_poller_pid" 2>/dev/null
+    fi
     # run_with_bouncing_bar의 명령은 별도 프로세스 그룹이라 터미널 Ctrl+C가 닿지 않는다(#31).
     if [ -n "${_bar_cmd_pid:-}" ]; then
         kill "$_bar_cmd_pid" 2>/dev/null
@@ -335,13 +338,22 @@ _spawn_own_pgrp() {
     _spawned_pid=$!
     set +m
 }
+# _isolated_tick: 함수 이름을 앞에 붙여 부르면(`_isolated_tick=f _run_isolated ...`) 명령을 기다리는
+# 동안 ~0.2초마다 그 함수를 프레임 번호와 함께 부른다. 진행 표시용이다(_rails_runner).
+_isolated_tick=
 _run_isolated() {
-    local out err rc prev_trap=$_trap_active
+    local out err rc prev_trap=$_trap_active frame=0
     out=$(mktemp)
     err=$(mktemp)
     _TMPFILES+=("$out" "$err")
     _trap_active=1
     _spawn_own_pgrp "$@" > "$out" 2> "$err"
+    if [ -n "$_isolated_tick" ]; then
+        while kill -0 "$_spawned_pid" 2>/dev/null; do
+            "$_isolated_tick" "$((frame++))"
+            sleep 0.2
+        done
+    fi
     _wait_reap "$_spawned_pid"
     rc=$?
     _trap_active=$prev_trap
@@ -377,8 +389,75 @@ _exec_isolated() {
 }
 
 # _rails_runner <ruby> — gitlab-rails runner 한 번(부팅 5분 내외). 결과는 _exec_out.
+# 부팅하는 동안 진행 막대를 그린다(#38). 신호는 runner 의 ruby 프로세스가 쓰는 메모리(RSS)다.
+# 부팅 내내 거의 직선으로 늘고(NAS 실측: 경과 20/40/60/80% 에 최대값의 21/42/68/95%), 마지막
+# 1분 남짓만 평평하다. 최대값은 데이터가 아니라 로드한 코드 양으로 정해져서 머신이 달라도 비슷하다
+# (EE 19.3.4 NAS 1216MB, 19.4.1 워크스테이션 1262MB). 그래서 직전 부팅의 최대값을 분모로 쓴다.
+# initializer 이벤트나 Zeitwerk 콜백을 세는 방법은 부팅의 7%·45% 만 덮고, gitlab-rails 래퍼가
+# RUBYOPT 를 지워 주입할 길도 없다. 기록이 없으면(첫 실행) 경과 시간만 보여 준다.
+_RAILS_BOOT_PATTERN='bin/rail[s] runner'
+_rails_boot_poller_pid=
 _rails_runner() {
-    _exec_isolated gitlab-rails runner "$1"
+    local rc peak tick=_rails_boot_tick
+    _rails_boot_file=$(mktemp)
+    _TMPFILES+=("$_rails_boot_file")
+    _rails_boot_start=$SECONDS _rails_boot_peak=0 _rails_boot_expected=0
+    read -r _rails_boot_expected 2>/dev/null < "$_rails_boot_rss_file"
+    [[ "$_rails_boot_expected" =~ ^[0-9]+$ ]] || _rails_boot_expected=0
+    # 컨테이너 안 루프는 지금까지의 최대값이 오를 때만 한 줄 쓴다. 그래서 마지막 줄이 곧 최대값이다.
+    # _size_poller 와 같은 이유로 스스로 끝난다: runner 를 본 뒤 사라지면, 끝내 나타나지 않으면
+    # ~10분 뒤. 패턴이 대괄호 표기인 이유도 같다(_BACKUP_PROC_PATTERN). 부팅과 같은 CPU 를 쓰므로
+    # pid 를 찾은 뒤에는 pgrep 대신 /proc 만 보고, 값은 sh 내장 read 로 읽는다.
+    docker exec "$CONTAINER_NAME" sh -c '
+        seen=0; idle=0; p=; m=0
+        while true; do
+            [ -n "$p" ] && [ -d "/proc/$p" ] || p=$(pgrep -n -f "$1")
+            if [ -n "$p" ]; then
+                seen=1
+                while read -r k v _; do
+                    [ "$k" = VmRSS: ] && [ "$v" -gt "$m" ] && m=$v && echo "$m"
+                done 2>/dev/null < "/proc/$p/status"
+            else
+                [ "$seen" = 1 ] && exit 0
+                idle=$((idle + 1)); [ "$idle" -gt 600 ] && exit 0
+            fi
+            sleep 1
+        done
+    ' sh "$_RAILS_BOOT_PATTERN" >> "$_rails_boot_file" 2>/dev/null &
+    _rails_boot_poller_pid=$!
+    # 터미널이 없으면(무인 실행) 그리지 않는다. 최대값 기록은 다음 대화형 실행을 위해 남긴다.
+    [ "$_tty" = /dev/null ] && tick=
+    _isolated_tick=$tick _exec_isolated gitlab-rails runner "$1"
+    rc=$?
+    kill "$_rails_boot_poller_pid" 2>/dev/null
+    wait "$_rails_boot_poller_pid" 2>/dev/null
+    _rails_boot_poller_pid=
+    printf '\r\033[K' > "$_tty"
+    # 끝까지 부팅한 경우만 다음 분모로 남긴다. 실패한 runner 의 값은 부팅 도중의 값일 수 있다.
+    peak=$(tail -n 1 "$_rails_boot_file")
+    if [ "$rc" -eq 0 ] && [[ "$peak" =~ ^[0-9]+$ ]]; then
+        echo "$peak" 2>/dev/null > "$_rails_boot_rss_file"
+    fi
+    rm -f "$_rails_boot_file"
+    return "$rc"
+}
+
+# _rails_boot_tick <frame> — _rails_runner 가 기다리는 동안 ~0.2초마다 부른다. 값은 1초에 한 번
+# 바뀌므로 파일도 그때만 읽는다. 끝나기 전에는 99% 를 넘기지 않는다.
+# shellcheck disable=SC2329
+_rails_boot_tick() {
+    local frame=$1 rss pct elapsed=$((SECONDS - _rails_boot_start)) label='gitlab-rails boot'
+    if [ $((frame % 5)) -eq 0 ]; then
+        rss=$(tail -n 1 "$_rails_boot_file" 2>/dev/null)
+        [[ "$rss" =~ ^[0-9]+$ ]] && _rails_boot_peak=$rss
+    fi
+    if [ "$_rails_boot_expected" -gt 0 ]; then
+        pct=$((_rails_boot_peak * 100 / _rails_boot_expected))
+        [ "$pct" -gt 99 ] && pct=99
+        _draw_backup_progress "$label" "$pct" "$frame" 1 "$(_backup_progress_extra 1 "$pct" "$elapsed")"
+    else
+        _draw_bouncing_frame "$label $(_fmt_duration "$elapsed")" "$frame"
+    fi
 }
 
 # _find_hook <지정 경로> <환경변수 이름> <스크립트 옆 파일 이름> <설명>
@@ -1164,6 +1243,8 @@ _maintenance_state_file="$_runner_state_dir/upgrade-gitlab-${CONTAINER_NAME}.mai
 # 교체용 컨테이너를 만들기 전의 재시작 정책(#30). 교체용은 no로 만드므로, hold를 남긴 채 끝난 뒤의
 # 다음 실행은 컨테이너에서 원래 값을 읽을 수 없다.
 _restart_policy_state_file="$_runner_state_dir/upgrade-gitlab-${CONTAINER_NAME}.restart-policy"
+# 직전 rails 부팅의 최대 RSS(kB). _rails_runner 진행 막대의 분모(#38).
+_rails_boot_rss_file="$_runner_state_dir/upgrade-gitlab-${CONTAINER_NAME}.rails-boot-rss"
 
 # --------------------------
 # 에디션 자동 감지 (CE/EE)

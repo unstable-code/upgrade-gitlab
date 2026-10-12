@@ -1135,6 +1135,29 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     [[ "$output" == *"Successfully updated"* ]]
 }
 
+# ---------- rails boot progress (#38) ----------
+@test "full-flow: the peak RSS of a finished rails boot is kept as the next progress bar's total" {
+    export MOCK_GITLAB_VERSION="17.11.3-ee.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    # The last line the poller wrote is the peak; a later GC dip (1150000) is not written.
+    export MOCK_RAILS_BOOT_RSS="41000 900000 1216000 1150000"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    [ "$(<"$RAILS_BOOT_RSS_FILE")" = 1216000 ]
+}
+
+@test "full-flow: a failed rails boot keeps the recorded peak" {
+    export MOCK_GITLAB_VERSION="17.11.3-ee.0" MOCK_MAINTENANCE=enabled
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    mkdir -p "$(dirname "$RAILS_BOOT_RSS_FILE")"
+    echo 1216000 > "$RAILS_BOOT_RSS_FILE"
+    export MOCK_RAILS_BOOT_RSS="300000" MOCK_RAILS_RUNNER_FAIL=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"could not enable maintenance mode"* ]]
+    [ "$(<"$RAILS_BOOT_RSS_FILE")" = 1216000 ]
+}
+
 @test "full-flow: --no-maintenance-mode skips the probe entirely" {
     export MOCK_GITLAB_VERSION="17.11.3-ee.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"

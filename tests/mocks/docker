@@ -256,6 +256,16 @@ case "$args" in
         fi
         echo "/etc/gitlab/config_backup/gitlab_config_1700000000_2026_01_01.tar"
         ;;
+    # RSS poller of a rails boot (#38): MOCK_RAILS_BOOT_RSS is the RSS it reads, one kB value per word.
+    # Like the real loop, it prints the running peak only when it rises. Placed early for the same
+    # "pgrep" reason as below.
+    *"exec"*"VmRSS"*)
+        _m=0
+        for _v in ${MOCK_RAILS_BOOT_RSS:-}; do
+            [ "$_v" -gt "$_m" ] && _m=$_v && echo "$_m"
+        done
+        exit 0
+        ;;
     # In-container backup liveness/stop for the cancel path. Placed early: "pgrep" contains
     # "grep", which the gitlab.rb grep patterns below would otherwise catch.
     *"exec"*"kill -TERM"*)
@@ -382,6 +392,8 @@ case "$args" in
     *"exec"*"gitlab-rails runner"*)
         # One line per rails boot, so tests can assert that snippets share a boot.
         [ -n "$MOCK_STATE_DIR" ] && echo x >> "$MOCK_STATE_DIR/rails_runner_calls"
+        # MOCK_RAILS_RUNNER_FAIL=1: every boot fails before any snippet runs.
+        [ "${MOCK_RAILS_RUNNER_FAIL:-0}" -eq 1 ] && exit 1
         case "$args" in
             *"maintenance_mode: false"*)
                 # Disable snippet. MOCK_MAINTENANCE_DISABLE_FAIL=1 → rails fails (no result line).
