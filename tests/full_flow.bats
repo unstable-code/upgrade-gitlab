@@ -1704,14 +1704,17 @@ _inspect_patch_full='
 }
 
 @test "ready wait: an interrupt during the wait is announced and the wait goes on" {
-    export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_HEALTH_STATUS=starting
+    # The wait's first death check is held until the signal is sent: signalling on the swap's
+    # rename instead raced --ready-timeout, and a slow runner timed out before the signal landed.
+    export MOCK_GITLAB_VERSION="17.11.3-ce.0" MOCK_HEALTH_STATUS=starting MOCK_RUNNING_SLEEP=60
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
     # Signal the script alone, as the other interrupt tests do; the group-wide case is covered by
     # the swap tests below. --ready-timeout bounds the run.
     bash "$PROJECT_ROOT/upgrade-gitlab" -y --ready-timeout=4 > "$MOCK_STATE_DIR/out.log" 2>&1 &
     pid=$!
-    wait_for_marker "$MOCK_STATE_DIR/rename_args"   # the replacement is up, the wait has begun
+    wait_for_marker "$MOCK_STATE_DIR/running_held"   # inside the wait
     kill -TERM "$pid"   # SIGINT is ignored by background jobs; _handle_signal traps both
+    : > "$MOCK_STATE_DIR/running_release"
     status=0
     wait "$pid" || status=$?
     # The wait did not break on the signal; the timeout ended it.

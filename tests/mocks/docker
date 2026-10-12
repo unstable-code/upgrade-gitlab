@@ -36,12 +36,17 @@ _mock_crash_before() {
     [ "$c" -le "$threshold" ]
 }
 
-# _mock_hold <name> <seconds>: when <seconds> is set, write the <name>_held marker and sleep, so a
-# test can signal the script at that point (#31). Requires MOCK_STATE_DIR.
+# _mock_hold <name> <seconds>: when <seconds> is set, write the <name>_held marker and wait that many
+# whole seconds, so a test can signal the script at that point (#31). A test that must not race the
+# script's own timers writes <name>_release once it has signalled, which ends the hold at once.
+# Requires MOCK_STATE_DIR.
 _mock_hold() {
     [ -n "$2" ] && [ -n "$MOCK_STATE_DIR" ] || return 1
     : > "$MOCK_STATE_DIR/$1_held"
-    sleep "$2"
+    local end=$((SECONDS + $2))
+    while [ $SECONDS -lt "$end" ] && [ ! -f "$MOCK_STATE_DIR/$1_release" ]; do
+        sleep 0.1
+    done
 }
 
 # _mock_running_jobs_now: sets and prints _n, the number of CI jobs "running" right now.
