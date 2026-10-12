@@ -1,6 +1,10 @@
 include:
   - template: Jobs/Container-Scanning.gitlab-ci.yml
 
+# The age release the age image is built from (age-image) and scanned as (age-scan-target).
+variables:
+  AGE_VERSION: v1.3.2
+
 stages:
   - lint
   - test
@@ -63,7 +67,6 @@ age-image:
   stage: image
   image: golang:1.26
   variables:
-    AGE_VERSION: v1.3.2
     CRANE_VERSION: v0.22.1
   before_script:
     - go install "github.com/google/go-containerregistry/cmd/crane@${CRANE_VERSION}"
@@ -76,17 +79,29 @@ age-image:
       when: manual
       allow_failure: true
 
-# Trivy cannot scan by an index digest: it fetches the platform manifest and then refuses it for not
-# matching the requested digest. This resolves the amd64 manifest inside the pinned index, so the scan
-# still covers exactly the pinned image; arm64 is built from the same source.
+# What container_scanning scans: the amd64 image inside the pinned index (arm64 is built from the same
+# source), named by its per-arch tag. Not by digest, although that is what the script pins: Trivy
+# cannot scan an index digest (it fetches the platform manifest, then rejects it for not matching the
+# requested digest), and GitLab 19.3.3 fails to ingest findings whose image is a bare digest
+# (`…/age@sha256:…`): the vulnerability UUIDs computed at store and at ingestion no longer match, and
+# ingestion stops with NoMethodError on nil (pipeline #692). The tag must still name the pinned image,
+# so it is checked against the pinned amd64 digest first and the job fails if the tag has moved.
 age-scan-target:
   stage: lint
   image:
     name: gcr.io/go-containerregistry/crane/debug:v0.22.1
     entrypoint: [""]
   script:
-    - img=$(sed -n 's/^AGE_IMAGE=//p' upgrade-gitlab)
-    - echo "CS_IMAGE=${img%@*}@$(crane digest --platform linux/amd64 "$img")" | tee scan-target.env
+    - pinned=$(sed -n 's/^AGE_IMAGE=//p' upgrade-gitlab)
+    - want=$(crane digest --platform linux/amd64 "$pinned")
+    - target="${pinned%@*}:$AGE_VERSION-amd64"
+    - got=$(crane digest "$target")
+    - |
+      if [ "$got" != "$want" ]; then
+        echo "$target is $got, but the pinned image's amd64 manifest is $want: AGE_VERSION and AGE_IMAGE disagree" >&2
+        exit 1
+      fi
+    - echo "CS_IMAGE=$target" | tee scan-target.env
   artifacts:
     reports:
       dotenv: scan-target.env
