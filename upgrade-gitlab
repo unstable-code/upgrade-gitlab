@@ -41,6 +41,8 @@ skip_components=""
 skip_object_storage=0
 use_maintenance_mode=1
 _maintenance_enabled_by_us=0
+# 켜기 전의 배너 문구 기록(#64). 상태 파일에 쓸 수 없었을 때의 폴백이고, 형식은 파일과 같다.
+_maintenance_prev_message_record=""
 running_jobs_mode="wait"
 running_jobs_timeout=0
 # 교체한 컨테이너가 준비되기를 기다리는 상한(초, 0 = 무제한). Docker 이미지는 부팅하면서 reconfigure와
@@ -696,7 +698,31 @@ _remove_previous_image() {
 # psql UPDATE는 설정 캐시(프로세스 메모리 + Redis)를 무효화하지 않으므로 update!를 쓴다.
 # current는 캐시된 사본을 줄 수 있어 current_without_cache로 읽는다.
 # 원래 켜져 있었으면(already) 사용자 의도이므로 끝나고 끄지 않는다.
-_MAINTENANCE_ENABLE_RUBY="begin
+#
+# 배너 문구(#64): 켜 두기만 하면 GitLab 기본 배너라 사용자는 왜 쓰기가 막혔는지 알 수 없다.
+# 버전은 확인 화면과 같은 값에서 꼬리표만 뗀다.
+_maintenance_message() {
+    printf 'Upgrading GitLab from %s to %s. Writes are disabled until it finishes; please try again later.' \
+        "${CURRENT_VERSION%%-*}" "${UPGRADE_POINTS_ARRAY[-1]%%-*}"
+}
+
+# 호스트 문자열을 Ruby 단일 인용 리터럴로 감싼다. Ruby가 홑따옴표 안에서 해석하는 이스케이프는
+# 홑따옴표와 백슬래시 둘뿐이라 그 둘만 처리하면 된다. 스니펫에 끼우는 값은 모두 이걸 거치므로,
+# Ruby 본문 자체는 인용 heredoc(<<'RUBY')에 두고 보간은 프리앰블 한 줄로 분리할 수 있다 —
+# 본문의 $와 백틱, #{}가 호스트 셸에 노출되지 않는다.
+_ruby_literal() {
+    local s=${1//\\/\\\\}
+    printf "'%s'" "${s//\'/\\\'}"
+}
+
+# 문구 쓰기는 켜기와 분리한다: 길이 검증 등으로 거부되더라도 maintenance mode 자체는 켜져야 한다.
+# 관리자가 써 둔 문구는 끄기 때 되돌려야 하므로 base64로 돌려받는다. Base64 상수가 아니라
+# pack('m0')을 쓰는 건 require 없이 되는 core 기능이기 때문이다 — 상수가 없는 환경에서
+# NameError가 나면 아래 rescue가 "unavailable"로 흡수해 버린다.
+_maintenance_enable_ruby() {
+    printf 'msg = %s\n' "$(_ruby_literal "$(_maintenance_message)")"
+    cat <<'RUBY'
+begin
   if License.feature_available?(:maintenance_mode)
     s = ApplicationSetting.current_without_cache
     if s.maintenance_mode
@@ -704,6 +730,14 @@ _MAINTENANCE_ENABLE_RUBY="begin
     else
       s.update!(maintenance_mode: true)
       puts 'maintenance_mode=enabled'
+      if s.respond_to?(:maintenance_mode_message)
+        puts "maintenance_mode_prev_message=#{[s.maintenance_mode_message.to_s].pack('m0')}"
+        begin
+          s.update!(maintenance_mode_message: msg)
+        rescue StandardError
+          puts 'maintenance_mode_message=error'
+        end
+      end
     end
   else
     puts 'maintenance_mode=unavailable'
@@ -712,9 +746,60 @@ rescue NameError
   puts 'maintenance_mode=unavailable'
 rescue StandardError
   puts 'maintenance_mode=error'
-end"
-_MAINTENANCE_DISABLE_RUBY="ApplicationSetting.current_without_cache.update!(maintenance_mode: false)
-puts 'maintenance_mode=disabled'"
+end
+RUBY
+}
+
+# 끄기. 되돌릴 기록이 있으면 복원 절을 덧붙인다. 되돌리기를 끄기와 같은 update!에 묶지 않고
+# 뒤에 따로 쓰고 rescue하는 이유는 enable과 같다: 문구 하나가 거부돼 maintenance mode가 켜진 채
+# 남는 것이 더 나쁘다. 복원은 현재 문구가 무엇이든 덮어쓴다 — 재시작 정책(_restore_restart_policy)의
+# "우리가 넣은 값일 때만" 규칙을 쓰지 않는 건, 남은 상태 파일로 다음 실행이 해제할 때 그 실행이
+# 만드는 문구는 버전이 달라 비교가 어긋나고, 그러면 낡은 업그레이드 배너가 그대로 남기 때문이다.
+_maintenance_disable_ruby() {
+    local token
+    cat <<'RUBY'
+s = ApplicationSetting.current_without_cache
+s.update!(maintenance_mode: false)
+puts 'maintenance_mode=disabled'
+RUBY
+    token=$(_maintenance_prev_message) || return 0
+    printf 'prev = %s\n' "$(_ruby_literal "$token")"
+    cat <<'RUBY'
+begin
+  if s.respond_to?(:maintenance_mode_message)
+    m = prev.unpack1('m')
+    s.update!(maintenance_mode_message: m.empty? ? nil : m)
+  end
+rescue StandardError
+  puts 'maintenance_mode_message=error'
+end
+RUBY
+}
+
+# key=value 줄에서 첫 값을 뽑는다(stdin). 종료 상태 0 = 그 키가 있었다 — 값은 빈 문자열일 수 있다.
+# runner 출력과 상태 파일이 같은 형식을 쓰므로 양쪽 파싱이 이 하나를 공유한다.
+_kv_first() {
+    local line
+    line=$(grep -m1 "^$1=") || return 1
+    printf '%s' "${line#"$1="}"
+}
+
+# 되돌릴 이전 문구 기록. 종료 상태 0 = 기록이 있다(출력이 그 base64이고, 빈 값은 "문구가 없었다"는
+# 기록이라 되돌리기가 비우는 것이 된다). 1 = 기록이 없다 → 문구를 건드리지 않는다. 키의 유무가
+# 신호이므로 그 둘이 구분된다. 상태 파일이 source of truth이고 파일 자체가 없을 때만 메모리로
+# 폴백하는 것은 _disable_maintenance_mode와 같은 규칙이다.
+_maintenance_prev_message() {
+    local src token
+    if [ -f "$_maintenance_state_file" ]; then
+        src=$(<"$_maintenance_state_file")
+    else
+        src=$_maintenance_prev_message_record
+    fi
+    token=$(_kv_first prev_message_b64 <<< "$src") || return 1
+    # 상태 파일은 사람이 고칠 수 있다 — base64가 아니면 기록이 없는 것으로 본다.
+    [[ "$token" =~ ^[A-Za-z0-9+/]*={0,2}$ ]] || return 1
+    printf '%s' "$token"
+}
 
 # 이번(또는 이전) 실행이 켠 maintenance mode를 끈다. _resume_paused_runners와 같은 규칙:
 # 영속 상태 파일이 source of truth이고, 파일 기록이 실패했던 경우에만 메모리 플래그로 폴백하며,
@@ -734,9 +819,12 @@ _disable_maintenance_mode() {
     fi
     _maintenance_release_attempted=1
     echo "Disabling maintenance mode via gitlab-rails (a rails boot; expect around 5 minutes. Ctrl+C waits for it to finish)..."
-    _rails_runner "$_MAINTENANCE_DISABLE_RUBY"
+    _rails_runner "$(_maintenance_disable_ruby)"
     if grep -qx 'maintenance_mode=disabled' <<< "$_exec_out"; then
         echo "Maintenance mode disabled."
+        if grep -qx 'maintenance_mode_message=error' <<< "$_exec_out"; then
+            echo "Warning: could not restore the previous maintenance-mode banner message; it still names this upgrade. Clear it in Admin > Settings > General > Maintenance mode." >&2
+        fi
         _maintenance_enabled_by_us=0
         rm -f "$_maintenance_state_file"
     else
@@ -4035,7 +4123,7 @@ PULL_PID=$!
 #    판정 결과와 무관하게 업그레이드는 계속한다 — 켜지 못했다는 이유로 막을 일이 아니다.
 _prebackup_snippets=()
 [ "$skip_object_storage" -eq 1 ] && _prebackup_snippets+=("$_OBJECT_STORAGE_RUBY")
-[ "$use_maintenance_mode" -eq 1 ] && _prebackup_snippets+=("$_MAINTENANCE_ENABLE_RUBY")
+[ "$use_maintenance_mode" -eq 1 ] && _prebackup_snippets+=("$(_maintenance_enable_ruby)")
 if [ ${#_prebackup_snippets[@]} -gt 0 ]; then
     echo "Querying GitLab runtime settings via gitlab-rails (a rails boot; expect around 5 minutes. Ctrl+C waits for it to finish)..."
     _rails_runner "$(printf '%s\n' "${_prebackup_snippets[@]}")"
@@ -4045,10 +4133,19 @@ if [ "$use_maintenance_mode" -eq 1 ]; then
     case "$(grep -m1 -Ex 'maintenance_mode=[a-z]+' <<< "$_exec_out")" in
         maintenance_mode=enabled)
             _maintenance_enabled_by_us=1
-            if ! : > "$_maintenance_state_file" 2>/dev/null; then
+            # 되돌릴 이전 배너 문구를 상태 파일에 함께 남긴다. 키가 없는 파일(문구 컬럼이 없는
+            # 인스턴스, 또는 이 기능 이전 실행이 남긴 파일)은 "문구를 건드리지 않음"으로 읽힌다.
+            if _prev_b64=$(_kv_first maintenance_mode_prev_message <<< "$_exec_out"); then
+                _maintenance_prev_message_record="prev_message_b64=$_prev_b64"
+            fi
+            # 기록이 없으면 종전처럼 빈 marker 파일이 된다(키가 없으면 문구를 건드리지 않는다).
+            if ! printf '%s' "$_maintenance_prev_message_record" > "$_maintenance_state_file" 2>/dev/null; then
                 echo "Warning: could not persist maintenance-mode state to $_maintenance_state_file; disabling it will rely on this run staying alive." >&2
             fi
             echo "Maintenance mode enabled: non-admin users are read-only until the upgrade finishes."
+            if grep -qx 'maintenance_mode_message=error' <<< "$_exec_out"; then
+                echo "Warning: could not set the maintenance-mode banner message; the default banner gives users no reason for the read-only state." >&2
+            fi
             ;;
         maintenance_mode=already)
             # 상태 파일이 있으면 이전 실행이 켜고 해제하지 못한 것이라 여전히 우리 몫이고,

@@ -1104,6 +1104,78 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     [ ! -f "$MAINTENANCE_STATE_FILE" ]
 }
 
+# ---------- maintenance mode banner message (#64) ----------
+@test "full-flow: the banner message names the upgrade and is cleared at the end" {
+    export MOCK_GITLAB_VERSION="17.11.3-ee.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_MAINTENANCE=enabled
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    [ "$(cat "$MOCK_STATE_DIR/maintenance_message")" = "Upgrading GitLab from 17.11.3 to 18.0.1. Writes are disabled until it finishes; please try again later." ]
+    # no message before, so the release empties it rather than leaving the upgrade text behind
+    [ -f "$MOCK_STATE_DIR/maintenance_restore_b64" ]
+    [ -z "$(cat "$MOCK_STATE_DIR/maintenance_restore_b64")" ]
+}
+
+@test "full-flow: an existing banner message is restored when the hold is released" {
+    export MOCK_GITLAB_VERSION="17.11.3-ee.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_MAINTENANCE=enabled
+    export MOCK_MAINTENANCE_PREV_B64="UGxhbm5lZCBvdXRhZ2U="     # "Planned outage"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    [ "$(cat "$MOCK_STATE_DIR/maintenance_restore_b64")" = "UGxhbm5lZCBvdXRhZ2U=" ]
+}
+
+@test "full-flow: a leftover state file carries the previous banner message to the next run" {
+    export MOCK_GITLAB_VERSION="18.0.1-ee.0"     # already at target, previous exit clean
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    mkdir -p "$(dirname "$MAINTENANCE_STATE_FILE")"
+    echo "prev_message_b64=UGxhbm5lZCBvdXRhZ2U=" > "$MAINTENANCE_STATE_FILE"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    [ "$(cat "$MOCK_STATE_DIR/maintenance_restore_b64")" = "UGxhbm5lZCBvdXRhZ2U=" ]
+}
+
+@test "full-flow: a schema without the message column still enables maintenance mode" {
+    export MOCK_GITLAB_VERSION="17.11.3-ee.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_MAINTENANCE=enabled
+    export MOCK_MAINTENANCE_NO_MESSAGE_COLUMN=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Maintenance mode enabled"* ]]
+    [[ "$output" == *"Maintenance mode disabled."* ]]
+    [ ! -f "$MOCK_STATE_DIR/maintenance_message" ]
+    # nothing recorded, so the release leaves the message alone instead of guessing
+    [ -f "$MOCK_STATE_DIR/maintenance_disabled" ]
+    [ ! -f "$MOCK_STATE_DIR/maintenance_restore_b64" ]
+}
+
+@test "full-flow: a rejected banner message warns but still leaves maintenance mode on" {
+    export MOCK_GITLAB_VERSION="17.11.3-ee.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_MAINTENANCE=enabled
+    export MOCK_MAINTENANCE_MESSAGE_FAIL=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Maintenance mode enabled"* ]]
+    [[ "$output" == *"could not set the maintenance-mode banner message"* ]]
+    [[ "$output" == *"Maintenance mode disabled."* ]]
+}
+
+@test "full-flow: a failed banner restore warns but the disable still counts" {
+    export MOCK_GITLAB_VERSION="17.11.3-ee.0"
+    echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
+    export MOCK_MAINTENANCE=enabled
+    export MOCK_MAINTENANCE_RESTORE_FAIL=1
+    run bash "$PROJECT_ROOT/upgrade-gitlab" -y
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Maintenance mode disabled."* ]]
+    [[ "$output" == *"could not restore the previous maintenance-mode banner message"* ]]
+    [ ! -f "$MAINTENANCE_STATE_FILE" ]
+}
+
 @test "full-flow: maintenance mode that was already on is left on" {
     export MOCK_GITLAB_VERSION="17.11.3-ee.0"
     echo "$MOCK_GITLAB_VERSION" > "$MOCK_STATE_DIR/current_version"
@@ -1205,6 +1277,9 @@ Removed configurations found in gitlab.rb. Aborting reconfigure."
     [[ "$output" == *"Requirements already satisfied"* ]]
     [[ "$output" == *"Maintenance mode disabled."* ]]
     [ ! -f "$MAINTENANCE_STATE_FILE" ]
+    # a file from before the banner message (#64) records nothing, so the message is left alone
+    [ -f "$MOCK_STATE_DIR/maintenance_disabled" ]
+    [ ! -f "$MOCK_STATE_DIR/maintenance_restore_b64" ]
 }
 
 @test "full-flow: Ctrl+C while maintenance mode is being enabled still disables it" {

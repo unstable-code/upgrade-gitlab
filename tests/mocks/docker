@@ -397,9 +397,19 @@ case "$args" in
         case "$args" in
             *"maintenance_mode: false"*)
                 # Disable snippet. MOCK_MAINTENANCE_DISABLE_FAIL=1 → rails fails (no result line).
-                [ -n "$MOCK_STATE_DIR" ] && touch "$MOCK_STATE_DIR/maintenance_disabled"
+                if [ -n "$MOCK_STATE_DIR" ]; then
+                    touch "$MOCK_STATE_DIR/maintenance_disabled"
+                    # The banner token the restore clause carries (#64), so tests assert on the
+                    # value and not on how the snippet spells it; no clause → no file at all.
+                    case "$args" in
+                        *"prev = "*) sed -n "s/.*prev = '\([^']*\)'.*/\1/p" <<< "$args" \
+                            > "$MOCK_STATE_DIR/maintenance_restore_b64" ;;
+                    esac
+                fi
                 if [ "${MOCK_MAINTENANCE_DISABLE_FAIL:-0}" -eq 1 ]; then exit 1; fi
                 echo "maintenance_mode=disabled"
+                # MOCK_MAINTENANCE_RESTORE_FAIL=1 → the banner restore is rejected, the disable is not.
+                [ "${MOCK_MAINTENANCE_RESTORE_FAIL:-0}" -eq 1 ] && echo "maintenance_mode_message=error"
                 exit 0
                 ;;
         esac
@@ -420,6 +430,17 @@ case "$args" in
                 # deliver a signal while the enable is still in flight.
                 if [ -n "${MOCK_RAILS_SLEEP:-}" ]; then sleep "$MOCK_RAILS_SLEEP"; fi
                 [ "${MOCK_MAINTENANCE:-}" = fail ] || echo "maintenance_mode=${MOCK_MAINTENANCE:-unavailable}"
+                # Banner message (#64), only on a real enable. MOCK_MAINTENANCE_NO_MESSAGE_COLUMN
+                # mimics the respond_to? guard being false; the other three vars are in CLAUDE.md.
+                if [ "${MOCK_MAINTENANCE:-}" = enabled ] && [ "${MOCK_MAINTENANCE_NO_MESSAGE_COLUMN:-0}" -ne 1 ]; then
+                    echo "maintenance_mode_prev_message=${MOCK_MAINTENANCE_PREV_B64:-}"
+                    if [ "${MOCK_MAINTENANCE_MESSAGE_FAIL:-0}" -eq 1 ]; then
+                        echo "maintenance_mode_message=error"
+                    elif [ -n "$MOCK_STATE_DIR" ]; then
+                        sed -n "s/.*msg = '\(.*\)'$/\1/p" <<< "$args" \
+                            > "$MOCK_STATE_DIR/maintenance_message"
+                    fi
+                fi
                 ;;
         esac
         exit 0
