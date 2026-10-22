@@ -3623,9 +3623,25 @@ _fetch_upgrade_path() {
         fi
     fi
 
-    # 5. ALL_TAGS 구성: 각 경유 버전의 최신 패치를 Docker Hub에서 해석
+    # 5. partial version 해석: ALL_TAGS 보다 먼저 풀어야 해석 전 문자열(17.10)이 경로에 들어가지 않는다(#62).
+    # N-1 은 major 만 준 값을 그대로 써야 하므로 그 뒤다. 경유 버전이 아니라 Docker Hub 태그 전체에서 찾는다:
+    # major 만 주면 그 major 의 마지막 minor 가 경유 버전이 아닐 수 있다
+    local resolved
+    if [ "$_partial_version" -eq 1 ]; then
+        resolved=$(echo "$_all_docker_tags" | grep "^${target_version_tag//./\\.}\." | tail -1)
+        if [ -z "$resolved" ]; then
+            echo "Error: No tags matching '${target_version_tag}.*' found." >&2
+            target_version_tag=
+        else
+            target_version_tag="$resolved"
+            echo "Resolved partial version to: $target_version_tag"
+        fi
+        _partial_version=0
+    fi
+
+    # 6. ALL_TAGS 구성: 각 경유 버전의 최신 패치를 Docker Hub에서 해석
     ALL_TAGS=()
-    local wp wp_major wp_minor resolved
+    local wp wp_major wp_minor
     for wp in "${waypoints[@]}"; do
         wp_major=${wp%%.*}
         wp_minor=${wp#*.}
@@ -3634,8 +3650,7 @@ _fetch_upgrade_path() {
     done
 
     # 최신 버전 또는 target_version_tag 추가
-    # partial version 은 해석 전 문자열(17.10)이라 넣지 않는다 — 해석한 태그는 partial version resolve 가 넣는다
-    if [ -n "$target_version_tag" ] && [ "$_partial_version" -eq 0 ]; then
+    if [ -n "$target_version_tag" ]; then
         ALL_TAGS+=("$target_version_tag")
     else
         ALL_TAGS+=("$LATEST_VERSION_TAG")
@@ -3665,26 +3680,6 @@ fi
 
 echo "Processing GitLab-${GITLAB_EDITION^^} upgrade path..."
 _fetch_upgrade_path
-
-# partial version resolve
-if [ "$_partial_version" -eq 1 ]; then
-    # ALL_TAGS 가 아니라 Docker Hub 태그 전체에서 찾는다: ALL_TAGS 에는 경유 버전뿐이라,
-    # major 만 주면 그 major 의 마지막 minor 가 경유 버전이 아닐 때 더 낮은 minor 로 풀린다
-    resolved=$(echo "$_all_docker_tags" | grep "^${target_version_tag//./\\.}\." | sort -V | tail -1)
-
-    if [ -z "$resolved" ]; then
-        echo "Error: No tags matching '${target_version_tag}.*' found." >&2
-        target_version_tag=
-    else
-        target_version_tag="$resolved"
-        echo "Resolved partial version to: $target_version_tag"
-        # ALL_TAGS에 없으면 추가
-        if [[ " ${ALL_TAGS[*]} " != *" $target_version_tag "* ]]; then
-            ALL_TAGS+=("$target_version_tag")
-            mapfile -t ALL_TAGS < <(printf '%s\n' "${ALL_TAGS[@]}" | sort -Vu)
-        fi
-    fi
-fi
 
 # EOS (End-of-Support) 체크
 _check_eos
@@ -3849,16 +3844,18 @@ done
 scan() {
     awk -v src="$1" -v q="'" '
         BEGIN {
-            str = "[\"" q "]/[^\"" q "]*[\"" q "]"
-            interpolated = "[\"" q "]/[^\"" q "]*#\\{"
+            quoted_abs = "[\"" q "]/[^\"" q "]*"
+            str = quoted_abs "[\"" q "]"
+            interpolated = quoted_abs "#\\{"
             reads_file = "File\\.read|from_file[[:space:](]*[^[:space:](\"" q "]"
-            path_start = "[\"" q "]/[^\"" q "]*[\"" q "]?"
             literal_read = "File\\.read[[:space:](]*[\"" q "]/"
         }
         function inside_volume(s,    path) {
             if (s ~ /from_file/) return 0
-            if (gsub(/File\.read/, "&", s) != gsub(literal_read, "&", s)) return 0
-            while (match(s, path_start)) {
+            path = s
+            gsub(literal_read, "", path)
+            if (path ~ /File\.read/) return 0
+            while (match(s, quoted_abs)) {
                 path = substr(s, RSTART + 1, RLENGTH - 1)
                 s = substr(s, RSTART + RLENGTH)
                 if (path !~ /^\/(etc|opt)\/gitlab\//) return 0

@@ -231,7 +231,7 @@ The swap's own docker clients are shielded from the terminal's process group too
 Tests use [BATS](https://github.com/bats-core/bats-core) (Bash Automated Testing System).
 
 ### Test Structure
-- `tests/upgrade_path.bats` — Logic tests using `--dry-run` (path resolution, `--skip-latest`, `--version`, `--max-tier` validation); `_fixtures_without` copies the fixtures minus given tags, so a minor's latest becomes its `.0`
+- `tests/upgrade_path.bats` — Logic tests using `--dry-run` (path resolution, `--skip-latest`, `--version`, `--max-tier` validation); `_fixtures_without` copies the fixtures minus given tags, so a minor's latest becomes its `.0`; `_path_without` drops waypoints from `path.json` the same way, and `_steps` lists the dry-run steps on one line for exact comparison
 - `tests/full_flow.bats` — Integration tests simulating full upgrade loops via mocks (includes stuck-migration scenarios)
 - `tests/deprecations.bats` — Unit tests for the reconfigure deprecation collector; helpers are source-extracted with `sed` (the `preflight.bats` pattern) and the collector globals re-seeded per test
 - `tests/config_discovery.bats` — Unit tests for the `gitlab.rb` path scan of the configuration archive discovery; `scan()` is extracted from the in-container snippet the same way

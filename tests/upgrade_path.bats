@@ -196,6 +196,20 @@ _fixtures_without() {
     export FIXTURES_DIR="$dir"
 }
 
+# Drops the given waypoints from path.json, on a copy of the fixtures.
+_path_without() {
+    _fixtures_without
+    local f="$FIXTURES_DIR/path.json" stop
+    for stop in "$@"; do
+        jq --arg s "$stop" '.all |= map(select(. != $s))' "$f" > "$f.new" && mv "$f.new" "$f"
+    done
+}
+
+# The step tags of the dry-run listing, on one line.
+_steps() {
+    printf '%s\n' "$output" | sed -n 's/^  [0-9]*\. //p' | paste -sd' '
+}
+
 @test "--skip-latest=unpatched keeps a latest that has a patch release" {
     export MOCK_GITLAB_VERSION="16.11.0-ce.0"
     run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --skip-latest=unpatched
@@ -290,11 +304,6 @@ _fixtures_without() {
 }
 
 # ---------- Partial versions never enter the steps unresolved (#62) ----------
-# The step tags of the dry-run listing, on one line.
-_steps() {
-    printf '%s\n' "$output" | sed -n 's/^  [0-9]*\. //p' | paste -sd' '
-}
-
 @test "--version=17 lists only resolved tags as steps" {
     export MOCK_GITLAB_VERSION="16.11.0-ce.0"
     run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --version=17
@@ -305,9 +314,7 @@ _steps() {
 }
 
 @test "--version=17 resolves to the major's latest even when it is not a path stop" {
-    _fixtures_without
-    jq '.all |= map(select(. != "17.11.3"))' "$FIXTURES_DIR/path.json" > "$FIXTURES_DIR/path.json.new" \
-        && mv "$FIXTURES_DIR/path.json.new" "$FIXTURES_DIR/path.json"
+    _path_without 17.11.3
     export MOCK_GITLAB_VERSION="16.11.0-ce.0"
     run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --version=17
     [ "$status" -eq 0 ]
@@ -317,9 +324,7 @@ _steps() {
 
 @test "an unresolvable partial version falls back to latest without a stray step" {
     # latest off the path, so only the fallback can put it into the steps
-    _fixtures_without
-    jq '.all |= map(select(. != "18.0.1"))' "$FIXTURES_DIR/path.json" > "$FIXTURES_DIR/path.json.new" \
-        && mv "$FIXTURES_DIR/path.json.new" "$FIXTURES_DIR/path.json"
+    _path_without 18.0.1
     export MOCK_GITLAB_VERSION="16.11.0-ce.0"
     export MOCK_EOS_UNAVAIL=1  # 17.99 is not a release track
     run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --version=17.99
