@@ -285,6 +285,48 @@ _fixtures_without() {
     # 17.10 not in path.json stops, but exists on Docker Hub → fallback
     [[ "$output" == *"Resolved partial version to: 17.10.2-ce.0"* ]]
     [[ "$output" == *"Target: 17.10.2-ce.0"* ]]
+    # the unresolved string must not become a step of its own (#62)
+    [ "$(_steps)" = "16.11.10-ce.0 17.3.7-ce.0 17.5.5-ce.0 17.7.4-ce.0 17.10.2-ce.0" ]
+}
+
+# ---------- Partial versions never enter the steps unresolved (#62) ----------
+# The step tags of the dry-run listing, on one line.
+_steps() {
+    printf '%s\n' "$output" | sed -n 's/^  [0-9]*\. //p' | paste -sd' '
+}
+
+@test "--version=17 lists only resolved tags as steps" {
+    export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --version=17
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Resolved partial version to: 17.11.3-ce.0"* ]]
+    [[ "$output" == *"Target: 17.11.3-ce.0"* ]]
+    [ "$(_steps)" = "16.11.10-ce.0 17.3.7-ce.0 17.5.5-ce.0 17.7.4-ce.0 17.11.3-ce.0" ]
+}
+
+@test "--version=17 resolves to the major's latest even when it is not a path stop" {
+    _fixtures_without
+    jq '.all |= map(select(. != "17.11.3"))' "$FIXTURES_DIR/path.json" > "$FIXTURES_DIR/path.json.new" \
+        && mv "$FIXTURES_DIR/path.json.new" "$FIXTURES_DIR/path.json"
+    export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --version=17
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Target: 17.11.3-ce.0"* ]]
+    [ "$(_steps)" = "16.11.10-ce.0 17.3.7-ce.0 17.5.5-ce.0 17.7.4-ce.0 17.11.3-ce.0" ]
+}
+
+@test "an unresolvable partial version falls back to latest without a stray step" {
+    # latest off the path, so only the fallback can put it into the steps
+    _fixtures_without
+    jq '.all |= map(select(. != "18.0.1"))' "$FIXTURES_DIR/path.json" > "$FIXTURES_DIR/path.json.new" \
+        && mv "$FIXTURES_DIR/path.json.new" "$FIXTURES_DIR/path.json"
+    export MOCK_GITLAB_VERSION="16.11.0-ce.0"
+    export MOCK_EOS_UNAVAIL=1  # 17.99 is not a release track
+    run bash "$PROJECT_ROOT/upgrade-gitlab" --dry-run --version=17.99
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"No tags matching '17.99.*' found."* ]]
+    [[ "$output" == *"Target: 18.0.1-ce.0"* ]]
+    [ "$(_steps)" = "16.11.10-ce.0 17.3.7-ce.0 17.5.5-ce.0 17.7.4-ce.0 17.11.3-ce.0 18.0.1-ce.0" ]
 }
 
 # ---------- Test 21: --max-tier accepts valid values ----------

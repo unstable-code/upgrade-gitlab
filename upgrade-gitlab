@@ -3634,7 +3634,8 @@ _fetch_upgrade_path() {
     done
 
     # 최신 버전 또는 target_version_tag 추가
-    if [ -n "$target_version_tag" ]; then
+    # partial version 은 해석 전 문자열(17.10)이라 넣지 않는다 — 해석한 태그는 partial version resolve 가 넣는다
+    if [ -n "$target_version_tag" ] && [ "$_partial_version" -eq 0 ]; then
         ALL_TAGS+=("$target_version_tag")
     else
         ALL_TAGS+=("$LATEST_VERSION_TAG")
@@ -3667,14 +3668,9 @@ _fetch_upgrade_path
 
 # partial version resolve
 if [ "$_partial_version" -eq 1 ]; then
-    resolved=$(printf '%s\n' "${ALL_TAGS[@]}" | grep "^${target_version_tag}\." | sort -V | tail -1)
-
-    # ALL_TAGS에 없으면 이미 조회한 Docker Hub 태그에서 검색
-    if [ -z "$resolved" ] && [[ "$target_version_tag" =~ ^[0-9]+\.[0-9]+$ ]]; then
-        partial_major=${target_version_tag%%.*}
-        partial_minor=${target_version_tag#*.}
-        resolved=$(echo "$_all_docker_tags" | grep -E "^${partial_major}\.${partial_minor}\.[0-9]+" | sort -V | tail -1)
-    fi
+    # ALL_TAGS 가 아니라 Docker Hub 태그 전체에서 찾는다: ALL_TAGS 에는 경유 버전뿐이라,
+    # major 만 주면 그 major 의 마지막 minor 가 경유 버전이 아닐 때 더 낮은 minor 로 풀린다
+    resolved=$(echo "$_all_docker_tags" | grep "^${target_version_tag//./\\.}\." | sort -V | tail -1)
 
     if [ -z "$resolved" ]; then
         echo "Error: No tags matching '${target_version_tag}.*' found." >&2
