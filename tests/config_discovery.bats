@@ -56,3 +56,30 @@ EOF
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 }
+
+@test "scan: unresolvable paths under /etc/gitlab or /opt/gitlab are not reported (#63)" {
+    run scan gitlab.rb <<'EOF2'
+gitlab_rails['custom_html_header_tags'] = "#{File.read("/etc/gitlab/custom-header/#{f}")}\n});</script>"
+nginx['ssl_certificate'] = "/etc/gitlab/ssl/#{host}.crt"
+gitlab_rails['y'] = File.read('/opt/gitlab/embedded/#{x}')
+EOF2
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "scan: unresolvable paths outside the volume, or without a fixed prefix, are still reported (#63)" {
+    run scan gitlab.rb <<'EOF2'
+gitlab_rails['y'] = File.read("/srv/certs/#{f}")
+gitlab_rails['y'] = File.read(path)
+nginx['ssl_certificate'] = "/etc/gitlab/ssl/#{ENV['CERT_DIR']}.crt"
+nginx['ssl_certificate'] = "/etc/gitlab/ssl/#{h}.crt"; nginx['ssl_certificate_key'] = "/srv/#{h}.key"
+gitlab_rails['y'] = File.read("/etc/gitlab/#{f}") + File.read(path)
+from_file "/etc/gitlab/extra-#{env}.rb"
+gitlab_rails['y'] = "/etc/gitlab#{suffix}"
+EOF2
+    [ "${#lines[@]}" -eq 7 ]
+    local i
+    for i in 0 1 2 3 4 5 6; do
+        [[ "${lines[$i]}" == $'warn\tgitlab.rb:'"$((i + 1))"$'\t'* ]]
+    done
+}

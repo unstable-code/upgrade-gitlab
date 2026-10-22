@@ -3842,6 +3842,9 @@ done
 
 # gitlab.rb와 GITLAB_OMNIBUS_CONFIG가 가리키는 /etc/gitlab 밖의 파일. 키 목록을 두지 않고 따옴표로 감싼
 # 절대경로를 모두 본다: 해시 안의 경로도 잡힌다. 정적으로 풀 수 없는 줄은 경로를 뽑지 않고 줄째로 알린다.
+# 다만 그 줄의 경로가 모두 /etc/gitlab/(아카이브가 볼륨째 담는다)이나 /opt/gitlab/(이미지) 아래로 시작하면
+# 알리지 않는다(#63). 경로가 변수인 File.read, ENV[…], from_file이 있는 줄은 그래도 알린다: from_file은
+# 파일이 볼륨 안이어도 그 내용을 따라가 볼 수 없다.
 # 출력: include(from_file)·ref<TAB>경로<TAB>위치, warn<TAB>위치<TAB>줄.
 scan() {
     awk -v src="$1" -v q="'" '
@@ -3849,14 +3852,29 @@ scan() {
             str = "[\"" q "]/[^\"" q "]*[\"" q "]"
             interpolated = "[\"" q "]/[^\"" q "]*#\\{"
             reads_file = "File\\.read|from_file[[:space:](]*[^[:space:](\"" q "]"
+            path_start = "[\"" q "]/[^\"" q "]*[\"" q "]?"
+            literal_read = "File\\.read[[:space:](]*[\"" q "]/"
+        }
+        function inside_volume(s,    path) {
+            if (s ~ /from_file/) return 0
+            if (gsub(/File\.read/, "&", s) != gsub(literal_read, "&", s)) return 0
+            while (match(s, path_start)) {
+                path = substr(s, RSTART + 1, RLENGTH - 1)
+                s = substr(s, RSTART + RLENGTH)
+                if (path !~ /^\/(etc|opt)\/gitlab\//) return 0
+            }
+            return 1
         }
         /^[[:space:]]*#/ { next }
         {
             where = src ":" NR
-            if ($0 ~ interpolated || $0 ~ reads_file || ($0 ~ /ENV\[/ && $0 !~ /[Pp]assword|[Ss]ecret|[Tt]oken/)) {
-                line = $0
-                sub(/^[[:space:]]+/, "", line)
-                print "warn\t" where "\t" line
+            env_ref = $0 ~ /ENV\[/ && $0 !~ /[Pp]assword|[Ss]ecret|[Tt]oken/
+            if (env_ref || $0 ~ interpolated || $0 ~ reads_file) {
+                if (env_ref || !inside_volume($0)) {
+                    line = $0
+                    sub(/^[[:space:]]+/, "", line)
+                    print "warn\t" where "\t" line
+                }
                 next
             }
             rest = $0
